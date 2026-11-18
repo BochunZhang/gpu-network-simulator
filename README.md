@@ -42,6 +42,13 @@ tail -f /tmp/gpu-network-runner.log
 
 当前这些程序无需安装 PyTorch 或 NCCL。Days 中的 collective/NCCL 名称用于描述模拟通信，宿主执行依赖以构建清单为准。后续真实训练或 NCCL collective 校准任务会单独声明相应依赖。
 
+在需要运行 Days AGO 的 GB200 设备上，使用启动 runner 的账户安装 Rust。脚本通过 Rustup 安装 `stable` 的最小工具链，包含 `rustc` 和 `cargo`。启动 runner 时将 Cargo 的可执行文件目录放入 `PATH`。
+
+```bash
+bash tools/install_rust.sh &&
+PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" RUSTUP_TOOLCHAIN=stable bash tools/runner.sh
+```
+
 ## Python 环境
 
 `tools/runner.sh` 从任意工作目录定位仓库，在以下目录维护运行环境。
