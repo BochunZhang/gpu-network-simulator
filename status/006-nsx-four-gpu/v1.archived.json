@@ -1,0 +1,17 @@
+{
+  "archive_name": "006-nsx-four-gpu.v1.tar.gz",
+  "archive_sha256": "95e7ff3399082ba8666ab8d15ef26486f0514dbcc653559392439327fcd65c20",
+  "archive_size": 13187,
+  "archived_at": "2026-11-18T08:49:24+00:00",
+  "claim": "1f307a3b06fd4d2aaa959195a98fa208",
+  "command": "bash tools/runner.sh --task 006 --once",
+  "command_source": "recorded",
+  "id": "006",
+  "name": "NSX-inspired four-GPU event exchange",
+  "schema_version": 1,
+  "slug": "nsx-four-gpu",
+  "source_commit": "0abcf12d76a44aca93170d516552dc8c9a5d8e57",
+  "state": "succeeded",
+  "task_sha256": "6bda3efa3ef812127370cd86e328307dbf4f4c0f64842becf70338ee08cbf313",
+  "version": 1
+}

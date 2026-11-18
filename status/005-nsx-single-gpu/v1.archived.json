@@ -1,0 +1,17 @@
+{
+  "archive_name": "005-nsx-single-gpu.v1.tar.gz",
+  "archive_sha256": "39eb62339f3a57269b30801f1fc53ddd9df0e1d9f91c5828e466bb800a996b85",
+  "archive_size": 3782,
+  "archived_at": "2026-11-18T08:49:24+00:00",
+  "claim": "7c25b60d82184bbdaef37e4148bc28e7",
+  "command": "bash tools/runner.sh --task 005 --once",
+  "command_source": "recorded",
+  "id": "005",
+  "name": "NSX-inspired single-GPU local causality",
+  "schema_version": 1,
+  "slug": "nsx-single-gpu",
+  "source_commit": "0abcf12d76a44aca93170d516552dc8c9a5d8e57",
+  "state": "succeeded",
+  "task_sha256": "01e8fb4a4692903f6521cdee6dd08439ff7ddf58595f26b171daa484b1f7ae3f",
+  "version": 1
+}
