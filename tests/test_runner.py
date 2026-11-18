@@ -170,15 +170,15 @@ class RunnerTest(unittest.TestCase):
         row = self.store.claim(task, digest, source, self.results, 'test-host')
         return task, row
 
-    def completed_fixture(self, legacy=False):
-        task, row = self.claim()
+    def completed_fixture(self, legacy=False, task_id='000'):
+        task, row = self.claim(task_id)
         if legacy:
             row = {key: value for key, value in row.items() if key not in {'slug', 'command'}}
-            self.store.path('000', 1).unlink()
-            legacy_status = self.status_dir / '000' / 'v1.json'
+            self.store.path(task_id, 1).unlink()
+            legacy_status = self.status_dir / task_id / 'v1.json'
             legacy_status.parent.mkdir(parents=True)
             runner.write_json(legacy_status, row)
-            output = self.results / '000' / 'v1'
+            output = self.results / task_id / 'v1'
         else:
             output = runner.run_path(self.results, row)
         output.mkdir(parents=True)
@@ -275,8 +275,9 @@ class RunnerTest(unittest.TestCase):
         original = canonical.read_bytes()
         legacy = output.with_suffix('.tar.gz')
         legacy.write_bytes(b'other experiment')
-        with self.assertRaisesRegex(runner.RunnerError, 'checksum'):
-            self.store.archive_receipts([receipt], self.results, self.checkout / 'results-archive')
+        errors = self.store.archive_receipts([receipt], self.results, self.checkout / 'results-archive')
+        self.assertEqual(len(errors), 1)
+        self.assertIn('checksum', errors[0]['reason'])
         self.assertEqual(canonical.read_bytes(), original)
         self.assertEqual(legacy.read_bytes(), b'other experiment')
         self.assertTrue(output.is_dir())
@@ -292,10 +293,86 @@ class RunnerTest(unittest.TestCase):
             if symlink:
                 destination.rmdir()
                 destination.symlink_to(package)
-            with self.assertRaisesRegex(runner.RunnerError, 'not a regular file'):
-                self.store.archive_receipts([receipt], self.results, archive_dir)
+            errors = self.store.archive_receipts([receipt], self.results, archive_dir)
+            self.assertEqual(len(errors), 1)
+            self.assertIn('not a regular file', errors[0]['reason'])
             self.assertTrue(output.is_dir())
             self.assertEqual(package.read_bytes(), original)
+
+    def test_missing_package_records_error_and_flat_rename_recovers(self):
+        output, receipt = self.completed_fixture()
+        package = runner.archive_path(self.results, receipt)
+        original = package.read_bytes()
+        package.unlink()
+        archive_dir = self.checkout / 'results-archive'
+        errors = self.store.archive_receipts([receipt], self.results, archive_dir)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('archival package is missing', errors[0]['reason'])
+        error_path = self.status_dir / '000-new-kind/v1.archive-error.json'
+        saved = runner.read_json(error_path)
+        self.assertEqual(saved['execution_state'], 'succeeded')
+        self.assertEqual(saved['archive_sha256'], receipt['archive_sha256'])
+        self.assertEqual(saved['controller_sha256'], runner.CONTROLLER_SHA256)
+        self.assertIn(str(self.results / runner.archive_name(receipt)), saved['expected_package_paths'])
+        self.assertTrue(output.is_dir())
+        self.assertTrue(self.store.reservation('000', 1).is_dir())
+        self.assertEqual(self.store.read()['000', 1]['delivery_state'], 'awaiting_download')
+        flat = self.results / runner.archive_name(receipt)
+        flat.write_bytes(original)
+        self.assertEqual(self.store.archive_receipts([receipt], self.results, archive_dir), [])
+        self.assertEqual(runner.archive_path(archive_dir, receipt).read_bytes(), original)
+        self.assertFalse(flat.exists())
+        self.assertFalse(error_path.exists())
+        self.assertEqual(self.store.read()['000', 1]['delivery_state'], 'archived')
+
+    def test_interim_hyphen_names_archive_without_recompression(self):
+        output, receipt = self.completed_fixture()
+        package = runner.archive_path(self.results, receipt)
+        original = package.read_bytes()
+        name = '000-new-kind-v1.tar.gz'
+        nested = output.parent / name
+        package.rename(nested)
+        archive_dir = self.checkout / 'results-archive'
+        self.assertEqual(self.store.archive_receipts([receipt], self.results, archive_dir), [])
+        destination = runner.archive_path(archive_dir, receipt)
+        self.assertEqual(destination.read_bytes(), original)
+        for alias in (self.results / name, self.results / '000' / name):
+            alias.parent.mkdir(parents=True, exist_ok=True)
+            alias.write_bytes(original)
+            self.assertEqual(self.store.archive_receipts([receipt], self.results, archive_dir), [])
+            self.assertFalse(alias.exists())
+            self.assertEqual(destination.read_bytes(), original)
+
+    def test_bad_receipt_does_not_block_following_receipt(self):
+        first, first_receipt = self.completed_fixture()
+        runner.archive_path(self.results, first_receipt).unlink()
+        self.commit_task(task_id='001', marker='second complete task')
+        second, second_receipt = self.completed_fixture(task_id='001')
+        archive_dir = self.checkout / 'results-archive'
+        errors = self.store.archive_receipts([first_receipt, second_receipt], self.results, archive_dir)
+        self.assertEqual([row['id'] for row in errors], ['000'])
+        self.assertTrue(first.is_dir())
+        self.assertFalse(second.exists())
+        self.assertTrue(runner.archive_path(archive_dir, second_receipt).is_file())
+        self.assertEqual(self.store.read()['001', 1]['delivery_state'], 'archived')
+
+    def test_missing_archival_package_does_not_block_new_task_cli(self):
+        output, receipt = self.completed_fixture()
+        runner.archive_path(self.results, receipt).unlink()
+        receipt_path = self.author / 'status/000-new-kind/v1.archived.json'
+        receipt_path.parent.mkdir(parents=True)
+        runner.write_json(receipt_path, receipt)
+        self.commit_task(task_id='001', marker='continue after archive error')
+        result = subprocess.run([sys.executable, '-B', str(self.checkout / 'tools/run_experiments.py'),
+                                 '--once'], text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('archive pending for 000-new-kind v1', result.stderr)
+        self.assertNotIn('poll failed:', result.stderr)
+        self.assertIn('controller_sha256=', result.stdout)
+        self.assertIn('running task 001 v1', result.stdout)
+        self.assertEqual(self.store.read()['001', 1]['state'], 'succeeded')
+        self.assertTrue(output.is_dir())
+        self.assertTrue((self.status_dir / '000-new-kind/v1.archive-error.json').is_file())
 
     def test_legacy_running_status_finishes_without_rerun(self):
         output, receipt = self.completed_fixture(legacy=True)
@@ -334,14 +411,16 @@ class RunnerTest(unittest.TestCase):
     def test_receipt_checksum_and_destination_collision_preserve_data(self):
         output, receipt = self.completed_fixture()
         archive = self.checkout / 'results-archive'
-        with self.assertRaisesRegex(runner.RunnerError, 'checksum'):
-            self.store.archive_receipts([{**receipt, 'archive_sha256': '0' * 64}], self.results, archive)
+        errors = self.store.archive_receipts([{**receipt, 'archive_sha256': '0' * 64}], self.results, archive)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('checksum', errors[0]['reason'])
         self.assertTrue(output.exists())
         target = runner.run_path(archive, receipt)
         target.mkdir(parents=True)
         (target / 'unrelated.log').write_text('retain')
-        with self.assertRaisesRegex(runner.RunnerError, 'both pending and archived'):
-            self.store.archive_receipts([receipt], self.results, archive)
+        errors = self.store.archive_receipts([receipt], self.results, archive)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('both pending and archived', errors[0]['reason'])
         self.assertTrue((output / 'raw.log').is_file())
         self.assertEqual((target / 'unrelated.log').read_text(), 'retain')
         self.assertFalse(list(self.lock_dir.glob('archive-*.lock')))
@@ -356,8 +435,9 @@ class RunnerTest(unittest.TestCase):
                 raise OSError('simulated move interruption')
             return real_rename(path, target)
         with patch.object(Path, 'rename', fail_package):
-            with self.assertRaisesRegex(OSError, 'move interruption'):
-                self.store.archive_receipts([receipt], self.results, archive)
+            errors = self.store.archive_receipts([receipt], self.results, archive)
+            self.assertEqual(len(errors), 1)
+            self.assertIn('move interruption', errors[0]['reason'])
         self.assertFalse(output.exists())
         self.assertTrue(package.is_file())
         self.assertEqual(self.store.read()['000', 1]['delivery_state'], 'awaiting_download')

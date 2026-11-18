@@ -29,6 +29,17 @@ tail -f /tmp/gpu-network-runner.log
 
 `/tmp/gpu-network-simulator.lock` 在每台主机上串行化本项目实验。每台四卡 GB200 设备默认一次执行一个任务，实验处理器决定使用满足任务需求的可见 GPU。`CUDA_VISIBLE_DEVICES` 可限制可见设备，`GPU_NET_SIM_GPU_UUID` 可在单卡 smoke 中指定可见池内的一张卡。`--worker-id` 仅用于记录执行者，默认使用主机名。
 
+## 当前程序依赖
+
+| 任务或固定实现 | 执行依赖 |
+| --- | --- |
+| `000` 系统盘点 | Python 标准库、`nvidia-smi` 与被探测的工具 |
+| `001` GeDES | C++17、CMake、CUDA Toolkit 和 NVIDIA 驱动 |
+| `002` Days AGO CUDA | Rust/Cargo、CUDA 13 与 `cudarc`，另需完成固定版本的 SM100 适配 |
+| `003` 四卡传输 | C++17、NVCC 和 CUDA Runtime |
+
+当前这些程序无需安装 PyTorch 或 NCCL。Days 中的 collective/NCCL 名称用于描述模拟通信，宿主执行依赖以构建清单为准。后续真实训练或 NCCL collective 校准任务会单独声明相应依赖。
+
 ## Python 环境
 
 `tools/runner.sh` 从任意工作目录定位仓库，在以下目录维护运行环境。
@@ -178,6 +189,10 @@ results-archive/000-system-info/000-system-info.v2.tar.gz
 ```
 
 此后 CPFS 的 `results/` 只保留尚未确认归档的数据。实验的 `state` 保持 `succeeded` 或 `failed` 等原结果，`delivery_state` 记录 `awaiting_download` 或 `archived`。失败实验同样可以回收归档。移动中断时可继续处理，遇到不同内容的目标文件会停止并保留数据。崩溃恢复后继续使用同一组结果目录和归档目录。
+
+某个版本的压缩包缺失、改名未被识别或校验冲突时，runner 会保留该版本数据，并写入 `status/000-system-info/v2.archive-error.json` 等诊断记录，列出原因、预期校验和和搜索路径，继续处理其他归档确认及新任务。补齐或修正文件后，后续轮询重新尝试。文件只改名时 SHA-256 保持一致，原始压缩包按确认记录校验。
+
+任务处理器通过拉取的提交更新，runner 控制器修复需要在共享 checkout 更新后重启进程。遇到旧命名兼容问题时，先执行 `git pull --ff-only`，再重启 `bash tools/runner.sh`；运行中的旧控制器不会因 Git 拉取而替换自身代码。
 
 旧版包缺少简称和命令时，工具按实验类型补全简称，并把生成的入口命令标记为复现命令。原始压缩包保持原样，确保已经下载的旧版包也能通过 SHA-256 确认。
 

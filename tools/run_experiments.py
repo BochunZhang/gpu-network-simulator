@@ -30,6 +30,7 @@ RESULT_SUFFIXES = {'.json', '.csv', '.txt'}
 FILE_LIMIT = 2 * 1024**2
 ARCHIVE_LIMIT = 16 * 1024**2
 ID_PATTERN = r'[0-9]{3}'
+CONTROLLER_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 SLUG_PATTERN = r'[a-z0-9]+(?:-[a-z0-9]+)*'
 LEGACY_SLUGS = {'gpu_inventory': 'system-info', 'gedes_smoke': 'gedes-smoke',
                 'days_cuda_smoke': 'days-cuda'}
@@ -102,7 +103,11 @@ def archive_candidates(results, row):
     return [archive_path(root, row),
             root / task_label(row) / f"v{row['version']}.tar.gz",
             root / row['id'] / f"v{row['version']}.tar.gz",
-            root / row['id'] / archive_name(row)]
+            root / row['id'] / archive_name(row),
+            root / archive_name(row),
+            root / task_label(row) / f"{task_label(row)}-v{row['version']}.tar.gz",
+            root / row['id'] / f"{task_label(row)}-v{row['version']}.tar.gz",
+            root / f"{task_label(row)}-v{row['version']}.tar.gz"]
 
 
 def execution_metadata(row):
@@ -476,54 +481,89 @@ class ClaimStore:
         return self.read()
 
     def archive_receipts(self, receipts, results, archive_dir, active_claim=None):
+        failures = []
         for receipt in receipts:
-            validate_receipt(receipt)
-            key = receipt['id'], receipt['version']
-            current = self.read(receipt['id']).get(key)
-            if current is None or current['state'] not in TERMINAL or current['claim'] == active_claim:
+            try:
+                validate_receipt(receipt)
+            except (RunnerError, ValueError) as error:
+                failures.append({'state': 'archive_error', 'reason': str(error)})
+                print(f'archive pending: {error}', file=sys.stderr)
                 continue
-            identity = ('id', 'version', 'claim', 'source_commit', 'task_sha256', 'state')
-            if any(current[field] != receipt[field] for field in identity):
-                raise RunnerError(f'archival receipt does not match execution {key}')
-            if effective_slug(current) != effective_slug(receipt):
-                raise RunnerError(f'archival receipt slug does not match execution {key}')
-            if current.get('delivery_state') == 'archived':
-                if current.get('archive_sha256') != receipt['archive_sha256']:
-                    raise RunnerError(f'archival receipt changed for completed delivery {key}')
-                pending = [run_path(results, receipt), results / receipt['id'] / f"v{receipt['version']}"]
-                pending_packages = archive_candidates(results, receipt)
-                archived_aliases = [path for path in archive_candidates(archive_dir, receipt)
-                                    if path != archive_path(archive_dir, receipt)]
-                if not any(path.exists() for path in (*pending, *pending_packages, *archived_aliases)):
-                    continue
-            guard = self.guard(receipt['id'])
-            if guard.exists():
-                try:
-                    guard_owner = read_json(guard / 'owner.json')
-                except FileNotFoundError:
-                    continue
-                if guard_owner.get('claim') == receipt['claim']:
-                    continue
-            operation = self.lock_dir / f"archive-{receipt['id']}-v{receipt['version']}.lock"
-            owner = {'claim': uuid.uuid4().hex, 'host_id': host_identity(), 'pid': os.getpid()}
+            error_path = self.status_dir / task_label(receipt) / f"v{receipt['version']}.archive-error.json"
             try:
-                operation.mkdir()
-            except FileExistsError:
+                completed = self._archive_receipt(receipt, results, archive_dir, active_claim)
+                if completed:
+                    error_path.unlink(missing_ok=True)
+            except (RunnerError, OSError, ValueError) as error:
+                failure = {
+                    'id': receipt['id'], 'slug': receipt['slug'], 'name': receipt['name'],
+                    'version': receipt['version'], 'state': 'archive_error',
+                    'execution_state': receipt['state'], 'claim': receipt['claim'],
+                    'archive_name': archive_name(receipt), 'archive_sha256': receipt['archive_sha256'],
+                    'reason': str(error), 'updated_at': timestamp(),
+                    'controller_sha256': CONTROLLER_SHA256,
+                    'expected_package_paths': [str(path) for root in (results, archive_dir)
+                                               for path in archive_candidates(root, receipt)],
+                }
+                failures.append(failure)
                 try:
-                    prior_owner = read_json(operation / 'owner.json')
-                except FileNotFoundError:
-                    continue
-                # main holds this host's /tmp lock, so its prior dispatcher has
-                # exited. Another host's unfinished move remains untouched.
-                if prior_owner.get('host_id') != host_identity():
-                    continue
-                owner = prior_owner
-            else:
-                write_json(operation / 'owner.json', owner)
+                    error_path.parent.mkdir(parents=True, exist_ok=True)
+                    write_json(error_path, failure)
+                except OSError as status_error:
+                    print(f'cannot save archive error for {task_label(receipt)}: {status_error}', file=sys.stderr)
+                print(f"archive pending for {task_label(receipt)} v{receipt['version']}: {error}", file=sys.stderr)
+        return failures
+
+    def _archive_receipt(self, receipt, results, archive_dir, active_claim=None):
+        validate_receipt(receipt)
+        key = receipt['id'], receipt['version']
+        current = self.read(receipt['id']).get(key)
+        if current is None or current['state'] not in TERMINAL or current['claim'] == active_claim:
+            return False
+        identity = ('id', 'version', 'claim', 'source_commit', 'task_sha256', 'state')
+        if any(current[field] != receipt[field] for field in identity):
+            raise RunnerError(f'archival receipt does not match execution {key}')
+        if effective_slug(current) != effective_slug(receipt):
+            raise RunnerError(f'archival receipt slug does not match execution {key}')
+        if current.get('delivery_state') == 'archived':
+            if current.get('archive_sha256') != receipt['archive_sha256']:
+                raise RunnerError(f'archival receipt changed for completed delivery {key}')
+            pending = [run_path(results, receipt), results / receipt['id'] / f"v{receipt['version']}"]
+            pending_packages = archive_candidates(results, receipt)
+            archived_aliases = [path for path in archive_candidates(archive_dir, receipt)
+                                if path != archive_path(archive_dir, receipt)]
+            if not any(path.exists() for path in (*pending, *pending_packages, *archived_aliases)):
+                return True
+        guard = self.guard(receipt['id'])
+        if guard.exists():
             try:
-                self._archive_one(receipt, current, results, archive_dir, identity)
-            finally:
-                remove_owned_directory(operation, owner)
+                guard_owner = read_json(guard / 'owner.json')
+            except FileNotFoundError:
+                return False
+            if guard_owner.get('claim') == receipt['claim']:
+                return False
+        operation = self.lock_dir / f"archive-{receipt['id']}-v{receipt['version']}.lock"
+        owner = {'claim': uuid.uuid4().hex, 'host_id': host_identity(), 'pid': os.getpid()}
+        try:
+            operation.mkdir()
+        except FileExistsError:
+            try:
+                prior_owner = read_json(operation / 'owner.json')
+            except FileNotFoundError:
+                return False
+            # main holds this host's /tmp lock, so its prior dispatcher has
+            # exited. Another host's unfinished move remains untouched.
+            if prior_owner.get('host_id') != host_identity():
+                return False
+            owner = prior_owner
+        else:
+            write_json(operation / 'owner.json', owner)
+        try:
+            self._archive_one(receipt, current, results, archive_dir, identity)
+        finally:
+            remove_owned_directory(operation, owner)
+
+        return True
 
     def _archive_one(self, receipt, current, results, archive_dir, identity):
         destination = run_path(archive_dir, receipt)
@@ -833,7 +873,7 @@ def start_task(queue, source, store, results, worker, fd, available_gpus, task_i
         output.mkdir(parents=True)
         script = Path(__file__).resolve()
         run = {**row, 'task': task, 'lock_dir': str(store.lock_dir),
-               'runner_sha256': hashlib.sha256(script.read_bytes()).hexdigest()}
+               'runner_sha256': CONTROLLER_SHA256}
         if prepared:
             run['prepared_base'] = prepared
         write_json(output / 'run.json', run)
@@ -929,7 +969,8 @@ def main():
                 store.abandon(args.results_dir, task_id, int(version))
                 return 0
             args.gpu_count = gpu_count()
-            print(f'CPFS worker {args.worker_id}, {args.gpu_count} GPUs; shared locks {args.lock_dir}', flush=True)
+            print(f'CPFS worker {args.worker_id}, {args.gpu_count} GPUs; shared locks {args.lock_dir}; '
+                  f'controller_sha256={CONTROLLER_SHA256} pid={os.getpid()}', flush=True)
             return poll(queue, store, args, fd)
     except (RunnerError, OSError, ValueError) as exc:
         print(exc, file=sys.stderr)
