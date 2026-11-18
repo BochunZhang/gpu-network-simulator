@@ -1,0 +1,21 @@
+{
+  "archive_name": "days-ago-000-fat-tree48-18432-00.v1795008575.tar.gz",
+  "archive_sha256": "8261eefea2b7bbb18062f019c507be28c912b223d3e6ec24765bbd7bbf213ac3",
+  "archive_size": 2781,
+  "archived_at": "2026-11-18T14:44:16+00:00",
+  "claim": "b661d84c4e9042f585c4050559be2c7d",
+  "command": "bash tools/runner.sh --task days-ago-000-fat-tree48-18432-00 --once",
+  "command_source": "recorded",
+  "id": "days-ago-000-fat-tree48-18432-00",
+  "name": "Days AGO FatTree48 k48/h16 wall-clock timing on one GB200",
+  "parent_id": "days-ago-000-fat-tree48-18432",
+  "schema_version": 1,
+  "slug": "fat-tree48-18432",
+  "source_commit": "3a4d1dc1b6c5e9d7acce35ed9cf41b064f7ae3fa",
+  "state": "failed",
+  "subtask_id": "00",
+  "subtask_status": "2026-11-18T13:29:35Z",
+  "task_sha256": "31800a0777ba1c1f2afc47c283bd71629d9732076aba2259911adb47521ef138",
+  "task_status": "2026-11-18T13:29:35Z",
+  "version": 1795008575
+}
