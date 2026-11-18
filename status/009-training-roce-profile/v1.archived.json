@@ -1,0 +1,17 @@
+{
+  "archive_name": "009-training-roce-profile.v1.tar.gz",
+  "archive_sha256": "c856d012b1fb6065be78dc830cbe3c88d14840a21db770f2240a73b79c8b2216",
+  "archive_size": 61006,
+  "archived_at": "2026-11-18T11:17:48+00:00",
+  "claim": "f3220dcd26304892ae244902501e9336",
+  "command": "bash tools/runner.sh --task 009 --once",
+  "command_source": "recorded",
+  "id": "009",
+  "name": "Profile single GPU RC packet transitions",
+  "schema_version": 1,
+  "slug": "training-roce-profile",
+  "source_commit": "32afe699578c4bdd5df9a1c3fb8a9770fa5f7811",
+  "state": "succeeded",
+  "task_sha256": "a36abc85b3ec4521e7472ae6c21604ec33bfe58ecd682b6eae67647048f61009",
+  "version": 1
+}
