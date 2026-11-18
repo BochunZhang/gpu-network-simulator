@@ -1,0 +1,17 @@
+{
+  "archive_name": "003-gpu-transfer.v1.tar.gz",
+  "archive_sha256": "649f2db6d0ae370fda45fd0814a8a808670d8103aaca8fa22d0c391df6cb346e",
+  "archive_size": 5396,
+  "archived_at": "2026-11-18T07:34:48+00:00",
+  "claim": "6caad1db45b84e1a97b6459592c0b014",
+  "command": "bash tools/runner.sh --task 003 --once",
+  "command_source": "recorded",
+  "id": "003",
+  "name": "Four-GPU device and peer-copy baseline",
+  "schema_version": 1,
+  "slug": "gpu-transfer",
+  "source_commit": "3b0a64f39e728cfd97501c8dc02dcce68290a9b4",
+  "state": "succeeded",
+  "task_sha256": "231bb97b3534087a24e3509626f59936ebf767e382f6a99aa5045e5d0d40bfdd",
+  "version": 1
+}
