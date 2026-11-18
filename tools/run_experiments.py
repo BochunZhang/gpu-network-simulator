@@ -28,6 +28,9 @@ RESULT_SUFFIXES = {'.json', '.csv', '.txt'}
 FILE_LIMIT = 2 * 1024**2
 ARCHIVE_LIMIT = 16 * 1024**2
 ID_PATTERN = r'[0-9]{3}'
+SLUG_PATTERN = r'[a-z0-9]+(?:-[a-z0-9]+)*'
+LEGACY_SLUGS = {'gpu_inventory': 'system-info', 'gedes_smoke': 'gedes-smoke',
+                'days_cuda_smoke': 'days-cuda'}
 
 
 class RunnerError(Exception):
@@ -67,6 +70,54 @@ def read_json(path):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
+def effective_slug(row):
+    task = row.get('task') if isinstance(row.get('task'), dict) else {}
+    slug = row.get('slug') or task.get('slug') or LEGACY_SLUGS.get(row.get('kind'))
+    if slug is None:
+        slug = re.sub('[^a-z0-9]+', '-', str(row.get('kind', 'task')).lower()).strip('-') or 'task'
+    if not isinstance(slug, str) or len(slug) > 63 or not re.fullmatch(SLUG_PATTERN, slug):
+        raise RunnerError('invalid task slug')
+    return slug
+
+
+def task_label(row):
+    return f"{row['id']}-{effective_slug(row)}"
+
+
+def execution_metadata(row):
+    row = dict(row)
+    row['slug'] = effective_slug(row)
+    task = row.get('task') if isinstance(row.get('task'), dict) else {}
+    row.setdefault('name', task.get('name', row['slug']))
+    row.setdefault('command', task.get('command') or
+                   f"bash tools/runner.sh --task {row['id']} --once")
+    return row
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_receipt(row, path=None):
+    if (not isinstance(row, dict) or row.get('schema_version') != 1
+            or not isinstance(row.get('id'), str) or not re.fullmatch(ID_PATTERN, row['id'])
+            or type(row.get('version')) is not int or row['version'] < 1
+            or row.get('state') not in TERMINAL
+            or any(not isinstance(row.get(key), str) or not row[key].strip()
+                   for key in ('slug', 'name', 'command', 'claim', 'archived_at'))
+            or not isinstance(row.get('source_commit'), str)
+            or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', row['source_commit'])
+            or any(not isinstance(row.get(key), str) or not re.fullmatch(r'[0-9a-f]{64}', row[key])
+                   for key in ('task_sha256', 'archive_sha256'))):
+        raise RunnerError(f'invalid archival receipt: {path}')
+    effective_slug(row)
+    return row
+
+
 def validate_record(row, path):
     if (not isinstance(row, dict)
             or not isinstance(row.get('id'), str) or not re.fullmatch(ID_PATTERN, row['id'])
@@ -75,7 +126,7 @@ def validate_record(row, path):
             or any(not isinstance(row.get(key), str) for key in
                    ('claim', 'host_id', 'worker', 'task_sha256', 'source_commit'))):
         raise RunnerError(f'invalid execution record: {path}')
-    return row
+    return execution_metadata(row)
 
 
 def inherited_fds():
@@ -212,6 +263,9 @@ class Queue:
             if (not isinstance(task.get('id'), str) or not re.fullmatch(ID_PATTERN, task['id'])
                     or path != f"tasks/{task['id']}.json"
                     or not isinstance(task.get('name'), str) or not task['name'].strip()
+                    or not isinstance(task.get('slug'), str) or len(task['slug']) > 63
+                    or not re.fullmatch(SLUG_PATTERN, task['slug'])
+                    or not isinstance(task.get('command'), str) or not task['command'].strip()
                     or type(task.get('version')) is not int or task['version'] < 1
                     or not isinstance(task.get('kind'), str) or not task['kind']
                     or not isinstance(task.get('params'), dict)
@@ -219,12 +273,25 @@ class Queue:
                     or not isinstance(task.get('description', ''), str)
                     or not isinstance(resources, dict) or set(resources) - {'gpus'}
                     or type(resources.get('gpus', 0)) is not int or resources.get('gpus', 0) < 0
-                    or set(task) - {'id', 'name', 'version', 'kind', 'params', 'resources', 'enabled', 'description'}):
+                    or set(task) - {'id', 'name', 'slug', 'command', 'version', 'kind', 'params', 'resources', 'enabled', 'description'}):
                 raise RunnerError(f'invalid task manifest: {path}')
-            definition = {key: value for key, value in task.items() if key not in {'description', 'enabled'}}
+            definition = {key: value for key, value in task.items() if key not in {'description', 'enabled', 'slug', 'command'}}
             digest = hashlib.sha256(encode(definition).encode()).hexdigest()
             tasks.append((task, digest))
         return sorted(tasks, key=lambda item: item[0]['id'])
+
+
+    def archived_receipts(self, source):
+        paths = self.git('ls-tree', '-rz', '--name-only', source, '--', 'status/').stdout.split('\0')
+        receipts = []
+        for path in paths:
+            if not re.fullmatch(r'status/[0-9]{3}-[a-z0-9-]+/v[1-9][0-9]*\.archived\.json', path):
+                continue
+            row = validate_receipt(json.loads(self.git('show', f'{source}:{path}').stdout), path)
+            if path != f"status/{task_label(row)}/v{row['version']}.archived.json":
+                raise RunnerError(f'archival receipt path does not match record: {path}')
+            receipts.append(row)
+        return receipts
 
 
 class ClaimStore:
@@ -238,31 +305,47 @@ class ClaimStore:
     def reservation(self, task_id, version):
         return self.lock_dir / f'{task_id}.v{version}.lock'
 
-    def path(self, task_id, version):
-        return self.status_dir / task_id / f'v{version}.json'
+    def path(self, task_id, version, row=None):
+        if row is not None:
+            return self.status_dir / task_label(row) / f'v{version}.json'
+        matches = list(self.status_dir.glob(f'{task_id}-*/v{version}.json'))
+        return matches[0] if matches else self.status_dir / task_id / f'v{version}.json'
 
     def read(self, task_id=None):
-        paths = self.status_dir.glob(f'{task_id}/v*.json' if task_id else '[0-9][0-9][0-9]/v*.json')
+        paths = self.status_dir.glob(f'{task_id}*/v*.json' if task_id else '[0-9][0-9][0-9]*/v*.json')
         rows = {}
         for path in paths:
+            if not re.fullmatch(r'v[1-9][0-9]*\.json', path.name):
+                continue
             row = validate_record(read_json(path), path)
-            if path != self.path(row['id'], row['version']):
+            if path.parent.name not in {row['id'], task_label(row)}:
                 raise RunnerError(f'status path does not match execution record: {path}')
-            rows[row['id'], row['version']] = row
+            key = row['id'], row['version']
+            previous = rows.get(key)
+            if previous and any(previous[field] != row[field]
+                                for field in ('claim', 'source_commit', 'task_sha256')):
+                raise RunnerError(f'conflicting legacy and named status: {path}')
+            if previous and previous['state'] in TERMINAL and row['state'] in TERMINAL and previous['state'] != row['state']:
+                raise RunnerError(f'conflicting terminal status: {path}')
+            if (previous is None or row['state'] in TERMINAL and previous['state'] == 'running'
+                    or previous['state'] == row['state'] and path.parent.name == task_label(row)):
+                rows[key] = row
         return rows
 
     def save(self, row):
         validate_record(row, self.status_dir)
-        path = self.path(row['id'], row['version'])
+        row = execution_metadata(row)
+        path = self.path(row['id'], row['version'], row)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, row)
 
     def claim(self, task, digest, source, results, worker):
         task_id, version = task['id'], task['version']
-        row = {'id': task_id, 'name': task['name'], 'version': version, 'kind': task['kind'],
+        row = {'id': task_id, 'name': task['name'], 'slug': task['slug'],
+               'command': task['command'], 'version': version, 'kind': task['kind'],
                'task_sha256': digest, 'source_commit': source, 'worker': worker,
                'host_id': host_identity(), 'claim': uuid.uuid4().hex,
-               'state': 'running', 'claimed_at': timestamp()}
+               'state': 'running', 'delivery_state': 'awaiting_download', 'claimed_at': timestamp()}
         self.lock_dir.mkdir(parents=True, exist_ok=True)
         guard = self.guard(task_id)
         try:
@@ -284,7 +367,8 @@ class ClaimStore:
             if any(previous['version'] >= version or previous['state'] == 'running' for previous in prior):
                 return None
             output = run_path(results, row)
-            if output.exists():
+            legacy_output = results / task_id / f'v{version}'
+            if output.exists() or legacy_output.exists():
                 raise RunnerError(f'result path already exists: {output}')
             reservation = self.reservation(task_id, version)
             try:
@@ -313,20 +397,121 @@ class ClaimStore:
             raise RunnerError('result does not match shared status')
         if current and current['state'] in TERMINAL and current['state'] != row['state']:
             raise RunnerError('terminal result and status disagree')
-        self.save(row)
+        if current and current['state'] in TERMINAL:
+            # Archival metadata is written by another CPFS worker. Replaying an
+            # old result must never replace its delivery confirmation.
+            row = current
+        else:
+            self.save(row)
         # Keep this reservation forever, including on failure. Even a stale
         # cached status listing cannot cause the same version to execute again.
         write_json(reservation / 'owner.json', row)
         remove_owned_directory(self.guard(row['id']), row)
 
     def reconcile(self, results, active_claim=None):
-        for path in sorted(results.glob('[0-9][0-9][0-9]/v*/result.json')):
+        for path in sorted(results.glob('[0-9][0-9][0-9]*/v*/result.json')):
             row = validate_record(read_json(path), path)
-            if path.parent != run_path(results, row) or row['state'] not in TERMINAL:
+            valid_paths = {run_path(results, row), results / row['id'] / f"v{row['version']}"}
+            if path.parent not in valid_paths or row['state'] not in TERMINAL:
                 raise RunnerError(f'invalid terminal result path: {path}')
             if row['host_id'] == host_identity() and row['claim'] != active_claim:
                 self.finish(row)
         return self.read()
+
+    def archive_receipts(self, receipts, results, archive_dir, active_claim=None):
+        for receipt in receipts:
+            validate_receipt(receipt)
+            key = receipt['id'], receipt['version']
+            current = self.read(receipt['id']).get(key)
+            if current is None or current['state'] not in TERMINAL or current['claim'] == active_claim:
+                continue
+            identity = ('id', 'version', 'claim', 'source_commit', 'task_sha256', 'state')
+            if any(current[field] != receipt[field] for field in identity):
+                raise RunnerError(f'archival receipt does not match execution {key}')
+            if effective_slug(current) != effective_slug(receipt):
+                raise RunnerError(f'archival receipt slug does not match execution {key}')
+            if current.get('delivery_state') == 'archived':
+                if current.get('archive_sha256') != receipt['archive_sha256']:
+                    raise RunnerError(f'archival receipt changed for completed delivery {key}')
+                pending = [run_path(results, receipt), results / receipt['id'] / f"v{receipt['version']}"]
+                if not any(path.exists() or path.with_suffix('.tar.gz').exists() for path in pending):
+                    continue
+            guard = self.guard(receipt['id'])
+            if guard.exists():
+                try:
+                    guard_owner = read_json(guard / 'owner.json')
+                except FileNotFoundError:
+                    continue
+                if guard_owner.get('claim') == receipt['claim']:
+                    continue
+            operation = self.lock_dir / f"archive-{receipt['id']}-v{receipt['version']}.lock"
+            owner = {'claim': uuid.uuid4().hex, 'host_id': host_identity(), 'pid': os.getpid()}
+            try:
+                operation.mkdir()
+            except FileExistsError:
+                try:
+                    prior_owner = read_json(operation / 'owner.json')
+                except FileNotFoundError:
+                    continue
+                # main holds this host's /tmp lock, so its prior dispatcher has
+                # exited. Another host's unfinished move remains untouched.
+                if prior_owner.get('host_id') != host_identity():
+                    continue
+                owner = prior_owner
+            else:
+                write_json(operation / 'owner.json', owner)
+            try:
+                self._archive_one(receipt, current, results, archive_dir, identity)
+            finally:
+                remove_owned_directory(operation, owner)
+
+    def _archive_one(self, receipt, current, results, archive_dir, identity):
+        destination = run_path(archive_dir, receipt)
+        candidates = [run_path(results, receipt), results / receipt['id'] / f"v{receipt['version']}"]
+        sources = [path for path in candidates if path.exists()]
+        if len(sources) > 1:
+            raise RunnerError(f'both legacy and named results exist for {task_label(receipt)}')
+        source = sources[0] if sources else None
+        source_packages = [path.with_suffix('.tar.gz') for path in candidates if path.with_suffix('.tar.gz').is_file()]
+        if len(source_packages) > 1:
+            raise RunnerError(f'both legacy and named packages exist for {task_label(receipt)}')
+        source_package = source_packages[0] if source_packages else None
+        destination_package = destination.with_suffix('.tar.gz')
+        for package in (source_package, destination_package if destination_package.exists() else None):
+            if package is not None and sha256_file(package) != receipt['archive_sha256']:
+                raise RunnerError(f'archival package checksum mismatch: {package}')
+        if source_package is None and not destination_package.is_file():
+            raise RunnerError(f'archival package is missing for {task_label(receipt)}')
+        if source is not None and destination.exists():
+            raise RunnerError(f'both pending and archived raw directories exist: {destination}')
+        raw = source or destination
+        if not raw.is_dir():
+            raise RunnerError(f'raw result directory is missing for {task_label(receipt)}')
+        raw_record = validate_record(read_json(raw / 'result.json'), raw)
+        if any(raw_record[field] != receipt[field] for field in identity):
+            raise RunnerError(f'archival raw result identity mismatch: {raw}')
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source is not None:
+            source.rename(destination)
+        if source_package is not None:
+            if destination_package.exists():
+                source_package.unlink()  # Both exact compressed hashes matched.
+            else:
+                source_package.rename(destination_package)
+        # Re-read after the move; an old result replay never writes delivery
+        # metadata over a terminal shared status.
+        latest = self.read(receipt['id']).get((receipt['id'], receipt['version']), current)
+        if any(latest[field] != receipt[field] for field in identity):
+            raise RunnerError('shared status changed while archiving completed data')
+        self.save({**latest, 'slug': receipt['slug'], 'command': receipt['command'],
+                   'delivery_state': 'archived', 'archived_at': receipt['archived_at'],
+                   'archive_sha256': receipt['archive_sha256']})
+        for parent in {path.parent for path in candidates}:
+            try:
+                parent.rmdir()  # Remove only empty pending task folders.
+            except OSError:
+                pass
+        print(f"archived downloaded results {task_label(receipt)} v{receipt['version']}", flush=True)
 
     def abandon(self, results, task_id, version):
         self.reconcile(results)
@@ -355,7 +540,7 @@ class ClaimStore:
 
 
 def run_path(results, row):
-    return results / row['id'] / f"v{row['version']}"
+    return results / task_label(row) / f"v{row['version']}"
 
 
 def prepare_archive(output, record):
@@ -385,7 +570,7 @@ def prepare_archive(output, record):
 
 
 def execute(queue, output):
-    run = read_json(output / 'run.json')
+    run = execution_metadata(read_json(output / 'run.json'))
     record = dict(run)
     try:
         with tempfile.TemporaryDirectory(prefix='gpu-network-simulator-source-') as temp:
@@ -404,6 +589,9 @@ def execute(queue, output):
         traceback.print_exc()
         record.update(state='failed', exit_code=getattr(exc, 'returncode', 1), error=str(exc))
     record['finished_at'] = timestamp()
+    command_log = output / 'commands.json'
+    if command_log.is_file():
+        record['commands'] = read_json(command_log)
     try:
         prepare_archive(output, record)
     except (OSError, tarfile.TarError) as exc:
@@ -441,8 +629,10 @@ def gpu_count():
     return len(selected)
 
 
-def start_task(queue, source, store, results, worker, fd, available_gpus):
+def start_task(queue, source, store, results, worker, fd, available_gpus, task_id=None):
     for task, digest in queue.tasks(source):
+        if task_id is not None and task['id'] != task_id:
+            continue
         if not task.get('enabled', True) or task.get('resources', {}).get('gpus', 0) > available_gpus:
             continue
         row = store.claim(task, digest, source, results, worker)
@@ -483,8 +673,11 @@ def poll(queue, store, args, fd):
             if args.once and result is not None:
                 return int(result != 0)
             source = queue.source()
+            archive_dir = getattr(args, 'archive_dir', queue.root / 'results-archive')
+            store.archive_receipts(queue.archived_receipts(source), args.results_dir, archive_dir,
+                                   active[2] if active else None)
             if active is None:
-                active = start_task(queue, source, store, args.results_dir, args.worker_id, fd, args.gpu_count)
+                active = start_task(queue, source, store, args.results_dir, args.worker_id, fd, args.gpu_count, getattr(args, 'task', None))
                 if active is None and args.once:
                     return 0
         except (RunnerError, OSError, ValueError) as exc:
@@ -516,14 +709,18 @@ def main():
     mode.add_argument('--abandon', nargs=2, metavar=('ID', 'VERSION'), help='recover a stopped task on its original host')
     mode.add_argument('--recover-git-lock', action='store_true', help='recover a stale Git mutex on its original host')
     cli.add_argument('--source-branch', default='main')
+    cli.add_argument('--task', help='run only this three-digit task, still using shared claims')
     cli.add_argument('--lock-dir', type=Path, default=root / '.lock')
     cli.add_argument('--status-dir', type=Path, default=root / 'status')
     cli.add_argument('--results-dir', type=Path, default=root / 'results')
+    cli.add_argument('--archive-dir', type=Path, default=root / 'results-archive')
     cli.add_argument('--worker-id', default=socket.gethostname(), help='owner label for status, never a task assignment')
     args = cli.parse_args()
-    for name in ('lock_dir', 'status_dir', 'results_dir'):
+    for name in ('lock_dir', 'status_dir', 'results_dir', 'archive_dir'):
         setattr(args, name, getattr(args, name).resolve())
     try:
+        if args.task is not None and not re.fullmatch(ID_PATTERN, args.task):
+            raise RunnerError('--task requires a three-digit task ID')
         with device_lock(LOCK_PATH) as fd:
             os.environ['GPU_NET_SIM_LOCK_FD'] = str(fd)
             queue = Queue(root, args.source_branch, args.lock_dir)

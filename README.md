@@ -46,7 +46,9 @@ tail -f /tmp/gpu-network-runner.log
 {
   "id": "000",
   "name": "GB200 four-GPU hardware inventory",
+  "slug": "system-info",
   "version": 1,
+  "command": "bash tools/runner.sh --task 000 --once",
   "kind": "gpu_inventory",
   "params": {},
   "resources": {"gpus": 4},
@@ -58,13 +60,17 @@ tail -f /tmp/gpu-network-runner.log
 | 字段 | 含义 |
 | --- | --- |
 | `id` | 必填，三位编号，与文件名一致。 |
-| `name` | 必填，任务名称。 |
+| `name` | 必填，任务完整名称。 |
+| `slug` | 必填，简短的英文名称，如 `system-info`，用于状态和结果目录。 |
+| `command` | 必填，复现实验的执行器入口命令，写入运行状态。 |
 | `version` | 必填，正整数。修正代码或配置时递增，同一次提交包含代码和清单。 |
 | `kind` | 必填，由该提交中的 `tools/experiment_handlers.py` 识别的实验类型。 |
 | `params` | 必填，该处理器的参数对象。当前 smoke 使用空对象。 |
 | `resources.gpus` | 可选，所需最少可见 GPU 数量，默认 0。设备满足数量后才能领取。 |
 | `enabled` | 可选，默认 `true`。设为 `false` 暂停领取。 |
 | `description` | 可选，实验说明与通过条件。 |
+
+运行状态包含任务名称、简称、入口命令、源码提交和执行主机。处理器将实际调用的程序、完整参数、工作目录、退出码与时间写入 `commands.json`，并带入结果记录。新增 `slug` 和 `command` 保持现有实验版本，旧的 `000/v1` 状态和结果继续读取。
 
 任务清单共享给所有设备。各设备按编号尝试领取可运行任务，已经被占用的任务会跳过，继续寻找其他任务。同一任务的新版本等旧版本释放任务锁后才执行。实验代码和处理器随拉取的提交更新，新增处理器会自动生效。升级调度器本身时，待当前实验完成后停止各台轮询器，更新共享 checkout，再重启入口。
 
@@ -83,9 +89,9 @@ tail -f /tmp/gpu-network-runner.log
 ```text
 .lock/000.task.lock/      同一任务所有版本共用的执行锁
 .lock/000.v1.lock/        任务 000 版本 1 的永久领取记录
-status/000/v1.json        共享状态
-results/000/v1/           执行记录、日志和输出
-results/000/v1.tar.gz     手动下载的摘要包
+status/000-system-info/v1.json        共享状态
+results/000-system-info/v1/           执行记录、日志和输出
+results/000-system-info/v1.tar.gz     手动下载的摘要包
 ```
 
 领取通过原子 `mkdir` 竞争。完成后先保存终态，再释放任务执行锁，保留版本领取记录。版本锁中保存主机、进程、领取标识及版本信息。重复启动会跳过已领取的版本。同一共享 checkout 的 Git 拉取和源码导出通过短期目录锁串行化，实验从独立快照执行。
@@ -100,14 +106,35 @@ bash tools/runner.sh --abandon 000 1
 
 如果原主机的 Git 拉取进程崩溃并留下 Git 协调锁，确认该进程已退出后，在原主机执行 `bash tools/runner.sh --recover-git-lock`。环境初始化崩溃遗留的锁需要根据其中的主机和进程记录人工检查后恢复。若崩溃发生在目录创建后、`owner.json` 写入前，该目录会保持阻塞。此时先停止可能持有该锁的轮询器及子进程，确认已全部退出，再人工移走该孤立目录并保留恢复记录。正常运行时保留 `.lock/`、`status/` 和 `results/`，供后续启动检查。
 
-## 下载结果
+## 结果回收与归档
 
 ```bash
-cat status/000/v1.json
-cat results/000/v1/result.json
+cat status/000-system-info/v1.json
+cat results/000-system-info/v1/result.json
 ```
 
-把 `results/000/v1.tar.gz` 从 CPFS 下载并发送给分析端。摘要包包含执行版本、源码提交、小型统计与 CSV。构建日志和大 trace 保留在结果目录，临时源码与构建目录会清理。失败结果也应保留，分析时可另取 `worker.log`、`configure.log` 和 `build.log`。
+GPU 设备完成后，`results/000-system-info/v1/` 和同级 `v1.tar.gz` 表示待下载数据。把原始 `v1.tar.gz` 下载到本地分析仓库的 `results-remote/`，保留压缩包原始字节。文件可放进子目录，归档工具通过包内执行记录确定任务身份。
+
+```bash
+python3 tools/archive_results.py
+```
+
+归档工具校验包内记录和文件，再写入本地 `results/000-system-info/v1/`，保留同级原始 `v1.tar.gz`，生成 `status/000-system-info/v1.archived.json`。成功归档后清理已消费的输入包，重复导入同一个包会校验并跳过。输入目录支持完整的 `.tar.gz` 结果包，松散目录保持原样供人工检查。
+
+分析端随后把 `v1.archived.json` 提交并推送到 `main`。确认记录包含执行状态、简称、命令、领取标识、源码提交和原始压缩包的 SHA-256。原始结果、`results-remote/` 与 `results-archive/` 保留在本地，Git 跟踪归档确认记录。
+
+CPFS 执行器下一次拉取后，核对确认记录与本机压缩包和执行身份，随后把远程端数据移到以下路径。
+
+```text
+results-archive/000-system-info/v1/
+results-archive/000-system-info/v1.tar.gz
+```
+
+此后 CPFS 的 `results/` 只保留尚未确认归档的数据。实验的 `state` 保持 `succeeded` 或 `failed` 等原结果，`delivery_state` 记录 `awaiting_download` 或 `archived`。失败实验同样可以回收归档。移动中断时可继续处理，遇到不同内容的目标文件会停止并保留数据。崩溃恢复后继续使用同一组结果目录和归档目录。
+
+旧版包缺少简称和命令时，工具按实验类型补全简称，并把生成的入口命令标记为复现命令。原始压缩包保持原样，确保已经下载的旧版包也能通过 SHA-256 确认。
+
+构建日志和大 trace 保留在远程结果目录，随版本目录一起移入 `results-archive/`。摘要包包含执行记录、小型统计与 CSV，分析时可另取 `worker.log`、`configure.log` 和 `build.log`。
 
 本地检查可运行以下命令，GPU 性能与 CPFS 跨机行为仍以目标设备上的实验为准。
 

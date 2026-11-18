@@ -1,5 +1,5 @@
-共享任务状态写入 `status/{三位编号}/v{version}.json`。例如 `status/000/v1.json`。
+CPFS 运行状态写入 `status/{三位编号}-{简称}/v{version}.json`，例如 `status/000-system-info/v1.json`。状态中包含任务名称、简称、命令、版本、源码提交、执行主机和结果。
 
-CPFS 上所有执行设备使用同一组 `.lock/`、`status/` 和 `results/`。通过原子目录创建抢占任务，同一任务各版本共用执行锁，每个版本保留永久领取记录。状态与结果供用户手动下载。
+本地分析端导入 `results-remote/` 的原始结果包后，生成同目录下的 `v1.archived.json` 并提交到 Git。CPFS 执行器拉取该确认记录，验证执行身份和压缩包 SHA-256，再把远程数据从 `results/` 移到 `results-archive/`。
 
-保留运行状态与锁目录供重启检查。异常恢复、任务版本更新和结果下载方式见根目录 README。
+`vN.json` 是共享文件系统上的运行状态，`vN.archived.json` 是 Git 跟踪的归档确认。执行状态和归档状态分别记录，任务锁与版本记录保留。具体步骤见根目录 README。

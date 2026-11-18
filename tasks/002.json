@@ -8,5 +8,7 @@
     "gpus": 1
   },
   "enabled": false,
-  "description": "Enable after a separately recorded SM100 port; the pinned upstream supports SM86, SM89 and SM121."
+  "description": "Enable after a separately recorded SM100 port; the pinned upstream supports SM86, SM89 and SM121.",
+  "slug": "days-cuda",
+  "command": "bash tools/runner.sh --task 002 --once"
 }

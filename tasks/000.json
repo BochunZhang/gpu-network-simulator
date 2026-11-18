@@ -8,5 +8,7 @@
     "gpus": 4
   },
   "enabled": true,
-  "description": "Record all four NVIDIA GPUs, memory, SM capability, NVLink topology, driver and build tools."
+  "description": "Record all four NVIDIA GPUs, memory, SM capability, NVLink topology, driver and build tools.",
+  "slug": "system-info",
+  "command": "bash tools/runner.sh --task 000 --once"
 }

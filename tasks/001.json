@@ -8,5 +8,7 @@
     "gpus": 1
   },
   "enabled": true,
-  "description": "Build the pinned GeDES source for the observed GPU architecture and check positive completed flows."
+  "description": "Build the pinned GeDES source for the observed GPU architecture and check positive completed flows.",
+  "slug": "gedes-smoke",
+  "command": "bash tools/runner.sh --task 001 --once"
 }

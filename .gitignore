@@ -1,5 +1,8 @@
 /results/
-/status/*/
+/results-remote/
+/results-archive/
+/status/*/*
+!/status/*/v*.archived.json
 /.lock/
 /.python/
 /.venv/

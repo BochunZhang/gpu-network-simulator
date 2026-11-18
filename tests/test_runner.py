@@ -47,7 +47,8 @@ class RunnerTest(unittest.TestCase):
 
     def commit_task(self, task_id='000', version=1, marker='original', **fields):
         task = {'id': task_id, 'name': 'Smoke task', 'version': version,
-                'kind': 'new_kind', 'params': {}, **fields}
+                'kind': 'new_kind', 'params': {}, 'slug': 'new-kind',
+                'command': f'bash tools/runner.sh --task {task_id} --once', **fields}
         runner.write_json(self.author / f'tasks/{task_id}.json', task)
         (self.author / 'tools/experiment_handlers.py').write_text(
             'def prepare(kind, params):\n'
@@ -70,6 +71,124 @@ class RunnerTest(unittest.TestCase):
         source, task, digest = self.source_task(task_id)
         row = self.store.claim(task, digest, source, self.results, 'test-host')
         return task, row
+
+    def completed_fixture(self, legacy=False):
+        task, row = self.claim()
+        if legacy:
+            row = {key: value for key, value in row.items() if key not in {'slug', 'command'}}
+            self.store.path('000', 1).unlink()
+            legacy_status = self.status_dir / '000' / 'v1.json'
+            legacy_status.parent.mkdir(parents=True)
+            runner.write_json(legacy_status, row)
+            output = self.results / '000' / 'v1'
+        else:
+            output = runner.run_path(self.results, row)
+        output.mkdir(parents=True)
+        runner.write_json(output / 'run.json', {**row, 'task': task})
+        self.assertEqual(runner.execute(self.queue, output), 0)
+        self.store.reconcile(self.results)
+        result = runner.read_json(output / 'result.json')
+        receipt = {key: result[key] for key in
+                   ('id', 'slug', 'name', 'version', 'claim', 'source_commit', 'task_sha256', 'state', 'command')}
+        receipt.update(schema_version=1, archive_sha256=runner.sha256_file(output.with_suffix('.tar.gz')),
+                       archived_at='2026-11-18T00:00:00+00:00')
+        return output, receipt
+
+    def test_slug_metadata_legacy_digest_and_status_filter(self):
+        source, task, digest = self.source_task()
+        legacy = {key: value for key, value in task.items() if key not in {'slug', 'command'}}
+        definition = {key: value for key, value in legacy.items() if key not in {'description', 'enabled'}}
+        import hashlib
+        self.assertEqual(digest, hashlib.sha256(runner.encode(definition).encode()).hexdigest())
+        _, row = self.claim()
+        self.assertEqual(runner.task_label(row), '000-new-kind')
+        self.assertEqual(row['command'], 'bash tools/runner.sh --task 000 --once')
+        receipt_path = self.status_dir / '000-new-kind' / 'v1.archived.json'
+        runner.write_json(receipt_path, {'not': 'a runtime status'})
+        self.assertEqual(set(self.store.read()), {('000', 1)})
+
+    def test_legacy_running_status_finishes_without_rerun(self):
+        output, receipt = self.completed_fixture(legacy=True)
+        self.assertEqual(output.parent.name, '000')
+        self.store.reconcile(self.results)
+        self.assertEqual(self.store.read()['000', 1]['state'], 'succeeded')
+        source, task, digest = self.source_task()
+        self.assertIsNone(self.store.claim(task, digest, source, self.results, 'again'))
+        archive = self.checkout / 'results-archive'
+        self.store.archive_receipts([receipt], self.results, archive)
+        self.assertTrue((archive / '000-new-kind' / 'v1.tar.gz').is_file())
+        self.assertFalse((self.results / '000').exists())
+
+    def test_receipt_moves_and_preserves_execution_and_newer_task(self):
+        output, receipt = self.completed_fixture()
+        self.commit_task(version=2)
+        _, second = self.claim()
+        old_guard = runner.read_json(self.store.guard('000') / 'owner.json')
+        archive = self.checkout / 'results-archive'
+        self.store.archive_receipts([receipt], self.results, archive)
+        self.assertTrue((archive / '000-new-kind/v1/raw.log').is_file())
+        self.assertTrue((archive / '000-new-kind/v1.tar.gz').is_file())
+        self.assertFalse(output.exists())
+        self.assertTrue(self.store.reservation('000', 1).is_dir())
+        self.assertEqual(runner.read_json(self.store.guard('000') / 'owner.json')['claim'], old_guard['claim'])
+        status = self.store.read()['000', 1]
+        self.assertEqual(status['state'], 'succeeded')
+        self.assertEqual(status['delivery_state'], 'archived')
+        # Reconciliation of an old terminal record cannot undo delivery state.
+        raw_record = runner.read_json(archive / '000-new-kind/v1/result.json')
+        self.store.finish(raw_record)
+        self.assertEqual(self.store.read()['000', 1]['delivery_state'], 'archived')
+        self.store.archive_receipts([receipt], self.results, archive)
+        self.assertEqual(self.store.read()['000', 2]['claim'], second['claim'])
+
+    def test_receipt_checksum_and_destination_collision_preserve_data(self):
+        output, receipt = self.completed_fixture()
+        archive = self.checkout / 'results-archive'
+        with self.assertRaisesRegex(runner.RunnerError, 'checksum'):
+            self.store.archive_receipts([{**receipt, 'archive_sha256': '0' * 64}], self.results, archive)
+        self.assertTrue(output.exists())
+        target = runner.run_path(archive, receipt)
+        target.mkdir(parents=True)
+        (target / 'unrelated.log').write_text('retain')
+        with self.assertRaisesRegex(runner.RunnerError, 'both pending and archived'):
+            self.store.archive_receipts([receipt], self.results, archive)
+        self.assertTrue((output / 'raw.log').is_file())
+        self.assertEqual((target / 'unrelated.log').read_text(), 'retain')
+        self.assertFalse(list(self.lock_dir.glob('archive-*.lock')))
+
+    def test_partial_archive_move_replays_safely(self):
+        output, receipt = self.completed_fixture()
+        archive = self.checkout / 'results-archive'
+        package = output.with_suffix('.tar.gz')
+        real_rename = Path.rename
+        def fail_package(path, target):
+            if path == package:
+                raise OSError('simulated move interruption')
+            return real_rename(path, target)
+        with patch.object(Path, 'rename', fail_package):
+            with self.assertRaisesRegex(OSError, 'move interruption'):
+                self.store.archive_receipts([receipt], self.results, archive)
+        self.assertFalse(output.exists())
+        self.assertTrue(package.is_file())
+        self.assertEqual(self.store.read()['000', 1]['delivery_state'], 'awaiting_download')
+        self.store.archive_receipts([receipt], self.results, archive)
+        self.assertFalse(package.exists())
+        self.assertFalse(output.parent.exists())
+        self.assertEqual(self.store.read()['000', 1]['delivery_state'], 'archived')
+
+    def test_published_receipt_is_read_from_fetched_source(self):
+        output, receipt = self.completed_fixture()
+        target = self.author / 'status' / runner.task_label(receipt)
+        target.mkdir(parents=True)
+        runner.write_json(target / 'v1.archived.json', receipt)
+        self.git(self.author, 'add', '.')
+        self.git(self.author, 'commit', '-m', 'confirm local archival')
+        self.git(self.remote, 'fetch', str(self.author), 'main:main')
+        source = self.queue.source()
+        self.assertEqual(self.queue.archived_receipts(source), [receipt])
+        self.store.archive_receipts(self.queue.archived_receipts(source), self.results,
+                                    self.checkout / 'results-archive')
+        self.assertFalse(output.exists())
 
     def test_two_processes_claim_same_version_once(self):
         source, task, digest = self.source_task()
@@ -186,7 +305,7 @@ class RunnerTest(unittest.TestCase):
             return object() if '--_execute' in args else REAL_POPEN(args, **kwargs)
         with patch.object(runner.subprocess, 'Popen', side_effect=fake_worker) as popen:
             active = runner.start_task(self.queue, source, self.store, self.results, 'host', 0, 1)
-        self.assertEqual(active[1], self.results / '002/v1')
+        self.assertEqual(active[1], self.results / '002-new-kind/v1')
         self.assertEqual(sum('--_execute' in call.args[0] for call in popen.call_args_list), 1)
         self.commit_task(task_id='002', resources={'gpus': 1}, name='changed without version', marker='changed')
         with self.assertRaisesRegex(runner.RunnerError, 'changed without increasing version'):
@@ -263,7 +382,7 @@ class RunnerTest(unittest.TestCase):
             process = subprocess.run(args, env=env, text=True, capture_output=True, timeout=30)
             self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
             self.assertEqual(self.store.read()['000', version]['state'], 'succeeded')
-        self.assertEqual((self.results / '000/v2/summary.txt').read_text(), 'v2')
+        self.assertEqual((self.results / '000-new-kind/v2/summary.txt').read_text(), 'v2')
         calls = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertTrue(any('fetch' in call for call in calls))
         self.assertFalse(any('push' in call or 'credential' in call for call in calls))
@@ -282,7 +401,7 @@ class RunnerTest(unittest.TestCase):
         _, second = self.claim()
         dead = SimpleNamespace(returncode=9, poll=lambda: 9, wait=lambda timeout: 9)
         args.once = False
-        with patch.object(runner, 'start_task', return_value=(dead, self.results / '000/v2', second['claim'])) as start:
+        with patch.object(runner, 'start_task', return_value=(dead, self.results / '000-new-kind/v2', second['claim'])) as start:
             with patch.object(self.store, 'read', return_value={}):
                 self.assertEqual(runner.poll(self.queue, self.store, args, 0), 1)
         self.assertEqual(start.call_count, 1)

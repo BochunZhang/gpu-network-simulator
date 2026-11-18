@@ -8,10 +8,13 @@ import os
 from pathlib import Path
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
 import time
+import uuid
+from datetime import datetime, timezone
 
 GEDES = ("https://github.com/mobinets/GeDES.git", "1376c638a0ae66116430f953da137d0c536675ad")
 DAYS = ("https://github.com/iQua/days.git", "048d48743119257fd8d4b2e5f0fb2228153fd955")
@@ -19,7 +22,15 @@ DAYS_FIXTURE = "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml"
 
 
 def write_json(path, result):
-    path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    temporary = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        with temporary.open('x', encoding='utf-8') as stream:
+            stream.write(json.dumps(result, indent=2) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def pass_lock():
@@ -28,14 +39,32 @@ def pass_lock():
 
 
 def command(args, log, cwd=None, env=None):
+    journal = log.parent / 'commands.json'
+    records = json.loads(journal.read_text()) if journal.exists() else []
+    argv = [str(argument) for argument in args]
+    record = {'argv': argv, 'command': shlex.join(argv),
+              'cwd': str(Path(cwd or Path.cwd()).resolve()), 'log': log.name,
+              'started_at': datetime.now(timezone.utc).isoformat(), 'state': 'running'}
+    records.append(record)
+    write_json(journal, records)
     start = time.monotonic()
-    with log.open("wb") as stream:
-        result = subprocess.run(
-            args, cwd=cwd, env=env, stdout=stream, stderr=subprocess.STDOUT,
-            pass_fds=pass_lock(), check=False,
-        )
-    if result.returncode:
-        raise RuntimeError(f"{args[0]} returned {result.returncode}; see {log.name}")
+    try:
+        with log.open("wb") as stream:
+            result = subprocess.run(
+                argv, cwd=cwd, env=env, stdout=stream, stderr=subprocess.STDOUT,
+                pass_fds=pass_lock(), check=False,
+            )
+        record.update(returncode=result.returncode,
+                      state='succeeded' if result.returncode == 0 else 'failed')
+        if result.returncode:
+            raise RuntimeError(f"{args[0]} returned {result.returncode}; see {log.name}")
+    except Exception as error:
+        record.update(state='failed', error=str(error))
+        raise
+    finally:
+        record.update(finished_at=datetime.now(timezone.utc).isoformat(),
+                      elapsed_seconds=time.monotonic() - start)
+        write_json(journal, records)
     return time.monotonic() - start
 
 
