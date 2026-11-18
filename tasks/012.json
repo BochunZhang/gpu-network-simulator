@@ -9,6 +9,6 @@
   "resources": {
     "gpus": 1
   },
-  "enabled": true,
+  "enabled": false,
   "description": "Compare fixed-work fused RC receive kernels at three unroll factors with static SASS, register/spill evidence, paired timings and available device counters."
 }

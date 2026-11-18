@@ -7,6 +7,6 @@
   "kind": "training_owner_sweep",
   "params": {},
   "resources": {"gpus": 1},
-  "enabled": true,
+  "enabled": false,
   "description": "Cross global and local safe horizons with static and dynamic owner assignment on matched single-hot and multi-hot FIFO streams. Compare per-owner output to a scalar oracle, reject an unsafe tie and time five paired resident-loop samples per variant."
 }

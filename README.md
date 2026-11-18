@@ -224,7 +224,7 @@ python3 -B -m unittest discover -s tests -v
 
 ## 单卡训练网络机制实验
 
-每项任务选择一张当前可见的物理 GPU。公开用例可以独立构建；完整训练 DAG 在项目的训练后端上另外比较。
+本轮先开放 008、009 采集 profiler。007 和 010–012 等首批时间线回收分析后按需启用。每项任务使用一张物理 GPU。研究问题、阶段顺序与验收条件见 [plan.md](plan.md)。
 
 | 任务 | 执行与输出 |
 | --- | --- |
@@ -244,4 +244,4 @@ c++ -std=c++17 -O2 -x c++ benchmarks/training_roce_engine.cu benchmarks/training
 /tmp/training-roce --backend cpu --workload closed-loop --ranks 4 --bytes 8193 --fault drop-ack
 ```
 
-GB200 任务使用 `bash tools/runner.sh --task 007 --once`，其余编号同理。
+任务随代码推送到本仓库，远程开发机上的 runner 自动拉取并运行。用户下载原始压缩包到 `results-remote/` 后，由助手校验、分析并提交归档确认。

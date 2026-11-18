@@ -7,6 +7,6 @@
   "kind": "training_roce_checks",
   "params": {},
   "resources": {"gpus": 1},
-  "enabled": true,
+  "enabled": false,
   "description": "Compare scalar and single-device CUDA packet and local completion behavior on bounded public synthetic communication fixtures; inject loss and receiver-not-ready and verify dependent and independent progress."
 }

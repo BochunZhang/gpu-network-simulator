@@ -7,6 +7,6 @@
   "kind": "rc_stage_pipeline",
   "params": {},
   "resources": {"gpus": 1},
-  "enabled": true,
+  "enabled": false,
   "description": "Apply the same ordered RC receive-queue fixture with split or fused kernels, cooperative or warp-specialized loads and synchronous or double-buffered outputs. Compare every packet result with a scalar oracle."
 }
