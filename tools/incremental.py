@@ -69,6 +69,23 @@ def _case_ids(value, name):
     return value
 
 
+def _allowed_base_id(task, base_id):
+    task_id = task.get('id')
+    child_pattern = rf'[a-z][a-z0-9]*-[0-9]{{3}}-{CASE_PATTERN}-[0-9]{{2}}'
+    if not isinstance(task_id, str) or not isinstance(base_id, str):
+        return False
+    if re.fullmatch(r'[0-9]{3}', task_id):
+        return base_id == task_id
+    if not re.fullmatch(child_pattern, task_id):
+        return False
+    if re.fullmatch(child_pattern, base_id):
+        return base_id.rsplit('-', 1)[0] == task_id.rsplit('-', 1)[0]
+    # The initial migrated subtask uses the original numeric execution identity.
+    legacy = task.get('legacy_base', {})
+    return (isinstance(legacy, dict) and re.fullmatch(r'[0-9]{3}', base_id) is not None
+            and base_id == legacy.get('id'))
+
+
 def validate_execution(task):
     execution = task.get('execution', {'mode': 'full'})
     if (not isinstance(execution, dict)
@@ -87,13 +104,12 @@ def validate_execution(task):
         return normalized
     base = execution.get('base')
     if (not isinstance(base, dict) or set(base) != {'id', 'version', 'artifacts_manifest_sha256'}
-            or not isinstance(task.get('id'), str) or not re.fullmatch(r'[0-9]{3}', task['id'])
-            or base.get('id') != task['id']
+            or not _allowed_base_id(task, base.get('id'))
             or type(base.get('version')) is not int or base['version'] < 1
             or type(task.get('version')) is not int or base['version'] >= task['version']
             or not isinstance(base.get('artifacts_manifest_sha256'), str)
             or not re.fullmatch(HEX_PATTERN, base['artifacts_manifest_sha256'])):
-        raise IncrementalError('incremental base must pin an earlier version of this task and its manifest SHA-256')
+        raise IncrementalError('incremental base must pin an earlier version within this task and its manifest SHA-256')
     if execution.get('reuse', 'verified-compatible') != 'verified-compatible':
         raise IncrementalError('execution.reuse must be verified-compatible')
     normalized.update(base=dict(base), reuse='verified-compatible')
@@ -166,15 +182,18 @@ def prepare_base(task, results_dir, archive_dir, destination):
     if execution['mode'] == 'full':
         return None
     base = execution['base']
-    slug = task.get('slug')
-    if not isinstance(slug, str) or not re.fullmatch(CASE_PATTERN, slug):
-        raise IncrementalError('incremental task requires a safe slug')
+    labels = [base['id']]
+    if re.fullmatch(r'[0-9]{3}', base['id']):
+        slug = task.get('legacy_base', {}).get('slug', task.get('slug'))
+        if not isinstance(slug, str) or not re.fullmatch(CASE_PATTERN, slug):
+            raise IncrementalError('incremental task requires a safe slug')
+        labels.append(f"{base['id']}-{slug}")
     candidates = [Path(root) / label / f"v{base['version']}"
-                  for root in (results_dir, archive_dir) for label in (f"{task['id']}-{slug}", task['id'])]
+                  for root in (results_dir, archive_dir) for label in labels]
     found = [path for path in candidates if path.is_dir()]
     if len(found) != 1:
         reason = 'missing' if not found else 'ambiguous'
-        raise BaseUnavailable(f'{reason} baseline {task["id"]} v{base["version"]}')
+        raise BaseUnavailable(f'{reason} baseline {base["id"]} v{base["version"]}')
     root = found[0]
     try:
         if root.is_symlink() or root.parent.is_symlink():
@@ -182,7 +201,7 @@ def prepare_base(task, results_dir, archive_dir, destination):
         result_path = _regular_path(root, 'result.json')
         result = json.loads(result_path.read_text(encoding='utf-8'))
         if (not isinstance(result, dict) or result.get('state') not in {'succeeded', 'failed', 'abandoned'}
-                or result.get('id') != task['id'] or result.get('version') != base['version']
+                or result.get('id') != base['id'] or result.get('version') != base['version']
                 or result.get('kind') != task.get('kind')
                 or any(not isinstance(result.get(key), str) or not result[key]
                        for key in ('claim', 'source_commit', 'task_sha256'))):

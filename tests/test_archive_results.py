@@ -70,6 +70,40 @@ class ArchiveResultsTest(unittest.TestCase):
         self.assertFalse(duplicate.exists())
         self.assertEqual(json.loads(receipt_path.read_text()), receipt)
 
+    def test_classified_receipt_remains_idempotent_after_redownload(self):
+        child = 'gedes-000-smoke-02'
+        fields = {'parent_id': 'gedes-000-smoke', 'subtask_id': '02',
+                  'task_status': '2026-11-17T00:00:00Z', 'subtask_status': '2026-11-18T00:00:00Z',
+                  'id': child, 'version': 1794960000, 'slug': 'smoke'}
+        package, _ = self.package(metadata=fields)
+        exact = package.read_bytes()
+        receipt_path = importer.archive_package(package, self.results, self.status)
+        self.assertEqual(receipt_path, self.status / child / 'v1794960000.archived.json')
+        receipt = runner.read_json(receipt_path)
+        self.assertEqual(receipt['parent_id'], fields['parent_id'])
+        self.assertEqual((self.results / child / (child + '.v1794960000.tar.gz')).read_bytes(), exact)
+        package.write_bytes(exact)
+        with patch.object(runner, 'timestamp', return_value='later'):
+            importer.archive_package(package, self.results, self.status)
+        self.assertEqual(runner.read_json(receipt_path), receipt)
+
+    def test_classified_record_and_receipt_must_identify_the_same_publication(self):
+        fields = {'parent_id': 'gedes-000-smoke', 'subtask_id': '02', 'id': 'gedes-000-smoke-02',
+                  'task_status': '2026-11-17T00:00:00Z', 'subtask_status': '2026-11-18T00:00:00Z',
+                  'version': 1794960000}
+        package, row = self.package(metadata=fields)
+        receipt = importer.receipt_for(row, package)
+        for invalid in ({'version': 1794960001}, {'subtask_status': None}, {'task_status': 'ignore'},
+                        {'task_status': '2026-11-19T00:00:00Z'}, {'subtask_id': '03'}):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(runner.RunnerError):
+                    runner.validate_record({**row, **invalid}, package)
+                with self.assertRaises(runner.RunnerError):
+                    runner.validate_receipt({**receipt, **invalid})
+        stripped = {k: v for k, v in row.items() if k not in runner.RELEASE_FIELDS}
+        with self.assertRaises(runner.RunnerError):
+            runner.validate_record(stripped, package)
+
     def test_verified_case_manifest_is_exposed_in_receipt(self):
         manifest = b'{"schema_version": 1, "cases": {}}'
         checksum = hashlib.sha256(manifest).hexdigest()

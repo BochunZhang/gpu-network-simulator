@@ -1,0 +1,23 @@
+{
+  "id": "gedes-001-drain",
+  "name": "GeDES fixed-workload transport drain audit",
+  "status": "2026-11-18T08:42:46Z",
+  "legacy": {
+    "id": "004",
+    "slug": "gedes-drain",
+    "version": 1,
+    "published_at": "2026-11-18T08:42:46Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T08:42:46Z",
+      "kind": "gedes_drain",
+      "params": {},
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Check flow, TCP and queue drain in the fixed GeDES k4 and k8 fixtures, with a real one-round early-stop control."
+    }
+  }
+}

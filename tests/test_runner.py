@@ -38,8 +38,8 @@ class RunnerTest(unittest.TestCase):
         self.git(self.author, 'config', 'commit.gpgsign', 'false')
         (self.author / 'tasks').mkdir()
         (self.author / 'tools').mkdir()
-        shutil.copyfile(REPO / 'tools/run_experiments.py', self.author / 'tools/run_experiments.py')
-        shutil.copyfile(REPO / 'tools/incremental.py', self.author / 'tools/incremental.py')
+        for module in ('run_experiments.py', 'incremental.py', 'task_catalog.py', 'retired_experiments.py', 'archive_results.py'):
+            shutil.copyfile(REPO / 'tools' / module, self.author / 'tools' / module)
         self.commit_task()
         self.git(self.root, 'clone', str(self.remote), str(self.checkout))
         self.lock_dir, self.status_dir, self.results = (self.checkout / name for name in ('.lock', 'status', 'results'))
@@ -94,6 +94,74 @@ class RunnerTest(unittest.TestCase):
                                   '--task', '000', '--once'], text=True, capture_output=True, timeout=30)
         self.assertEqual(process.returncode, expected, process.stdout + process.stderr)
         return process
+
+    def publish_catalog(self, manifest):
+        (self.author / 'tasks/000.json').unlink(missing_ok=True)
+        runner.write_json(self.author / 'tasks' / f"{manifest['id']}.json", manifest)
+        self.git(self.author, 'add', 'tasks')
+        self.git(self.author, 'commit', '-m', 'Publish catalog update')
+        self.git(self.remote, 'fetch', str(self.author), 'main:main')
+
+    def test_cli_publishes_extends_reissues_and_retires(self):
+        parent = 'nsx-000-topologies'
+        initial = '2026-11-18T00:00:00Z'
+        batch = runner.task_catalog.release_version(initial)
+        first = {'status': initial, 'kind': 'new_kind', 'params': {'topos': ['A', 'B', 'C']}}
+        manifest = {'id': parent, 'name': 'Topology checks', 'status': initial, 'subtasks': {'00': first}}
+        self.publish_catalog(manifest)
+
+        def once(selector):
+            proc = subprocess.run([sys.executable, '-B', str(self.checkout / 'tools/run_experiments.py'),
+                                   '--task', selector, '--once'], text=True, capture_output=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        child0, child1 = parent + '-00', parent + '-01'
+        once(parent)
+        first_run = self.store.read()[child0, batch]
+        package = runner.archive_path(self.results, first_run)
+        checksum = runner.sha256_file(package)
+        manifest['subtasks']['01'] = {**first, 'params': {'topos': ['D']}}
+        self.publish_catalog(manifest)
+        once(parent)
+        self.assertEqual(len(self.store.read()), 2)
+        first['status'] = '2026-11-18T00:00:01Z'
+        self.publish_catalog(manifest)
+        once(child1)
+        self.assertEqual(len(self.store.read()), 2)
+        once(child0)
+        self.assertEqual(set(self.store.read()), {(child0, batch), (child1, batch), (child0, batch + 1)})
+        self.assertEqual(runner.sha256_file(package), checksum)
+        self.assertEqual(self.store.read()[child0, batch]['claim'], first_run['claim'])
+
+        first['status'] = 'ignore'
+        self.publish_catalog(manifest)
+        once(parent)
+        rows = self.store.read()
+        for release in (batch, batch + 1):
+            self.assertEqual(rows[child0, release]['disposition'], 'ignored')
+            self.assertEqual(rows[child0, release]['state'], 'succeeded')
+        self.assertFalse(package.exists())
+        self.assertEqual(runner.sha256_file(runner.archive_path(self.checkout / 'results-archive', first_run)),
+                         checksum)
+        self.assertEqual(rows[child1, batch]['delivery_state'], 'awaiting_download')
+        manifest['status'] = 'ignore'
+        self.publish_catalog(manifest)
+        once(parent)
+        self.assertEqual(self.store.read()[child1, batch]['disposition'], 'ignored')
+
+    def test_fresh_controller_validates_parent_history_and_accepts_a_correction(self):
+        manifest = {'id': 'nsx-000-topology', 'name': 'Topology', 'status': '2026-11-18T00:00:00Z',
+                    'subtasks': {'00': {'kind': 'new_kind', 'params': {}, 'status': '2026-11-18T00:00:10Z'}}}
+        self.publish_catalog(manifest)
+        manifest['status'] = '2026-11-18T00:00:01Z'
+        self.publish_catalog(manifest)
+        with self.assertRaisesRegex(runner.RunnerError, 'immutable'):
+            self.queue.tasks(self.queue.source())
+        manifest['status'] = '2026-11-18T00:00:00Z'
+        self.publish_catalog(manifest)
+        source = self.queue.source()
+        fresh = runner.Queue(self.checkout)
+        self.assertEqual([t['id'] for t, _ in fresh.tasks(source)], ['nsx-000-topology-00'])
 
     def test_incremental_cli_reuses_passed_case_from_failed_archived_v2(self):
         self.commit_case_task(2, {'mode': 'full'}, fail=True, value='v2')
@@ -502,6 +570,36 @@ class RunnerTest(unittest.TestCase):
         # Replaying old recovery must not remove the newer guard.
         self.store.finish({**first, 'state': 'succeeded', 'finished_at': 'now', 'exit_code': 0})
         self.assertEqual(runner.read_json(self.store.guard('000') / 'owner.json')['claim'], second['claim'])
+
+    def test_migrated_child_keeps_old_guard_and_sibling_can_run_independently(self):
+        source, original, digest = self.source_task()
+        row = self.store.claim(original, digest, source, self.results, 'old-runner')
+        parent = 'system-000-init-environment'
+        newer = {**original, 'id': parent + '-00', 'legacy_id': '000', 'version': 1794960000,
+                 'parent_id': parent, 'subtask_id': '00', 'task_status': '2026-11-17T00:00:00Z',
+                 'subtask_status': '2026-11-18T00:00:00Z'}
+        sibling = {**original, 'id': parent + '-01', 'version': newer['version'],
+                   'parent_id': parent, 'subtask_id': '01', 'task_status': newer['task_status'],
+                   'subtask_status': newer['subtask_status']}
+        def claim(task):
+            return self.store.claim(task, 'f' * 64, source, self.results, 'worker')
+        self.assertIsNone(claim(newer))
+        other = claim(sibling)
+        self.assertIsNotNone(other)
+        self.store.finish({**row, 'state': 'failed'})
+        reissue = claim(newer)
+        self.assertTrue(self.store.guard('000').is_dir())
+        self.assertEqual(self.store.read(newer['id']), {(newer['id'], newer['version']): reissue})
+        self.assertGreaterEqual(len(self.store.read()), 3)
+        self.store.finish({**reissue, 'state': 'succeeded'})
+        self.assertFalse(self.store.guard('000').exists())
+        self.assertTrue(self.store.guard(sibling['id']).exists())
+        self.assertIsNone(claim(newer))
+        self.store.finish({**other, 'state': 'succeeded'})
+        (self.status_dir / parent).mkdir()
+        (self.status_dir / parent / 'ignored.json').touch()
+        self.assertIsNone(claim({**newer, 'version': newer['version'] + 1,
+                                 'subtask_status': '2026-11-18T00:00:01Z'}))
 
     def test_terminal_reservation_blocks_stale_status_listing(self):
         source, task, digest = self.source_task()

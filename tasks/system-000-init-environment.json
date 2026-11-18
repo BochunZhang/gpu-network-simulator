@@ -1,0 +1,32 @@
+{
+  "id": "system-000-init-environment",
+  "name": "GB200 four-GPU hardware inventory",
+  "status": "2026-11-18T03:39:20Z",
+  "legacy": {
+    "id": "000",
+    "slug": "system-info",
+    "version": 3,
+    "published_at": "2026-11-18T06:11:23Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T06:11:23Z",
+      "kind": "gpu_inventory",
+      "params": {},
+      "resources": {
+        "gpus": 4
+      },
+      "enabled": true,
+      "description": "Validate incremental execution against the completed v2 baseline: refresh live probes and reuse only compatible derived artifacts.",
+      "execution": {
+        "mode": "incremental",
+        "base": {
+          "id": "000",
+          "version": 2,
+          "artifacts_manifest_sha256": "3eb996f919b1545a53e1d970a5b0d02fc55a60dd266e09bb450f76f684e3e0a4"
+        },
+        "reuse": "verified-compatible"
+      }
+    }
+  }
+}

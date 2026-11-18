@@ -1,0 +1,23 @@
+{
+  "id": "roce-003-stage-pipeline",
+  "name": "Single-GPU RC stage and output pipeline",
+  "status": "2026-11-18T10:46:08Z",
+  "legacy": {
+    "id": "011",
+    "slug": "rc-stage-pipeline",
+    "version": 1,
+    "published_at": "2026-11-18T10:46:08Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T10:46:08Z",
+      "kind": "rc_stage_pipeline",
+      "params": {},
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": false,
+      "description": "Apply the same ordered RC receive-queue fixture with split or fused kernels, cooperative or warp-specialized loads and synchronous or double-buffered outputs. Compare every packet result with a scalar oracle."
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "gedes-000-completion-audit",
+  "name": "GeDES completion and single-GPU timing audit",
+  "status": "2026-11-18T03:39:20Z",
+  "legacy": {
+    "id": "001",
+    "slug": "gedes-smoke",
+    "version": 3,
+    "published_at": "2026-11-18T07:43:12Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T07:43:12Z",
+      "kind": "gedes_audit",
+      "params": {},
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Fix the flow-start queue allocation, then rerun the pinned k4 and k8 cases with post-sync TCP-node and channel-block completion counts.",
+      "execution": {
+        "mode": "full"
+      }
+    }
+  }
+}

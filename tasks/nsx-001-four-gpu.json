@@ -1,0 +1,23 @@
+{
+  "id": "nsx-001-four-gpu",
+  "name": "NSX-inspired four-GPU event exchange",
+  "status": "2026-11-18T08:42:46Z",
+  "legacy": {
+    "id": "006",
+    "slug": "nsx-four-gpu",
+    "version": 1,
+    "published_at": "2026-11-18T08:42:46Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T08:42:46Z",
+      "kind": "nsx_four_gpu",
+      "params": {},
+      "resources": {
+        "gpus": 4
+      },
+      "enabled": true,
+      "description": "Compare an independent fixed forwarding fixture on one and four GPUs using staged and peer CUDA transfers. Verify per-owner event order, exactly-once delivery and drain against a serial reference."
+    }
+  }
+}

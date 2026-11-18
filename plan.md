@@ -10,25 +10,25 @@
 
 | 任务 | 采集什么 | 回包后先检查什么 |
 | --- | --- | --- |
-| [008 · GeDES 时间线](tasks/008.json) | 对同一 GeDES k8 输入先正常运行，再用 Nsight Systems 分别采集第 2,000 和 6,900 轮起的 16 轮。输出主机 CUDA API、设备 kernel 时间线与活动区间汇总。 | 三次均应完成 7,001 轮、128 条流，匹配原输入、FCT、字节及排空检查。分别报告图启动、主机同步、设备活动并集和窗口中无已观测设备活动的区间。同步等待与 GPU 工作可以重叠，两者不能直接相加。 |
-| [009 · RC kernel 内部时间线](tasks/009.json) | 在同一简化 RC 闭环用例运行标量对照、普通 CUDA 和设备内插桩 CUDA，记录真实设备时间、SM、CTA、QP、WR、执行阶段和虚拟时刻。 | 核对三次提交与完成账本一致、采样未截断。沿被延迟的 ACK 找到依赖它的操作，同时检查独立 rank 的进度。此用例采用单 CTA，只用来校验 profiler 能否解释协议事件；多 CTA 的负载分布留到后续实测。 |
+| [gedes-002-timeline-00 · GeDES 时间线](tasks/gedes-002-timeline.json) | 对同一 GeDES k8 输入先正常运行，再用 Nsight Systems 分别采集第 2,000 和 6,900 轮起的 16 轮。输出主机 CUDA API、设备 kernel 时间线与活动区间汇总。 | 三次均应完成 7,001 轮、128 条流，匹配原输入、FCT、字节及排空检查。分别报告图启动、主机同步、设备活动并集和窗口中无已观测设备活动的区间。同步等待与 GPU 工作可以重叠，两者不能直接相加。 |
+| [roce-001-training-profile-00 · RC kernel 内部时间线](tasks/roce-001-training-profile.json) | 在同一简化 RC 闭环用例运行标量对照、普通 CUDA 和设备内插桩 CUDA，记录真实设备时间、SM、CTA、QP、WR、执行阶段和虚拟时刻。 | 核对三次提交与完成账本一致、采样未截断。沿被延迟的 ACK 找到依赖它的操作，同时检查独立 rank 的进度。此用例采用单 CTA，只用来校验 profiler 能否解释协议事件；多 CTA 的负载分布留到后续实测。 |
 
-首轮交付两张时间线和一张判断表。对每个可疑瓶颈记下**可见证据、当前仍无法区分的原因、下一项能区分它们的对照实验**。例如，GeDES 尾部若有很多空隙，先区分图启动间隙与仿真本身剩余工作变少；RC 用例若有待处理工作，则检查它是在等协议反馈还是已经就绪。与项目既有的 [005 局部时间边界对照](tasks/005.json)一起检查因果计数。工具可借鉴 [FlashInfer 的 kernel 内部 profiler](https://github.com/flashinfer-ai/flashinfer/tree/main/profiler) 和 [vLLM 的短窗采集方法](https://docs.vllm.ai/en/stable/contributing/profiling/)。
+首轮交付两张时间线和一张判断表。对每个可疑瓶颈记下**可见证据、当前仍无法区分的原因、下一项能区分它们的对照实验**。例如，GeDES 尾部若有很多空隙，先区分图启动间隙与仿真本身剩余工作变少；RC 用例若有待处理工作，则检查它是在等协议反馈还是已经就绪。与项目既有的 [nsx-000-single-gpu-00 局部时间边界对照](tasks/nsx-000-single-gpu.json)一起检查因果计数。工具可借鉴 [FlashInfer 的 kernel 内部 profiler](https://github.com/flashinfer-ai/flashinfer/tree/main/profiler) 和 [vLLM 的短窗采集方法](https://docs.vllm.ai/en/stable/contributing/profiling/)。
 
 ## 第二阶段 · 建立训练闭环和 RoCEv2 对照
 
 - CPU frontend 处理训练 DAG、计算延迟和集合通信依赖。先验证整批输入，再比较分块提交。每块公布后续输入最早可能发生的虚拟时间。本端完成事件 CQE 解锁依赖它的下一步，独立 rank 可继续推进。
 - GPU backend 首版对齐项目既有 RC 模型。训练前配置持久 QP，训练中复用；按包处理分段、ACK/NAK、RNR、重传、去重与 CQE；训练结束后核对数据与控制消息排空，再释放 QP。以每个有状态端口或 QP 为单位保持同刻事件的确定顺序。共享有限缓冲、PFC、ECN/DCQCN 放在完成基础 RC 对照之后。
-- [007 · RC 与 CQE 正确性](tasks/007.json)覆盖丢包、反馈延迟、Ring 和全对全微例。正式训练先用 128 个模拟 rank 的 k8 FatTree，对照同版本串行 `SimAI_roce_v2` 跑四层 GPT-13B Dense、Qwen3-MoE。固定有效输入、集合算法、通道、路由及链路参数，核对每个 rank 完成、逻辑操作与字节、虚拟迭代时间、线上计数、QP 生命周期及最终排空。训练关键路径用训练数据重新采集。
+- [roce-000-training-checks-00 · RC 与 CQE 正确性](tasks/roce-000-training-checks.json)覆盖丢包、反馈延迟、Ring 和全对全微例。正式训练先用 128 个模拟 rank 的 k8 FatTree，对照同版本串行 `SimAI_roce_v2` 跑四层 GPT-13B Dense、Qwen3-MoE。固定有效输入、集合算法、通道、路由及链路参数，核对每个 rank 完成、逻辑操作与字节、虚拟迭代时间、线上计数、QP 生命周期及最终排空。训练关键路径用训练数据重新采集。
 
 ## 第三阶段 · 按 profiler 证据选择加速机制
 
 | 观测 | 下一项对照 | 判据 |
 | --- | --- | --- |
 | 有积压，可安全执行的队列少 | 比较固定全局时隙、可跳空的全局边界、逐输入队列的最早入队时间承诺（MET）。将训练输入、反馈和计时器计入边界。 | 每轮安全批长与实际提交数增加，节省的时间超过维护和传播边界的成本。 |
-| 就绪队列多，阶段尾部只剩少数 CTA | [010](tasks/010.json) 交叉比较全局/局部边界与静态分配/CTA 动态领取。保持总包量，分别制造多热出口、单热出口、单热 QP。 | 区分任务分配不均与单个 owner 的串行路径。对后者拆分可并行的整理与归并，按参考顺序提交共享状态。 |
-| 热阶段存在可重叠的搬运与处理，或结果写出阻塞 | [011](tasks/011.json) 对照按阶段拆分/融合 kernel、协作加载/专职 producer 与 consumer warp、同步输出/页锁定双缓冲输出。 | 固定 CTA 大小、队列深度和输出内容，逐项核对结果，计入屏障、反压、D2H 和最终 flush。 |
-| 融合后启动次数减少，但 kernel 变慢 | [012](tasks/012.json) 改变展开程度，检查热路径 SASS、寄存器、spill、驻留 warp 和可用的指令缓存指标。 | 用正常运行时间与多项指标判断取指是否受限，给出 GB200 上该负载的融合适用区间。 |
+| 就绪队列多，阶段尾部只剩少数 CTA | [roce-002-owner-sweep-00](tasks/roce-002-owner-sweep.json) 交叉比较全局/局部边界与静态分配/CTA 动态领取。保持总包量，分别制造多热出口、单热出口、单热 QP。 | 区分任务分配不均与单个 owner 的串行路径。对后者拆分可并行的整理与归并，按参考顺序提交共享状态。 |
+| 热阶段存在可重叠的搬运与处理，或结果写出阻塞 | [roce-003-stage-pipeline-00](tasks/roce-003-stage-pipeline.json) 对照按阶段拆分/融合 kernel、协作加载/专职 producer 与 consumer warp、同步输出/页锁定双缓冲输出。 | 固定 CTA 大小、队列深度和输出内容，逐项核对结果，计入屏障、反压、D2H 和最终 flush。 |
+| 融合后启动次数减少，但 kernel 变慢 | [roce-004-instruction-profile-00](tasks/roce-004-instruction-profile.json) 改变展开程度，检查热路径 SASS、寄存器、spill、驻留 warp 和可用的指令缓存指标。 | 用正常运行时间与多项指标判断取指是否受限，给出 GB200 上该负载的融合适用区间。 |
 
 同一机制通过正确性对照后，再放回 Dense/MoE 完整训练迭代评估。正常计时关闭 profiler，固定种子、输入与输出，预热后至少做五次配对重复。随后在一张物理卡上以 512、1024 个模拟 rank 检验规模、显存和热点变化，分别列出缩放通信量与原始通信量的结果。
 
@@ -36,5 +36,5 @@
 
 1. 助手在本地 `workspace/gpu-network-simulator` 编写代码和任务清单，提交并推送到该公开仓库。远程开发机上的常驻 runner 自动拉取、领取和执行。
 2. 用户把 CPFS 生成的原始结果包下载到本仓库的 `results-remote/`。首批是 `008-gedes-timeline.v1.tar.gz` 和 `009-training-roce-profile.v1.tar.gz`。成功和失败的结果都回收。
-3. 助手用 `python3 tools/archive_results.py` 核验并归档，分析时间线、日志和完成门限，提交并推送归档回执。若采集失败，保留日志并按原任务编号修复升版。
-4. 当前后续任务 `007`、`010`、`011`、`012` 已暂停新领取。首批 profiler 结果回收分析后，按实际发现启用相应任务。已在旧提交上领取的版本沿用原始源码和记录。
+3. 助手用 `python3 tools/archive_results.py` 核验并归档，分析时间线、日志和完成门限，提交并推送归档回执。若采集失败，保留日志并修复后更新原子任务的发布时间。
+4. 当前后续任务 `roce-000-training-checks`、`roce-002-owner-sweep`、`roce-003-stage-pipeline`、`roce-004-instruction-profile` 的子任务 `00` 已暂停新领取。首批 profiler 结果回收分析后，按实际发现启用相应任务。已在旧提交上领取的版本沿用原始源码和记录。

@@ -1,0 +1,23 @@
+{
+  "id": "roce-001-training-profile",
+  "name": "Profile single GPU RC packet transitions",
+  "status": "2026-11-18T10:41:34Z",
+  "legacy": {
+    "id": "009",
+    "slug": "training-roce-profile",
+    "version": 1,
+    "published_at": "2026-11-18T10:41:34Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T10:41:34Z",
+      "kind": "training_roce_profile",
+      "params": {},
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Trace device SM, CTA, QP and virtual time for the bounded CUDA RC fixture; compare output with its uninstrumented run and serial oracle."
+    }
+  }
+}

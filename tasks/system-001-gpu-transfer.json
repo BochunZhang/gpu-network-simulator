@@ -1,0 +1,23 @@
+{
+  "id": "system-001-gpu-transfer",
+  "name": "Four-GPU device and peer-copy baseline",
+  "status": "2026-11-18T06:16:31Z",
+  "legacy": {
+    "id": "003",
+    "slug": "gpu-transfer",
+    "version": 1,
+    "published_at": "2026-11-18T06:16:31Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T06:16:31Z",
+      "kind": "gpu_transfer",
+      "params": {},
+      "resources": {
+        "gpus": 4
+      },
+      "enabled": true,
+      "description": "Measure validated 1 MiB and 64 MiB device-local and directed peer copies on four visible GPUs with warmup and full data checks."
+    }
+  }
+}

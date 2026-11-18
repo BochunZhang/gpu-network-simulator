@@ -77,6 +77,27 @@ class IncrementalTest(unittest.TestCase):
         self.assertEqual((output / 'cases/failed/failure.log').read_text(), 'diagnostic evidence')
         self.assertEqual((newer / 'cases/passed/value.txt').read_text(), 'stable')
 
+    def test_migrated_and_sibling_baselines_use_their_own_verified_paths(self):
+        parent = 'system-000-init-environment'
+        output, _ = self.full([self.case('passed')])
+        legacy_task = {**self.incremental_task(output), 'id': parent + '-00',
+                       'slug': 'init-environment', 'legacy_base': {'id': '000', 'slug': 'system-info'}}
+        _, result = self.rerun(legacy_task, [self.case('passed')])
+        self.assertEqual(result['cases']['passed']['reused_from']['id'], '000')
+
+        base_path = self.archive / legacy_task['id'] / 'v3'
+        base_path.parent.mkdir(parents=True)
+        (self.results / '000-system-info/v3').rename(base_path)
+        engine.write_json(base_path / 'result.json', {**self.record(legacy_task), 'state': 'succeeded'})
+        base = {'id': legacy_task['id'], 'version': 3,
+                'artifacts_manifest_sha256': engine.file_digest(base_path / 'artifacts-manifest.json')}
+        sibling = {**legacy_task, 'id': parent + '-01', 'version': 4,
+                   'execution': {'mode': 'incremental', 'base': base}}
+        snapshot = engine.prepare_base(sibling, self.results, self.archive, self.root / 'sibling')
+        self.assertEqual(snapshot['provenance']['id'], parent + '-00')
+        with self.assertRaises(engine.IncrementalError):
+            engine.validate_execution({**sibling, 'id': 'system-001-unrelated-01'})
+
     def test_changed_implementation_invalidates_dependency_chain(self):
         output, _ = self.full([self.case('producer'), self.case('consumer', dependencies=['producer']),
                                self.case('independent')])

@@ -1,0 +1,23 @@
+{
+  "id": "gedes-002-timeline",
+  "name": "GeDES single GPU graph timeline",
+  "status": "2026-11-18T10:41:34Z",
+  "legacy": {
+    "id": "008",
+    "slug": "gedes-timeline",
+    "version": 1,
+    "published_at": "2026-11-18T10:41:34Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T10:41:34Z",
+      "kind": "gedes_timeline",
+      "params": {},
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Capture 16 graph rounds in two k8 training-backend profiler calibration windows with Nsight Systems. Validate host and device activity against fixed input, FCT, byte and drain gates."
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "id": "nsx-000-single-gpu",
+  "name": "NSX-inspired single-GPU local causality",
+  "status": "2026-11-18T08:42:46Z",
+  "legacy": {
+    "id": "005",
+    "slug": "nsx-single-gpu",
+    "version": 1,
+    "published_at": "2026-11-18T08:42:46Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T08:42:46Z",
+      "kind": "nsx_single_gpu",
+      "params": {},
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Compare global and local minimum enqueue-time scheduling on a bounded CUDA fixture against a serial CPU ledger, verify drain, and reject an inclusive-bound negative control."
+    }
+  }
+}

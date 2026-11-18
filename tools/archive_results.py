@@ -149,6 +149,7 @@ def receipt_for(row, package):
         'archive_sha256': runner.sha256_file(package), 'archive_size': package.stat().st_size,
         'archived_at': runner.timestamp(),
     }
+    receipt.update({field: row[field] for field in runner.RELEASE_FIELDS if field in row})
     if 'artifacts_manifest_sha256' in row:
         receipt['artifacts_manifest_sha256'] = row['artifacts_manifest_sha256']
     if 'case_counts' in row:
@@ -183,7 +184,9 @@ def validate_existing_files(destination, files, results):
 
 
 def existing_receipt(status_dir, receipt):
-    matches = sorted(status_dir.glob(f"{receipt['id']}-*/v{receipt['version']}.archived.json"))
+    directory = (receipt['id'] + '-*' if re.fullmatch(runner.ID_PATTERN, receipt['id'])
+                 else runner.task_label(receipt))
+    matches = sorted(status_dir.glob(f"{directory}/v{receipt['version']}.archived.json"))
     for path in matches:
         current = runner.validate_receipt(runner.read_json(path), path)
         if (any(current[key] != receipt[key] for key in (*IDENTITY, 'slug', 'command', 'archive_sha256'))):

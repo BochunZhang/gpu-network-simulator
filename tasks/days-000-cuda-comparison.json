@@ -1,0 +1,23 @@
+{
+  "id": "days-000-cuda-comparison",
+  "name": "Days AGO Scalar CPU CUDA comparison",
+  "status": "2026-11-18T03:39:20Z",
+  "legacy": {
+    "id": "002",
+    "slug": "days-cuda",
+    "version": 1,
+    "published_at": "2026-11-18T03:39:20Z"
+  },
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T03:39:20Z",
+      "kind": "days_cuda_smoke",
+      "params": {},
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": false,
+      "description": "Enable after a separately recorded SM100 port; the pinned upstream supports SM86, SM89 and SM121."
+    }
+  }
+}
