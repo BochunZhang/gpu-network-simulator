@@ -55,12 +55,13 @@ class ArchiveResultsTest(unittest.TestCase):
         receipt_path = importer.archive_package(package, self.results, self.status)
         self.assertFalse(package.exists())
         self.assertEqual(receipt_path, self.status / '000-system-info/v1.archived.json')
-        archived = self.results / '000-system-info/v1.tar.gz'
+        archived = self.results / '000-system-info/000-system-info.v1.tar.gz'
         self.assertEqual(archived.read_bytes(), exact)
         self.assertEqual(json.loads((self.results / '000-system-info/v1/result.json').read_text()), row)
         receipt = json.loads(receipt_path.read_text())
         self.assertEqual(receipt['state'], 'failed')
         self.assertEqual(receipt['command_source'], 'recorded')
+        self.assertEqual(receipt['archive_name'], '000-system-info.v1.tar.gz')
         self.assertEqual(receipt['archive_sha256'], runner.sha256_file(archived))
         duplicate = self.incoming / 'again.tar.gz'
         duplicate.write_bytes(exact)
@@ -107,20 +108,20 @@ class ArchiveResultsTest(unittest.TestCase):
         self.assertEqual(receipt['slug'], 'system-info')
         self.assertEqual(receipt['command_source'], 'replay')
         self.assertEqual(receipt['command'], 'bash tools/runner.sh --task 000 --once')
-        self.assertEqual((self.results / '000-system-info/v1.tar.gz').read_bytes(), exact)
+        self.assertEqual((self.results / '000-system-info/000-system-info.v1.tar.gz').read_bytes(), exact)
         self.assertNotIn('slug', json.loads((self.results / '000-system-info/v1/result.json').read_text()))
 
     def test_conflicting_claim_preserves_incoming_and_archived_data(self):
         first, _ = self.package()
         receipt = importer.archive_package(first, self.results, self.status)
         receipt_bytes = receipt.read_bytes()
-        original = (self.results / '000-system-info/v1.tar.gz').read_bytes()
+        original = (self.results / '000-system-info/000-system-info.v1.tar.gz').read_bytes()
         conflict, _ = self.package('conflict.tar.gz', metadata={'claim': 'attempt-two'})
         with self.assertRaisesRegex(importer.ArchiveError, 'incompatible archival receipt'):
             importer.archive_package(conflict, self.results, self.status)
         self.assertTrue(conflict.exists())
         self.assertEqual(receipt.read_bytes(), receipt_bytes)
-        self.assertEqual((self.results / '000-system-info/v1.tar.gz').read_bytes(), original)
+        self.assertEqual((self.results / '000-system-info/000-system-info.v1.tar.gz').read_bytes(), original)
 
     def test_partial_local_import_can_resume_before_receipt(self):
         package, row = self.package()
@@ -133,7 +134,86 @@ class ArchiveResultsTest(unittest.TestCase):
         receipt_path = importer.archive_package(package, self.results, self.status)
         self.assertTrue(receipt_path.is_file())
         self.assertEqual((target / 'summary.txt').read_text(), 'completed data')
-        self.assertEqual(target.with_suffix('.tar.gz').read_bytes(), exact)
+        self.assertEqual((target.parent / '000-system-info.v1.tar.gz').read_bytes(), exact)
+        self.assertFalse(target.with_suffix('.tar.gz').exists())
+
+    def test_legacy_receipt_and_package_are_renamed_without_recompression(self):
+        package, _ = self.package()
+        exact = package.read_bytes()
+        receipt_path = importer.archive_package(package, self.results, self.status)
+        canonical = self.results / '000-system-info/000-system-info.v1.tar.gz'
+        legacy = canonical.parent / 'v1.tar.gz'
+        canonical.rename(legacy)
+        receipt = json.loads(receipt_path.read_text())
+        receipt.pop('archive_name')
+        receipt_path.write_text(json.dumps(receipt))
+        duplicate = self.incoming / 'v1.tar.gz'
+        duplicate.write_bytes(exact)
+
+        with patch.object(runner, 'timestamp', return_value='later import'):
+            importer.archive_package(duplicate, self.results, self.status)
+
+        expected = {**receipt, 'archive_name': '000-system-info.v1.tar.gz'}
+        self.assertEqual(json.loads(receipt_path.read_text()), expected)
+        self.assertEqual(canonical.read_bytes(), exact)
+        self.assertEqual(runner.sha256_file(canonical), receipt['archive_sha256'])
+        self.assertFalse(legacy.exists())
+        self.assertFalse(duplicate.exists())
+
+    def test_numeric_directory_legacy_package_is_normalized(self):
+        package, _ = self.package()
+        exact = package.read_bytes()
+        legacy = self.results / '000/v1.tar.gz'
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(exact)
+
+        importer.archive_package(package, self.results, self.status)
+
+        canonical = self.results / '000-system-info/000-system-info.v1.tar.gz'
+        self.assertEqual(canonical.read_bytes(), exact)
+        self.assertFalse(legacy.exists())
+
+    def test_matching_legacy_duplicates_are_removed_after_import(self):
+        package, _ = self.package()
+        exact = package.read_bytes()
+        importer.archive_package(package, self.results, self.status)
+        legacy_paths = [self.results / '000-system-info/v1.tar.gz', self.results / '000/v1.tar.gz']
+        for legacy in legacy_paths:
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_bytes(exact)
+        duplicate = self.incoming / 'downloaded-again.tar.gz'
+        duplicate.write_bytes(exact)
+
+        importer.archive_package(duplicate, self.results, self.status)
+
+        self.assertEqual((self.results / '000-system-info/000-system-info.v1.tar.gz').read_bytes(), exact)
+        self.assertTrue(all(not path.exists() for path in legacy_paths))
+        self.assertFalse(duplicate.exists())
+
+    def test_conflicting_legacy_and_canonical_packages_are_preserved(self):
+        package, _ = self.package()
+        exact = package.read_bytes()
+        receipt_path = importer.archive_package(package, self.results, self.status)
+        receipt_bytes = receipt_path.read_bytes()
+        legacy = self.results / '000-system-info/v1.tar.gz'
+        legacy.write_bytes(b'other result data')
+        duplicate = self.incoming / 'again.tar.gz'
+        duplicate.write_bytes(exact)
+
+        with self.assertRaisesRegex(importer.ArchiveError, 'archived package differs'):
+            importer.archive_package(duplicate, self.results, self.status)
+
+        self.assertEqual(legacy.read_bytes(), b'other result data')
+        self.assertEqual((self.results / '000-system-info/000-system-info.v1.tar.gz').read_bytes(), exact)
+        self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
+        self.assertTrue(duplicate.exists())
+
+    def test_declared_package_name_must_match_identity(self):
+        package, _ = self.package(metadata={'archive_name': '001-other-task.v9.tar.gz'})
+        with self.assertRaisesRegex((importer.ArchiveError, runner.RunnerError), 'archive'):
+            importer.archive_package(package, self.results, self.status)
+        self.assertTrue(package.exists())
+        self.assertFalse(self.status.exists())
 
     def test_unsafe_tar_and_incomplete_manifest_are_preserved(self):
         traversal = tarfile.TarInfo('../escaped.txt')

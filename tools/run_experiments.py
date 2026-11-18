@@ -86,6 +86,25 @@ def task_label(row):
     return f"{row['id']}-{effective_slug(row)}"
 
 
+def archive_name(row):
+    if (not isinstance(row.get('id'), str) or not re.fullmatch(ID_PATTERN, row['id'])
+            or type(row.get('version')) is not int or row['version'] < 1):
+        raise RunnerError('archive name requires a three-digit task ID and positive version')
+    return f"{task_label(row)}.v{row['version']}.tar.gz"
+
+
+def archive_path(results, row):
+    return Path(results) / task_label(row) / archive_name(row)
+
+
+def archive_candidates(results, row):
+    root = Path(results)
+    return [archive_path(root, row),
+            root / task_label(row) / f"v{row['version']}.tar.gz",
+            root / row['id'] / f"v{row['version']}.tar.gz",
+            root / row['id'] / archive_name(row)]
+
+
 def execution_metadata(row):
     row = dict(row)
     row['slug'] = effective_slug(row)
@@ -93,6 +112,7 @@ def execution_metadata(row):
     row.setdefault('name', task.get('name', row['slug']))
     row.setdefault('command', task.get('command') or
                    f"bash tools/runner.sh --task {row['id']} --once")
+    row['archive_name'] = archive_name(row)
     return row
 
 
@@ -138,6 +158,8 @@ def validate_receipt(row, path=None):
                    for key in ('task_sha256', 'archive_sha256'))):
         raise RunnerError(f'invalid archival receipt: {path}')
     effective_slug(row)
+    if 'archive_name' in row and row['archive_name'] != archive_name(row):
+        raise RunnerError(f'archive name does not match task identity: {path}')
     return row
 
 
@@ -380,6 +402,7 @@ class ClaimStore:
                'task_sha256': digest, 'source_commit': source, 'worker': worker,
                'host_id': host_identity(), 'claim': uuid.uuid4().hex,
                'state': 'running', 'delivery_state': 'awaiting_download', 'claimed_at': timestamp()}
+        row['archive_name'] = archive_name(row)
         self.lock_dir.mkdir(parents=True, exist_ok=True)
         guard = self.guard(task_id)
         try:
@@ -468,7 +491,10 @@ class ClaimStore:
                 if current.get('archive_sha256') != receipt['archive_sha256']:
                     raise RunnerError(f'archival receipt changed for completed delivery {key}')
                 pending = [run_path(results, receipt), results / receipt['id'] / f"v{receipt['version']}"]
-                if not any(path.exists() or path.with_suffix('.tar.gz').exists() for path in pending):
+                pending_packages = archive_candidates(results, receipt)
+                archived_aliases = [path for path in archive_candidates(archive_dir, receipt)
+                                    if path != archive_path(archive_dir, receipt)]
+                if not any(path.exists() for path in (*pending, *pending_packages, *archived_aliases)):
                     continue
             guard = self.guard(receipt['id'])
             if guard.exists():
@@ -506,15 +532,19 @@ class ClaimStore:
         if len(sources) > 1:
             raise RunnerError(f'both legacy and named results exist for {task_label(receipt)}')
         source = sources[0] if sources else None
-        source_packages = [path.with_suffix('.tar.gz') for path in candidates if path.with_suffix('.tar.gz').is_file()]
-        if len(source_packages) > 1:
-            raise RunnerError(f'both legacy and named packages exist for {task_label(receipt)}')
-        source_package = source_packages[0] if source_packages else None
-        destination_package = destination.with_suffix('.tar.gz')
-        for package in (source_package, destination_package if destination_package.exists() else None):
-            if package is not None and sha256_file(package) != receipt['archive_sha256']:
+        source_candidates = archive_candidates(results, receipt)
+        archived_candidates = archive_candidates(archive_dir, receipt)
+        for package in (*source_candidates, *archived_candidates):
+            if package.is_symlink() or package.exists() and not package.is_file():
+                raise RunnerError(f'archival package is not a regular file: {package}')
+        source_packages = [path for path in source_candidates if path.is_file()]
+        archived_packages = [path for path in archived_candidates if path.is_file()]
+        destination_package = archive_path(archive_dir, receipt)
+        packages = source_packages + archived_packages
+        for package in packages:
+            if sha256_file(package) != receipt['archive_sha256']:
                 raise RunnerError(f'archival package checksum mismatch: {package}')
-        if source_package is None and not destination_package.is_file():
+        if not packages:
             raise RunnerError(f'archival package is missing for {task_label(receipt)}')
         if source is not None and destination.exists():
             raise RunnerError(f'both pending and archived raw directories exist: {destination}')
@@ -527,17 +557,20 @@ class ClaimStore:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if source is not None:
             source.rename(destination)
-        if source_package is not None:
-            if destination_package.exists():
-                source_package.unlink()  # Both exact compressed hashes matched.
-            else:
-                source_package.rename(destination_package)
+        if not destination_package.exists():
+            # Only names change. Receipts continue to identify the original
+            # compressed bytes, including packages written by older runners.
+            packages[0].rename(destination_package)
+        for package in packages:
+            if package != destination_package and package.exists():
+                package.unlink()  # Every alias matched the receipt checksum.
         # Re-read after the move; an old result replay never writes delivery
         # metadata over a terminal shared status.
         latest = self.read(receipt['id']).get((receipt['id'], receipt['version']), current)
         if any(latest[field] != receipt[field] for field in identity):
             raise RunnerError('shared status changed while archiving completed data')
         self.save({**latest, 'slug': receipt['slug'], 'command': receipt['command'],
+                   'archive_name': archive_name(receipt),
                    'delivery_state': 'archived', 'archived_at': receipt['archived_at'],
                    'archive_sha256': receipt['archive_sha256']})
         for parent in {path.parent for path in candidates}:
@@ -578,7 +611,9 @@ def run_path(results, row):
 
 
 def prepare_archive(output, record):
-    tarpath = output.with_suffix('.tar.gz')
+    record['archive_name'] = archive_name(record)
+    tarpath = archive_path(output.parent.parent, record)
+    tarpath.parent.mkdir(parents=True, exist_ok=True)
     tmp_tar = tarpath.with_suffix('.tmp')
     metadata = output / '.archive-metadata.json'
     selected, omitted, total = [], [], 0

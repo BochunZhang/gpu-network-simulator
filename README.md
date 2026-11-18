@@ -122,9 +122,9 @@ runner 在永久领取前检查基线，从 CPFS 的 `results/` 或 `results-arc
 ```text
 .lock/000.task.lock/      同一任务所有版本共用的执行锁
 .lock/000.v1.lock/        任务 000 版本 1 的永久领取记录
-status/000-system-info/v1.json        共享状态
-results/000-system-info/v1/           执行记录、日志和输出
-results/000-system-info/v1.tar.gz     手动下载的摘要包
+status/000-system-info/v2.json        共享状态
+results/000-system-info/v2/           执行记录、日志和输出
+results/000-system-info/000-system-info.v2.tar.gz     手动下载的摘要包
 ```
 
 领取通过原子 `mkdir` 竞争。完成后先保存终态，再释放任务执行锁，保留版本领取记录。版本锁中保存主机、进程、领取标识及版本信息。重复启动会跳过已领取的版本。同一共享 checkout 的 Git 拉取和源码导出通过短期目录锁串行化，实验从独立快照执行。
@@ -134,7 +134,7 @@ CPFS 挂载需要提供跨客户端互斥的目录创建与可见的元数据更
 状态包括 `running`、`succeeded`、`failed` 和 `abandoned`。崩溃遗留的锁保留给人工恢复。先在记录的原主机上停止轮询器并确认实验进程已经退出，再执行以下命令。需要重跑时，在开发端递增任务版本。
 
 ```bash
-bash tools/runner.sh --abandon 000 1
+bash tools/runner.sh --abandon 000 2
 ```
 
 如果原主机的 Git 拉取进程崩溃并留下 Git 协调锁，确认该进程已退出后，在原主机执行 `bash tools/runner.sh --recover-git-lock`。环境初始化崩溃遗留的锁需要根据其中的主机和进程记录人工检查后恢复。若崩溃发生在目录创建后、`owner.json` 写入前，该目录会保持阻塞。此时先停止可能持有该锁的轮询器及子进程，确认已全部退出，再人工移走该孤立目录并保留恢复记录。正常运行时保留 `.lock/`、`status/` 和 `results/`，供后续启动检查。
@@ -142,25 +142,27 @@ bash tools/runner.sh --abandon 000 1
 ## 结果回收与归档
 
 ```bash
-cat status/000-system-info/v1.json
-cat results/000-system-info/v1/result.json
+cat status/000-system-info/v2.json
+cat results/000-system-info/v2/result.json
 ```
 
-GPU 设备完成后，`results/000-system-info/v1/` 和同级 `v1.tar.gz` 表示待下载数据。把原始 `v1.tar.gz` 下载到本地分析仓库的 `results-remote/`，保留压缩包原始字节。文件可放进子目录，归档工具通过包内执行记录确定任务身份。
+压缩包统一使用 `{三位编号}-{任务简称}.v{版本}.tar.gz`，例如 `000-system-info.v2.tar.gz`、`001-gedes-smoke.v1.tar.gz`。文件保存在对应任务目录，下载后单独查看文件名也能识别任务和版本。运行状态、结果记录和归档确认包含 `archive_name`。既有 `vN.tar.gz` 结果包继续兼容读取，迁移通过重命名保留原始字节及校验和。
+
+GPU 设备完成后，`results/000-system-info/v2/` 和同级 `000-system-info.v2.tar.gz` 表示待下载数据。把原始 `000-system-info.v2.tar.gz` 下载到本地分析仓库的 `results-remote/`，保留压缩包原始字节。文件可放进子目录，归档工具通过包内执行记录确定任务身份。
 
 ```bash
 python3 tools/archive_results.py
 ```
 
-归档工具校验包内记录和文件，再写入本地 `results/000-system-info/v1/`，保留同级原始 `v1.tar.gz`，生成 `status/000-system-info/v1.archived.json`。成功归档后清理已消费的输入包，重复导入同一个包会校验并跳过。输入目录支持完整的 `.tar.gz` 结果包，松散目录保持原样供人工检查。
+归档工具校验包内记录和文件，再写入本地 `results/000-system-info/v2/`，保留同级原始 `000-system-info.v2.tar.gz`，生成 `status/000-system-info/v2.archived.json`。成功归档后清理已消费的输入包，重复导入同一个包会校验并跳过。输入目录支持完整的 `.tar.gz` 结果包，松散目录保持原样供人工检查。
 
-分析端随后把 `v1.archived.json` 提交并推送到 `main`。确认记录包含执行状态、简称、命令、领取标识、源码提交和原始压缩包的 SHA-256。原始结果、`results-remote/` 与 `results-archive/` 保留在本地，Git 跟踪归档确认记录。
+分析端随后把 `v2.archived.json` 提交并推送到 `main`。确认记录包含执行状态、简称、命令、领取标识、源码提交和原始压缩包的 SHA-256。原始结果、`results-remote/` 与 `results-archive/` 保留在本地，Git 跟踪归档确认记录。
 
 CPFS 执行器下一次拉取后，核对确认记录与本机压缩包和执行身份，随后把远程端数据移到以下路径。
 
 ```text
-results-archive/000-system-info/v1/
-results-archive/000-system-info/v1.tar.gz
+results-archive/000-system-info/v2/
+results-archive/000-system-info/000-system-info.v2.tar.gz
 ```
 
 此后 CPFS 的 `results/` 只保留尚未确认归档的数据。实验的 `state` 保持 `succeeded` 或 `failed` 等原结果，`delivery_state` 记录 `awaiting_download` 或 `archived`。失败实验同样可以回收归档。移动中断时可继续处理，遇到不同内容的目标文件会停止并保留数据。崩溃恢复后继续使用同一组结果目录和归档目录。

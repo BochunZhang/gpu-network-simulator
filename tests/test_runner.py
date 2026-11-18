@@ -104,7 +104,7 @@ class RunnerTest(unittest.TestCase):
         receipt = {key: result2[key] for key in ('id', 'slug', 'name', 'version', 'claim', 'source_commit',
                                                 'task_sha256', 'state', 'command')}
         receipt.update(schema_version=1, archived_at='2026-11-18T00:00:00+00:00',
-                       archive_sha256=runner.sha256_file(output2.with_suffix('.tar.gz')))
+                       archive_sha256=runner.sha256_file(runner.archive_path(self.results, result2)))
         self.store.archive_receipts([receipt], self.results, self.checkout / 'results-archive')
         self.assertFalse(output2.exists())
         execution = {'mode': 'incremental', 'base': {'id': '000', 'version': 2,
@@ -120,7 +120,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(manifest['cases']['mutable']['origin'], 'executed')
         self.assertEqual((output3 / 'cases/mutable/value.txt').read_text(), 'v3')
         self.assertEqual((self.checkout / 'results-archive/000-new-kind/v2/cases/mutable/value.txt').read_text(), 'v2')
-        with tarfile.open(output3.with_suffix('.tar.gz')) as archive:
+        with tarfile.open(runner.archive_path(self.results, result3)) as archive:
             self.assertIn('artifacts-manifest.json', archive.getnames())
             self.assertIn('cases/stable/value.txt', archive.getnames())
         self.case_cli()
@@ -188,7 +188,7 @@ class RunnerTest(unittest.TestCase):
         result = runner.read_json(output / 'result.json')
         receipt = {key: result[key] for key in
                    ('id', 'slug', 'name', 'version', 'claim', 'source_commit', 'task_sha256', 'state', 'command')}
-        receipt.update(schema_version=1, archive_sha256=runner.sha256_file(output.with_suffix('.tar.gz')),
+        receipt.update(schema_version=1, archive_sha256=runner.sha256_file(runner.archive_path(self.results, result)),
                        archived_at='2026-11-18T00:00:00+00:00')
         return output, receipt
 
@@ -205,6 +205,98 @@ class RunnerTest(unittest.TestCase):
         runner.write_json(receipt_path, {'not': 'a runtime status'})
         self.assertEqual(set(self.store.read()), {('000', 1)})
 
+    def test_package_name_and_metadata_identify_task_and_version(self):
+        output, receipt = self.completed_fixture()
+        package = runner.archive_path(self.results, receipt)
+        self.assertEqual(package, self.results / '000-new-kind/000-new-kind.v1.tar.gz')
+        self.assertTrue(package.is_file())
+        self.assertFalse(output.with_suffix('.tar.gz').exists())
+        with tarfile.open(package) as archive:
+            record = json.loads(archive.extractfile('result.json').read())
+        self.assertEqual(record['archive_name'], '000-new-kind.v1.tar.gz')
+        self.assertEqual(self.store.read()['000', 1]['archive_name'], record['archive_name'])
+        with self.assertRaisesRegex(runner.RunnerError, 'archive name'):
+            runner.validate_receipt({**receipt, 'archive_name': 'different.v1.tar.gz'})
+
+    def test_legacy_package_is_renamed_without_recompressing(self):
+        output, receipt = self.completed_fixture(legacy=True)
+        canonical = runner.archive_path(self.results, receipt)
+        self.assertTrue(canonical.is_file())  # Even a legacy raw directory gets a canonical package.
+        legacy_package = output.with_suffix('.tar.gz')
+        with tarfile.open(canonical) as archive:
+            contents = [(member, archive.extractfile(member).read()) for member in archive.getmembers()]
+        import io
+        with tarfile.open(legacy_package, 'w:gz') as archive:
+            for member, data in contents:
+                if member.name == 'result.json':
+                    record = json.loads(data)
+                    record.pop('archive_name', None)
+                    data = json.dumps(record).encode()
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        canonical.unlink()
+        original = legacy_package.read_bytes()
+        receipt['archive_sha256'] = runner.sha256_file(legacy_package)
+        archive_dir = self.checkout / 'results-archive'
+        self.store.archive_receipts([receipt], self.results, archive_dir)
+        destination = runner.archive_path(archive_dir, receipt)
+        self.assertEqual(destination.read_bytes(), original)
+        with tarfile.open(destination) as archive:
+            self.assertNotIn('archive_name', json.loads(archive.extractfile('result.json').read()))
+        self.assertFalse(legacy_package.exists())
+
+    def test_identical_package_aliases_merge_into_canonical_archive(self):
+        output, receipt = self.completed_fixture()
+        canonical = runner.archive_path(self.results, receipt)
+        original = canonical.read_bytes()
+        legacy = output.with_suffix('.tar.gz')
+        shutil.copyfile(canonical, legacy)
+        archive_dir = self.checkout / 'results-archive'
+        archived_legacy = runner.run_path(archive_dir, receipt).with_suffix('.tar.gz')
+        archived_legacy.parent.mkdir(parents=True)
+        shutil.copyfile(canonical, archived_legacy)
+        self.store.archive_receipts([receipt], self.results, archive_dir)
+        destination = runner.archive_path(archive_dir, receipt)
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertFalse(canonical.exists())
+        self.assertFalse(legacy.exists())
+        self.assertFalse(archived_legacy.exists())
+        self.assertEqual(self.store.read()['000', 1]['archive_name'], destination.name)
+        self.store.archive_receipts([receipt], self.results, archive_dir)
+        self.assertEqual(destination.read_bytes(), original)
+        destination.rename(archived_legacy)
+        self.store.archive_receipts([receipt], self.results, archive_dir)
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertFalse(archived_legacy.exists())
+
+    def test_conflicting_package_alias_preserves_pending_files(self):
+        output, receipt = self.completed_fixture()
+        canonical = runner.archive_path(self.results, receipt)
+        original = canonical.read_bytes()
+        legacy = output.with_suffix('.tar.gz')
+        legacy.write_bytes(b'other experiment')
+        with self.assertRaisesRegex(runner.RunnerError, 'checksum'):
+            self.store.archive_receipts([receipt], self.results, self.checkout / 'results-archive')
+        self.assertEqual(canonical.read_bytes(), original)
+        self.assertEqual(legacy.read_bytes(), b'other experiment')
+        self.assertTrue(output.is_dir())
+
+    def test_nonregular_package_destination_preserves_pending_files(self):
+        output, receipt = self.completed_fixture()
+        package = runner.archive_path(self.results, receipt)
+        original = package.read_bytes()
+        archive_dir = self.checkout / 'results-archive'
+        destination = runner.archive_path(archive_dir, receipt)
+        destination.mkdir(parents=True)
+        for symlink in (False, True):
+            if symlink:
+                destination.rmdir()
+                destination.symlink_to(package)
+            with self.assertRaisesRegex(runner.RunnerError, 'not a regular file'):
+                self.store.archive_receipts([receipt], self.results, archive_dir)
+            self.assertTrue(output.is_dir())
+            self.assertEqual(package.read_bytes(), original)
+
     def test_legacy_running_status_finishes_without_rerun(self):
         output, receipt = self.completed_fixture(legacy=True)
         self.assertEqual(output.parent.name, '000')
@@ -214,7 +306,7 @@ class RunnerTest(unittest.TestCase):
         self.assertIsNone(self.store.claim(task, digest, source, self.results, 'again'))
         archive = self.checkout / 'results-archive'
         self.store.archive_receipts([receipt], self.results, archive)
-        self.assertTrue((archive / '000-new-kind' / 'v1.tar.gz').is_file())
+        self.assertTrue((archive / '000-new-kind' / '000-new-kind.v1.tar.gz').is_file())
         self.assertFalse((self.results / '000').exists())
 
     def test_receipt_moves_and_preserves_execution_and_newer_task(self):
@@ -225,7 +317,7 @@ class RunnerTest(unittest.TestCase):
         archive = self.checkout / 'results-archive'
         self.store.archive_receipts([receipt], self.results, archive)
         self.assertTrue((archive / '000-new-kind/v1/raw.log').is_file())
-        self.assertTrue((archive / '000-new-kind/v1.tar.gz').is_file())
+        self.assertTrue((archive / '000-new-kind/000-new-kind.v1.tar.gz').is_file())
         self.assertFalse(output.exists())
         self.assertTrue(self.store.reservation('000', 1).is_dir())
         self.assertEqual(runner.read_json(self.store.guard('000') / 'owner.json')['claim'], old_guard['claim'])
@@ -257,7 +349,7 @@ class RunnerTest(unittest.TestCase):
     def test_partial_archive_move_replays_safely(self):
         output, receipt = self.completed_fixture()
         archive = self.checkout / 'results-archive'
-        package = output.with_suffix('.tar.gz')
+        package = runner.archive_path(self.results, receipt)
         real_rename = Path.rename
         def fail_package(path, target):
             if path == package:
@@ -356,7 +448,7 @@ class RunnerTest(unittest.TestCase):
         self.store.reconcile(self.results)
         self.assertEqual(self.store.read()['000', 1]['state'], 'succeeded')
         self.assertFalse(self.store.guard('000').exists())
-        with tarfile.open(output.with_suffix('.tar.gz')) as archive:
+        with tarfile.open(runner.archive_path(self.results, row)) as archive:
             self.assertEqual(archive.getnames(), ['result.json', 'summary.txt'])
             record = json.loads(archive.extractfile('result.json').read())
             self.assertEqual(record['source_commit'], row['source_commit'])
