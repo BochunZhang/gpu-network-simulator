@@ -1129,26 +1129,35 @@ def poll(queue, store, args, fd):
     from retired_experiments import reconcile_ignored
 
     active = None
+    archive_dir = getattr(args, 'archive_dir', queue.root / 'results-archive')
     while True:
         result = None
-        if active is not None and active[0].poll() is not None:
-            child, output, _ = active
-            result = child.returncode
-            if not (output / 'result.json').is_file():
-                print(f'worker exited without terminal result; retain shared claim: {output}', file=sys.stderr)
-                return 1
-            active = None
+        finished = active is not None and active[0].poll() is not None
+        active_claim = active[2] if active and not finished else None
         next_poll = time.monotonic() + POLL_SECONDS
         try:
-            rows = store.reconcile(args.results_dir, active[2] if active else None)
+            rows = store.reconcile(args.results_dir, active_claim)
+            if finished:
+                child, output, claim = active
+                row = next((row for row in rows.values() if row['claim'] == claim
+                            and row['state'] in TERMINAL), None)
+                if row is None:
+                    print(f'worker exited without terminal result; retain shared claim: {output}', file=sys.stderr)
+                    return 1
+                archive = row['archive_name'] if any(
+                    archive_path(root, row).is_file() for root in (args.results_dir, archive_dir)
+                ) else '-'
+                print(f"complete {row['id']} {version_name(row)} state={row['state']} archive_name={archive}",
+                      flush=True)
+                result = child.returncode
+                active = None
+                finished = False
             if active is None and any(row['host_id'] == host_identity() and row['state'] == 'running'
                                       for row in rows.values()):
                 raise RunnerError('unfinished execution on this host; confirm it stopped, then use --abandon ID VERSION')
             source = queue.source()
-            archive_dir = getattr(args, 'archive_dir', queue.root / 'results-archive')
             receipts = queue.archived_receipts(source)
             releases = queue.tasks(source)
-            active_claim = active[2] if active else None
             store.archive_receipts(receipts, args.results_dir, archive_dir, active_claim)
             reconcile_ignored(releases, store, args.results_dir, archive_dir, active_claim, receipts=receipts)
             if args.once and result is not None:
@@ -1159,10 +1168,10 @@ def poll(queue, store, args, fd):
                     return 0
         except (RunnerError, OSError, ValueError) as exc:
             print(f'poll failed: {exc}', file=sys.stderr)
-            if args.once and active is None:
+            if args.once and (active is None or finished):
                 return 1
         remaining = max(0, next_poll - time.monotonic())
-        if active is None:
+        if active is None or finished:
             time.sleep(remaining)
         else:
             try:

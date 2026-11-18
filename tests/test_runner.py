@@ -114,9 +114,12 @@ class RunnerTest(unittest.TestCase):
             proc = subprocess.run([sys.executable, '-B', str(self.checkout / 'tools/run_experiments.py'),
                                    '--task', selector, '--once'], text=True, capture_output=True, timeout=30)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc
 
         child0, child1 = parent + '-00', parent + '-01'
-        once(parent)
+        first_execution = once(parent)
+        self.assertIn(f'complete {child0} v1-261118-000000 state=succeeded '
+                      f'archive_name={child0}.v1-261118-000000.tar.gz', first_execution.stdout)
         first_run = self.store.read()[child0, batch]
         package = runner.archive_path(self.results, first_run)
         checksum = runner.sha256_file(package)
@@ -288,7 +291,8 @@ class RunnerTest(unittest.TestCase):
 
     def test_incremental_cli_reuses_passed_case_from_failed_archived_v2(self):
         self.commit_case_task(2, {'mode': 'full'}, fail=True, value='v2')
-        self.case_cli(expected=1)
+        failed = self.case_cli(expected=1)
+        self.assertIn('complete 000 v2 state=failed archive_name=000-new-kind.v2.tar.gz', failed.stdout)
         output2 = self.results / '000-new-kind/v2'
         result2 = runner.read_json(output2 / 'result.json')
         self.assertEqual(result2['case_counts'], {'executed': 2, 'reused': 0, 'failed': 1, 'skipped': 0})
@@ -896,12 +900,15 @@ class RunnerTest(unittest.TestCase):
         env = {**os.environ, 'PATH': str(guard_dir) + os.pathsep + os.environ['PATH'],
                'PYTHONDONTWRITEBYTECODE': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null'}
         args = [sys.executable, '-B', str(self.checkout / 'tools/run_experiments.py'), '--once']
-        for version in (1, 1, 2):
+        for version, executes in ((1, True), (1, False), (2, True)):
             if version == 2:
                 self.commit_task(version=2, marker='v2')
             process = subprocess.run(args, env=env, text=True, capture_output=True, timeout=30)
             self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
             self.assertEqual(self.store.read()['000', version]['state'], 'succeeded')
+            lines = [line for line in process.stdout.splitlines() if line.startswith('complete ')]
+            expected = [f'complete 000 v{version} state=succeeded archive_name=000-new-kind.v{version}.tar.gz']
+            self.assertEqual(lines, expected if executes else [])
         self.assertEqual((self.results / '000-new-kind/v2/summary.txt').read_text(), 'v2')
         calls = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertTrue(any('fetch' in call for call in calls))
@@ -922,10 +929,31 @@ class RunnerTest(unittest.TestCase):
         dead = SimpleNamespace(returncode=9, poll=lambda: 9, wait=lambda timeout: 9)
         args.once = False
         with patch.object(runner, 'start_task', return_value=(dead, self.results / '000-new-kind/v2', second['claim'])) as start:
-            with patch.object(self.store, 'read', return_value={}):
+            with patch.object(self.store, 'read', return_value={}), patch('builtins.print') as printed:
                 self.assertEqual(runner.poll(self.queue, self.store, args, 0), 1)
+        self.assertFalse(any(call.args[0].startswith('complete ') for call in printed.call_args_list))
         self.assertEqual(start.call_count, 1)
         self.assertTrue(self.store.guard('000').exists())
+
+    def test_complete_reports_missing_package_before_next_fetch(self):
+        source, task, digest = self.source_task()
+        args = SimpleNamespace(once=True, results_dir=self.results, worker_id='host', gpu_count=0)
+
+        def finish_without_archive(*_):
+            row = self.store.claim(task, digest, source, self.results, 'host')
+            output = runner.run_path(self.results, row)
+            output.mkdir(parents=True)
+            runner.write_json(output / 'result.json', {**row, 'state': 'failed', 'exit_code': 1,
+                                                        'archive_error': 'disk full'})
+            child = SimpleNamespace(returncode=1, poll=lambda: 1, wait=lambda timeout: 1)
+            return child, output, row['claim']
+
+        with patch.object(self.queue, 'source', side_effect=[source, runner.RunnerError('offline')]):
+            with patch.object(runner, 'start_task', side_effect=finish_without_archive), patch('builtins.print') as printed:
+                self.assertEqual(runner.poll(self.queue, self.store, args, 0), 1)
+        self.assertEqual([call.args[0] for call in printed.call_args_list],
+                         ['complete 000 v1 state=failed archive_name=-', 'poll failed: offline'])
+        self.assertEqual(self.store.read()['000', 1]['state'], 'failed')
 
     def test_gpu_visibility_and_inherited_local_lock(self):
         response = SimpleNamespace(returncode=0, stdout='0, GPU-a\n1, GPU-b\n2, GPU-c\n3, GPU-d\n')

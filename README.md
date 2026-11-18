@@ -22,6 +22,8 @@ bash tools/runner.sh
 
 入口自动准备 Python 环境，随后约每 10 秒拉取 `main` 并检查任务。实验运行期间继续检查更新。每个任务使用领取时的 Git 提交快照，后续拉取不会改变正在执行的实验。GPU 设备只通过网络读取公开代码和依赖，结果保存在共享文件系统。
 
+任务进入终态后，runner 输出一行 `complete <任务标识> <版本> state=<状态> archive_name=<包名>`。成功和已记录的失败均会输出；包未生成时 `archive_name=-`。
+
 终端保持打开时可直接前台运行。需要断开 SSH 后继续执行时可以使用 `nohup`，tmux 可选。
 
 ```bash
@@ -42,12 +44,7 @@ tail -f /tmp/gpu-network-runner.log
 
 当前这些程序无需安装 PyTorch 或 NCCL。Days 中的 collective/NCCL 名称用于描述模拟通信，宿主执行依赖以构建清单为准。后续真实训练或 NCCL collective 校准任务会单独声明相应依赖。
 
-在需要运行 Days AGO 的 GB200 设备上，使用启动 runner 的账户安装 Rust。脚本通过 Rustup 安装 `stable` 的最小工具链，包含 `rustc` 和 `cargo`。启动 runner 时将 Cargo 的可执行文件目录放入 `PATH`。
-
-```bash
-bash tools/install_rust.sh &&
-PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" RUSTUP_TOOLCHAIN=stable bash tools/runner.sh
-```
+Days AGO 在构建前检测 `rustc` 和 `cargo`，缺少可用工具链时自动用当前账户执行固定源码中的 `tools/install_rust.sh`。安装与版本探测记录随实验回包。也可以提前以 runner 账户执行 `bash tools/install_rust.sh`。
 
 ## Python 环境
 

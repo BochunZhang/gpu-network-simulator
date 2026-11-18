@@ -390,14 +390,38 @@ def days_record(log, engine):
     return fields
 
 
+def _rust_works(env):
+    probe_env = {**env, "RUSTUP_AUTO_INSTALL": "0"}
+    try:
+        return all(subprocess.run(
+            [tool, "--version"], env=probe_env, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, pass_fds=pass_lock(), check=False,
+        ).returncode == 0 for tool in ("rustc", "cargo"))
+    except OSError:
+        return False
+
+
+def days_rust_environment(source: Path, output: Path, env):
+    """Use available Rust tools or provision them with the pinned Days installer."""
+    if not _rust_works(env):
+        home = Path(env.get("HOME") or Path.home())
+        cargo_home = Path(env.get("CARGO_HOME") or home / ".cargo").absolute()
+        rust_path = os.pathsep.join(filter(None, (str(cargo_home / "bin"), env.get("PATH", os.defpath))))
+        env = {**env, "CARGO_HOME": str(cargo_home), "PATH": rust_path}
+        if not _rust_works(env):
+            command(["sh", source / "tools/install_rust.sh"], output / "rust-install.txt", env=env)
+            env = {**env, "RUSTUP_TOOLCHAIN": "stable"}
+    for tool in ("rustc", "cargo"):
+        command([tool, "--version"], output / f"{tool}.txt", env=env)
+    return env
+
+
 def days_cuda_smoke(source: Path, output: Path):
-    del source
     capability, env = selected_gpu(output)
     if capability not in {"8.6", "8.9", "12.1"}:
         raise RuntimeError(f"Days pin supports SM 8.6, 8.9 or 12.1; observed {capability}; port separately")
     command(["nvcc", "--version"], output / "nvcc.txt", env=env)
-    command(["rustc", "--version"], output / "rustc.txt", env=env)
-    command(["cargo", "--version"], output / "cargo.txt", env=env)
+    env = days_rust_environment(source, output, env)
     with TemporaryDirectory(prefix=".days-", dir=output) as scratch_dir:
         scratch = Path(scratch_dir)
         src = checkout(DAYS, scratch, output, env)

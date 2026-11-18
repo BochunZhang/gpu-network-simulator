@@ -83,8 +83,9 @@ def run(source, output, handlers):
         capability, env = handlers.selected_gpu(output)
         if capability != '10.0':
             raise RuntimeError(f'Days FatTree48 experiment requires SM100, observed {capability}')
-        for tool, executable in (('nvcc', env.get('NVCC', 'nvcc')), ('rustc', 'rustc'), ('cargo', 'cargo')):
-            handlers.command([executable, '--version'], output / f'{tool}.txt', env=env)
+        handlers.command([env.get('NVCC', 'nvcc'), '--version'], output / 'nvcc.txt', env=env)
+        summary['stage'] = 'rust-toolchain'
+        env = handlers.days_rust_environment(source, output, env)
         with TemporaryDirectory(prefix='.days-fat-tree48-', dir=output) as temp:
             scratch = Path(temp)
             summary['stage'] = 'checkout'
