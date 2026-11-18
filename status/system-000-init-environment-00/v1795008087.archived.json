@@ -1,0 +1,28 @@
+{
+  "archive_name": "system-000-init-environment-00.v1795008087.tar.gz",
+  "archive_sha256": "d72902fa3a5a5ae81d2a68997aa82876a4007b22bd8ae146c0a0ddc7afe1a7d8",
+  "archive_size": 5246,
+  "archived_at": "2026-11-18T14:33:01+00:00",
+  "artifacts_manifest_sha256": "5ccaadd0ad2f3a23c192db2198b385d2cde7bbb9e0cc65aae57fa477f590cd04",
+  "case_counts": {
+    "executed": 5,
+    "failed": 0,
+    "reused": 0,
+    "skipped": 0
+  },
+  "claim": "6457e0d3e7b445ffac029ff907ebc9d0",
+  "command": "bash tools/runner.sh --task system-000-init-environment-00 --once",
+  "command_source": "recorded",
+  "id": "system-000-init-environment-00",
+  "name": "GB200 four-GPU environment inventory",
+  "parent_id": "system-000-init-environment",
+  "schema_version": 1,
+  "slug": "init-environment",
+  "source_commit": "39bb9be7de10f7665026e0d9ef0e6382ba46d7cc",
+  "state": "succeeded",
+  "subtask_id": "00",
+  "subtask_status": "2026-11-18T13:21:27Z",
+  "task_sha256": "e81791613e14d10ca48240d764e0f2c4030e72c7105a7801d15b7b36c3d1872c",
+  "task_status": "2026-11-18T13:21:27Z",
+  "version": 1795008087
+}
