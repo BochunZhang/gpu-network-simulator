@@ -1,0 +1,38 @@
+diff --git a/executor/build.rs b/executor/build.rs
+--- a/executor/build.rs
++++ b/executor/build.rs
+@@ -71,2 +71,3 @@
+             .arg("--generate-code=arch=compute_121,code=sm_121")
++            .arg("--generate-code=arch=compute_100,code=sm_100")
+             .arg("--generate-code=arch=compute_89,code=sm_89")
+@@ -93,3 +94,3 @@
+             &nvcc,
+-            &format!("sm_121 + sm_89 + sm_86 fatbin compilation of round module {module}"),
++            &format!("sm_121 + sm_100 + sm_89 + sm_86 fatbin compilation of round module {module}"),
+             compiled,
+@@ -104,3 +105,3 @@
+     panic!(
+-        "the `cuda` feature requires a CUDA 13 nvcc capable of compiling sm_121, sm_89 and sm_86; \
++        "the `cuda` feature requires a CUDA 13 nvcc capable of compiling sm_121, sm_100, sm_89 and sm_86; \
+          `{}` failed during {operation} with status {}.\nstdout:\n{}\nstderr:\n{}",
+diff --git a/executor/src/cuda.rs b/executor/src/cuda.rs
+--- a/executor/src/cuda.rs
++++ b/executor/src/cuda.rs
+@@ -5564,3 +5564,3 @@
+ impl RoundModule {
+-    /// The embedded fatbin of `build`'s module, for sm_121, sm_89 and sm_86.
++    /// The embedded fatbin of `build`'s module, for sm_121, sm_100, sm_89 and sm_86.
+     fn fatbin(build: RoundKernel) -> &'static [u8] {
+@@ -5588,3 +5588,3 @@
+                 driver_error(
+-                    format!("embedded sm_121/sm_89/sm_86 {build:?} round-module fatbin load"),
++                    format!("embedded sm_121/sm_100/sm_89/sm_86 {build:?} round-module fatbin load"),
+                     error,
+@@ -5730,5 +5730,5 @@
+             select_cuda_provisioning(integrated, managed_memory, concurrent_managed_access);
+-        if !matches!((major, minor), (12, 1) | (8, 9) | (8, 6)) {
++        if !matches!((major, minor), (12, 1) | (10, 0) | (8, 9) | (8, 6)) {
+             return Err(CudaError::Unavailable(format!(
+-                "embedded kernels target sm_121, sm_89 and sm_86, but device {device_index} \
++                "embedded kernels target sm_121, sm_100, sm_89 and sm_86, but device {device_index} \
+                  reports sm_{major}{minor}"

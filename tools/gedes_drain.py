@@ -65,12 +65,16 @@ def instrument_sources(src, output, v3, drain_source):
     patched = _replace(patched, 'i < audit_max_rounds && !audit_finished()',
                        'i < audit_max_rounds && (!audit_early_stop || i < 1) && !audit_finished()')
     anchor = '    return 0;\n}'
-    patched = _replace(patched, anchor, '''    try {
+    patched = _replace(patched, anchor, '''    const auto drain_start = AuditClock::now();
+    try {
         topology.WriteDrainAudit(output_file_name);
     } catch (const std::exception &error) {
         std::cerr << "GeDES terminal snapshot failed: " << error.what() << std::endl;
         return 1;
     }
+    std::cout << "record=gedes_drain seconds="
+              << std::chrono::duration<double>(AuditClock::now() - drain_start).count()
+              << std::endl;
 ''' + anchor)
     main.write_text(patched)
     cmake = src / 'CMakeLists.txt'
@@ -93,16 +97,37 @@ def csv_dict(path, id_fields):
     return rows
 
 
+def inspect_queues(path, node_count):
+    counts = {group: {'queues': 0, 'entries': 0, 'nonempty': 0} for group in QUEUE_COUNTS}
+    seen = {group: bytearray(node_count * multiple) for group, multiple in QUEUE_COUNTS.items()}
+    with path.open(newline='', encoding='utf-8') as stream:
+        for row in csv.DictReader(stream):
+            if None in row or None in row.values():
+                raise ValueError('malformed GeDES queue occupancy row')
+            group = row['group']
+            index = int(row['index'])
+            if (group not in seen or not 0 <= index < len(seen[group]) or str(index) != row['index']
+                    or seen[group][index]):
+                raise ValueError('queue inventory does not match the fixed FatTree topology')
+            entries = int(row['entries'])
+            if entries < 0:
+                raise ValueError('negative terminal queue occupancy')
+            seen[group][index] = 1
+            counts[group]['queues'] += 1
+            counts[group]['entries'] += entries
+            counts[group]['nonempty'] += entries > 0
+    if any(counts[group]['queues'] != len(indices) for group, indices in seen.items()):
+        raise ValueError('queue inventory does not match the fixed FatTree topology')
+    return counts
+
+
 def inspect_snapshot(flow_path, k):
     node_count = k ** 3 // 4
     connections = csv_dict(Path(str(flow_path) + '.connections.csv'), ('node',))
     flows = csv_dict(flow_path, ('source_ip', 'dst_ip'))
-    queues = csv_dict(Path(str(flow_path) + '.queues.csv'), ('group', 'index'))
     if set(connections) != {(str(index),) for index in range(node_count)}:
         raise ValueError('connection inventory does not cover every simulated host')
-    if set(queues) != {(group, str(index)) for group, multiple in QUEUE_COUNTS.items()
-                      for index in range(node_count * multiple)}:
-        raise ValueError('queue inventory does not match the fixed FatTree topology')
+    queue_counts = inspect_queues(Path(str(flow_path) + '.queues.csv'), node_count)
 
     pairs = {(row['source_ip'], row['dst_ip']): row for row in connections.values()}
     if (set(pairs) != set(flows) or len(pairs) != node_count
@@ -134,14 +159,6 @@ def inspect_snapshot(flow_path, k):
         for key in totals:
             totals[key] += state[key]
 
-    queue_counts = {group: {'queues': node_count * multiple, 'entries': 0, 'nonempty': 0}
-                    for group, multiple in QUEUE_COUNTS.items()}
-    for (group, _), row in queues.items():
-        entries = int(row['entries'])
-        if entries < 0:
-            raise ValueError('negative terminal queue occupancy')
-        queue_counts[group]['entries'] += entries
-        queue_counts[group]['nonempty'] += entries > 0
     return {'generated_flows': len(pairs), **totals,
             'flow_failures': flow_failures, 'transport_failures': transport_failures,
             'queues': queue_counts}

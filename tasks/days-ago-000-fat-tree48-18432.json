@@ -1,0 +1,20 @@
+{
+  "id": "days-ago-000-fat-tree48-18432",
+  "name": "Days AGO FatTree48 k48/h16 wall-clock timing on one GB200",
+  "status": "2026-11-18T13:29:35Z",
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T13:29:35Z",
+      "kind": "days_ago_fat_tree48",
+      "params": {},
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Validate the SM100 build against Scalar, CPU and CUDA on one small fixture, then time the native 5,530-flow 30% load through 1.024 ms of virtual time and check its packet counts.",
+      "execution": {
+        "mode": "full"
+      }
+    }
+  }
+}

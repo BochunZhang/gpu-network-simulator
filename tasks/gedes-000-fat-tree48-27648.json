@@ -1,0 +1,20 @@
+{
+  "id": "gedes-000-fat-tree48-27648",
+  "name": "GeDES FatTree48 wall-clock timing on one GB200",
+  "status": "2026-11-18T13:29:35Z",
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T13:29:35Z",
+      "kind": "gedes_fat_tree48",
+      "params": {},
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Time the public artifact workload with a 20-million-packet pool and verify completion of all 27,648 directed TCP flows, byte counts, and terminal queue drain.",
+      "execution": {
+        "mode": "full"
+      }
+    }
+  }
+}

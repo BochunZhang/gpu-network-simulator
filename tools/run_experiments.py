@@ -356,14 +356,15 @@ class Queue:
         slots = set()
         last_index = {}
         for published in previous:
-            category, index, _ = published.split('-', 2)
+            category, index, _ = re.fullmatch(task_catalog.PARENT_PATTERN, published).groups()
             last_index[category] = max(last_index.get(category, ''), index)
         for entry in filter(None, tree.split('\0')):
             header, path = entry.split('\t', 1)
             if not path.endswith('.json') or re.fullmatch(r'tasks/[0-9]{6}\.json', path):
                 continue
             key = path[len('tasks/'):-len('.json')]
-            if not re.fullmatch(task_catalog.PARENT_PATTERN, key):
+            parent_match = re.fullmatch(task_catalog.PARENT_PATTERN, key)
+            if not parent_match:
                 raise RunnerError(f'invalid classified task path: {path}')
             blob = header.split()[-1]
             prior = previous.get(key)
@@ -378,10 +379,10 @@ class Queue:
                 if prior:
                     task_catalog.validate_transition(prior[1], manifest)
                 item = blob, manifest, releases
-            slot = tuple(key.split('-', 2)[:2])
+            category, index, _ = parent_match.groups()
+            slot = category, index
             if slot in slots:
                 raise RunnerError(f'duplicate task index: {key}')
-            category, index = slot
             if prior is None and index <= last_index.get(category, ''):
                 raise RunnerError(f'new tasks must follow the published {category} indices: {key}')
             slots.add(slot)

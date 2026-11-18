@@ -37,7 +37,7 @@ tail -f /tmp/gpu-network-runner.log
 | --- | --- |
 | 系统盘点 | Python 标准库、`nvidia-smi` 与被探测的工具 |
 | GeDES | C++17、CMake、CUDA Toolkit 和 NVIDIA 驱动 |
-| Days AGO CUDA | Rust/Cargo、CUDA 13 与 `cudarc`，另需完成固定版本的 SM100 适配 |
+| Days AGO CUDA | Rust/Cargo、支持 SM100 的 CUDA 13 与 `cudarc`。FatTree48 处理器在固定源码上应用 SM100 适配 |
 | 四卡传输 | C++17、NVCC 和 CUDA Runtime |
 
 当前这些程序无需安装 PyTorch 或 NCCL。Days 中的 collective/NCCL 名称用于描述模拟通信，宿主执行依赖以构建清单为准。后续真实训练或 NCCL collective 校准任务会单独声明相应依赖。
@@ -53,7 +53,7 @@ tail -f /tmp/gpu-network-runner.log
 
 ## 任务与子任务
 
-每个研究项目按实验顺序独立编号。父任务的标识是 `{simulator或system}-{三位序号}-{简称}`，清单保存在 `tasks/{父任务标识}.json`。例如，系统和 GeDES 各自的第一个实验都可使用序号 `000`。每个父任务内按发布顺序给子任务分配两位编号 `00` 至 `99`。
+每个研究项目按实验顺序独立编号。父任务的标识是 `{simulator或system}-{三位序号}-{简称}`，清单保存在 `tasks/{父任务标识}.json`。分类可包含连字符，例如 `days-ago`。系统、Days AGO 和 GeDES 各自的第一个实验都可使用序号 `000`。每个父任务内按发布顺序给子任务分配两位编号 `00` 至 `99`。
 
 | 操作 | 清单改动 | runner 行为 |
 | --- | --- | --- |

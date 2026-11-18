@@ -149,6 +149,27 @@ class RunnerTest(unittest.TestCase):
         once(parent)
         self.assertEqual(self.store.read()[child1, batch]['disposition'], 'ignored')
 
+    def test_compound_category_has_its_own_task_indices(self):
+        stamp = '2026-11-18T00:00:00Z'
+        child = {'status': stamp, 'kind': 'new_kind', 'params': {}}
+        manifest = {'name': 'Fixture', 'status': stamp, 'subtasks': {'00': child}}
+        parent = 'days-ago-000-fat-tree48-18432'
+        self.publish_catalog({**manifest, 'id': 'days-000-topology'})
+        self.publish_catalog({**manifest, 'id': parent})
+        _, task, _ = self.source_task(parent + '-00')
+        self.assertEqual(task['slug'], 'fat-tree48-18432')
+
+        process = subprocess.run([sys.executable, '-B', str(self.checkout / 'tools/run_experiments.py'),
+                                  '--task', parent, '--once'], text=True, capture_output=True, timeout=30)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        record = self.store.read()[task['id'], task['version']]
+        self.assertTrue(runner.archive_path(self.results, record).is_file())
+
+        self.publish_catalog({**manifest, 'id': 'days-ago-002-other'})
+        self.publish_catalog({**manifest, 'id': 'days-ago-001-backdated'})
+        with self.assertRaisesRegex(runner.RunnerError, 'must follow the published days-ago indices'):
+            self.queue.tasks(self.queue.source())
+
     def test_fresh_controller_validates_parent_history_and_accepts_a_correction(self):
         manifest = {'id': 'nsx-000-topology', 'name': 'Topology', 'status': '2026-11-18T00:00:00Z',
                     'subtasks': {'00': {'kind': 'new_kind', 'params': {}, 'status': '2026-11-18T00:00:10Z'}}}

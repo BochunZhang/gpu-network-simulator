@@ -22,7 +22,7 @@ GeDES 仓库公开了源码和评测脚本，仓库根目录未见许可证。Da
 
 ## Days AGO
 
-在固定版本根目录执行。CUDA 构建需要 Rust/Cargo 和 CUDA 13 `nvcc`。该版本 CUDA 后端允许 `sm_86`、`sm_89` 和 `sm_121`。机器若使用 H100（`sm_90`）或 GB200（`sm_100`），需要排独立移植任务，记录架构补丁并重新验证 Scalar 与 CUDA 的输出。 [固定版 CUDA 初始化](https://github.com/iQua/days/blob/048d48743119257fd8d4b2e5f0fb2228153fd955/executor/src/cuda.rs#L5731) · [NVIDIA GPU 架构列表](https://developer.nvidia.com/cuda/gpus)
+在固定版本根目录执行。CUDA 构建需要 Rust/Cargo 和 CUDA 13 `nvcc`。上游固定版本支持 `sm_86`、`sm_89` 和 `sm_121`。本仓库的 GB200 FatTree48 处理器在构建前应用 `sm_100` 补丁，用同一个二进制通过 Scalar、CPU 和 CUDA 小用例的状态指纹对照后再运行大拓扑。 [固定版 CUDA 初始化](https://github.com/iQua/days/blob/048d48743119257fd8d4b2e5f0fb2228153fd955/executor/src/cuda.rs#L5731) · [SM100 补丁](../tools/days_sm100.patch)
 
 ```bash
 cargo build --locked --release --features cuda --bin days

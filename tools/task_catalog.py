@@ -10,7 +10,8 @@ from incremental import validate_execution
 
 
 SHORT_NAME_PATTERN = r'[a-z0-9]+(?:-[a-z0-9]+)*'
-PARENT_PATTERN = rf'[a-z][a-z0-9]*-[0-9]{{3}}-{SHORT_NAME_PATTERN}'
+CATEGORY_PATTERN = r'[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*'
+PARENT_PATTERN = rf'(?P<category>{CATEGORY_PATTERN})-(?P<index>[0-9]{{3}})-(?P<slug>{SHORT_NAME_PATTERN})'
 CHILD_PATTERN = rf'{PARENT_PATTERN}-[0-9]{{2}}'
 STATUS_PATTERN = r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
 CHILD_FIELDS = {'status', 'name', 'kind', 'params', 'execution', 'resources', 'enabled', 'description'}
@@ -43,8 +44,8 @@ def expand(manifest, path):
     if not isinstance(manifest, dict) or set(manifest) - {'id', 'name', 'status', 'subtasks', 'legacy'}:
         raise ValueError(f'invalid catalog manifest: {path}')
     parent = manifest.get('id')
-    if (not isinstance(parent, str) or not re.fullmatch(PARENT_PATTERN, parent)
-            or len(parent) > 96 or len(parent.split('-', 2)[2]) > 63
+    parent_match = re.fullmatch(PARENT_PATTERN, parent) if isinstance(parent, str) else None
+    if (not parent_match or len(parent) > 96 or len(parent_match['slug']) > 63
             or Path(path).name != f'{parent}.json'
             or not isinstance(manifest.get('name'), str) or not manifest['name'].strip()
             or not isinstance(manifest.get('subtasks'), dict)):
@@ -81,7 +82,7 @@ def expand(manifest, path):
         child_id = f'{parent}-{index}'
         task = {key: value for key, value in child.items() if key != 'status'}
         task.update(id=child_id, name=child.get('name', manifest['name']),
-                    slug=parent.split('-', 2)[2], version=version or 1,
+                    slug=parent_match['slug'], version=version or 1,
                     command=f'bash tools/runner.sh --task {child_id} --once',
                     parent_id=parent, subtask_id=index, task_status=manifest['status'],
                     subtask_status=child['status'])

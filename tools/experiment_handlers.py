@@ -428,7 +428,8 @@ def days_cuda_smoke(source: Path, output: Path):
 def prepare(kind, params):
     handlers = {"gpu_inventory": inventory, "gedes_smoke": gedes_smoke,
                 "days_cuda_smoke": days_cuda_smoke}
-    if params == {} and kind in {"gpu_transfer", "gedes_drain", "nsx_single_gpu", "nsx_four_gpu",
+    if params == {} and kind in {"gpu_transfer", "gedes_drain", "gedes_fat_tree48",
+                                 "days_ago_fat_tree48", "nsx_single_gpu", "nsx_four_gpu",
                                  "training_roce_checks", "gedes_timeline", "training_roce_profile",
                                  "training_owner_sweep", "rc_stage_pipeline", "rc_instruction_profile"}:
         return partial(_run_pinned, kind)
