@@ -1,0 +1,14 @@
+{
+  "id": "012",
+  "name": "Single-GPU RC instruction working set",
+  "slug": "rc-instruction-profile",
+  "version": 1,
+  "command": "bash tools/runner.sh --task 012 --once",
+  "kind": "rc_instruction_profile",
+  "params": {},
+  "resources": {
+    "gpus": 1
+  },
+  "enabled": true,
+  "description": "Compare fixed-work fused RC receive kernels at three unroll factors with static SASS, register/spill evidence, paired timings and available device counters."
+}

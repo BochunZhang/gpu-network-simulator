@@ -10,6 +10,7 @@ VARIANTS = ("global-static", "global-dynamic", "local-static", "local-dynamic")
 SHAPES = ("single-hot", "multi-hot")
 OWNERS = 32768
 EVENTS = 2 * (24 + 8) * OWNERS
+PAYLOAD_BYTES = 1140850688
 WAVES = 12
 
 
@@ -29,6 +30,7 @@ def inspect_shape(timings, progress):
         latency = float(row["resident_loop_us"])
         if (int(row["variant"]) != variant or int(row["repetition"]) != rep or int(row["order"]) != order
                 or int(row["events"]) != EVENTS or int(row["owners"]) != OWNERS
+                or int(row["payload_bytes"]) != PAYLOAD_BYTES
                 or not math.isfinite(latency) or latency <= 0):
             raise ValueError("incorrect paired order, event count or interval")
         samples[VARIANTS[variant]].append(latency)
@@ -72,7 +74,7 @@ def run(source: Path, output: Path, helpers):
                "timing_excludes": "allocation, precomputed publication upload, per-run reset, audit D2H, oracle and files",
                "method": "one uninstrumented warmup per variant then five paired cyclic-order trials; separate diagnostics",
                "mapping": "one warp CTA per tile of 32 owners, static grid stride or atomic ready-tile queue",
-               "owners": OWNERS, "committed_events_per_run": EVENTS, "waves": WAVES,
+               "owners": OWNERS, "committed_events_per_run": EVENTS, "payload_bytes_per_run": PAYLOAD_BYTES, "waves": WAVES,
                "program_sha256": hashlib.sha256(program.read_bytes()).hexdigest(), "passed": False}
     try:
         with TemporaryDirectory(prefix=".owner-sweep-", dir=output) as tmp:
@@ -86,6 +88,16 @@ def run(source: Path, output: Path, helpers):
             summary["process_seconds"] = helpers.command([exe, output], output / "run.txt", env=env)
             summary["shapes"] = {s: inspect_shape(rows(output / f"{s}-timings.csv"),
                                                   rows(output / f"{s}-progress.csv")) for s in SHAPES}
+            for shape in SHAPES:
+                control = rows(output / f"{shape}-unsafe-control.csv")
+                if len(control) != 1:
+                    raise ValueError("missing equal-bound counterexample")
+                c = {k: int(v) for k,v in control[0].items()}
+                if (c["owner"] != 0 or c["expected_events"] <= 0 or c["expected_bytes"] <= 0
+                        or c["expected_events"] != c["observed_events"]
+                        or c["expected_bytes"] != c["observed_bytes"] or c["expected_hash"] == c["observed_hash"]):
+                    raise ValueError("inclusive bound did not isolate a same-work ordering violation")
+                summary["shapes"][shape]["unsafe_control"] = c
             summary["passed"] = True
     except Exception as error:
         summary["error"] = str(error)

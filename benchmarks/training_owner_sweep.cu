@@ -246,7 +246,7 @@ struct Device {
     }
 };
 template<bool local, bool dynamic, bool diagnostic>
-double run(const Fixture& f, Device& d, int workers, int variant, bool probe, std::ofstream& progress) {
+double run(const Fixture& f, Device& d, int workers, int variant, bool probe, std::ofstream& progress, std::ostream* control = nullptr) {
     cuda_check(cudaMemset(d.state.p, 0, f.owners * sizeof(State)));
     if (diagnostic) cuda_check(cudaMemset(d.marks.p, 0, waves * f.owners * sizeof(Mark)));
     cuda_check(cudaDeviceSynchronize());
@@ -275,6 +275,13 @@ double run(const Fixture& f, Device& d, int workers, int variant, bool probe, st
     std::vector<State> state(f.owners);
     d.state.get(state);
     verify(f, state, probe);
+    if (control) {
+        const State& oracle = f.expected.front();
+        const State& bad = state.front();
+        *control << "owner,expected_events,observed_events,expected_bytes,observed_bytes,expected_hash,observed_hash\n"
+                 << "0," << oracle.pos[0]+oracle.pos[1] << ',' << bad.pos[0]+bad.pos[1] << ','
+                 << oracle.bytes << ',' << bad.bytes << ',' << oracle.hash << ',' << bad.hash << '\n';
+    }
     if (diagnostic && !probe) {
         std::vector<Mark> marks(waves * f.owners);
         std::vector<int> prefix(f.owners, 0);
@@ -318,14 +325,20 @@ void sweep(const std::string& output) {
         std::string label = multi ? "multi-hot" : "single-hot";
         Fixture f(32768, multi);
         Device d(f);
+        U64 payload_bytes = 0;
+        for (const auto& owner : f.expected) payload_bytes += owner.bytes;
         std::ofstream progress, timings;
         progress.exceptions(std::ios::badbit | std::ios::failbit);
         timings.exceptions(std::ios::badbit | std::ios::failbit);
         progress.open(output + "/" + label + "-progress.csv");
         timings.open(output + "/" + label + "-timings.csv");
         progress << "variant,wave,events,max_owner,active_owners,max_cta,active_ctas\n";
-        timings << "repetition,order,variant,owners,workers,events,resident_loop_us\n";
-        run<true,false,false>(f,d,workers,2,true,progress);
+        timings << "repetition,order,variant,owners,workers,events,payload_bytes,resident_loop_us\n";
+        std::ofstream control;
+        control.exceptions(std::ios::badbit | std::ios::failbit);
+        control.open(output + "/" + label + "-unsafe-control.csv");
+        run<true,false,false>(f,d,workers,2,true,progress,&control);
+        control.close();
         for (int v = 0; v < 4; ++v) {
             variant_run<true>(v,f,d,workers,progress);
             variant_run<false>(v,f,d,workers,progress); // one ordinary warmup per variant
@@ -335,7 +348,7 @@ void sweep(const std::string& output) {
                 int v = (rep + order) % 4;
                 double us = variant_run<false>(v,f,d,workers,progress);
                 timings << rep << ',' << order << ',' << v << ',' << f.owners << ',' << workers
-                        << ',' << f.frames.size() << ',' << us << '\n';
+                        << ',' << f.frames.size() << ',' << payload_bytes << ',' << us << '\n';
             }
         }
         progress.close();

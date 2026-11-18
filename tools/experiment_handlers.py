@@ -430,7 +430,7 @@ def prepare(kind, params):
                 "days_cuda_smoke": days_cuda_smoke}
     if params == {} and kind in {"gpu_transfer", "gedes_drain", "nsx_single_gpu", "nsx_four_gpu",
                                  "training_roce_checks", "gedes_timeline", "training_roce_profile",
-                                 "training_owner_sweep"}:
+                                 "training_owner_sweep", "rc_stage_pipeline", "rc_instruction_profile"}:
         return partial(_run_pinned, kind)
     if kind not in handlers or params != {}:
         raise ValueError(f"unsupported task kind or parameters: {kind!r}")
