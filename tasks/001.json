@@ -1,14 +1,17 @@
 {
   "id": "001",
-  "name": "GeDES Fat-tree k8 CUDA smoke",
-  "version": 1,
-  "kind": "gedes_smoke",
+  "name": "GeDES completion and single-GPU timing audit",
+  "version": 2,
+  "kind": "gedes_audit",
   "params": {},
   "resources": {
     "gpus": 1
   },
   "enabled": true,
-  "description": "Build the pinned GeDES source for the observed GPU architecture and check positive completed flows.",
+  "description": "Build a pinned host-instrumented GeDES binary, run k4 and repeated k8 cases, record upstream completion and separate normal from detailed host timing.",
   "slug": "gedes-smoke",
-  "command": "bash tools/runner.sh --task 001 --once"
+  "command": "bash tools/runner.sh --task 001 --once",
+  "execution": {
+    "mode": "full"
+  }
 }

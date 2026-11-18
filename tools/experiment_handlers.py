@@ -2,6 +2,7 @@
 
 import csv
 import hashlib
+import importlib.util
 import inspect
 import json
 import math
@@ -12,6 +13,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import time
 import uuid
@@ -20,6 +22,27 @@ from datetime import datetime, timezone
 GEDES = ("https://github.com/mobinets/GeDES.git", "1376c638a0ae66116430f953da137d0c536675ad")
 DAYS = ("https://github.com/iQua/days.git", "048d48743119257fd8d4b2e5f0fb2228153fd955")
 DAYS_FIXTURE = "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml"
+_SUPPORT_MODULES = {}
+_CASE_SUPPORT = {}
+
+
+def _support_module(source, name):
+    path = source / 'tools' / f'{name}.py'
+    key = str(path.resolve())
+    if key not in _SUPPORT_MODULES:
+        module_name = 'pinned_' + name + '_' + hashlib.sha256(key.encode()).hexdigest()[:12]
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f'cannot load pinned experiment support: {name}')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        _SUPPORT_MODULES[key] = module
+    return _SUPPORT_MODULES[key]
+
+
+def _gpu_transfer(source, output):
+    _support_module(source, 'gpu_transfer').run(source, output, sys.modules[__name__])
 
 
 def write_json(path, result):
@@ -229,6 +252,10 @@ def _case_implementation(*functions):
 
 def case_plan(task, source):
     """Describe inventory stages for the runner's case engine."""
+    if task['kind'] == 'gedes_audit':
+        module = _support_module(source, 'gedes_experiments')
+        _CASE_SUPPORT[task['id'], task['version']] = module
+        return module.case_plan(task, source, sys.modules[__name__])
     if task['kind'] != 'gpu_inventory':
         return None
     if task['params'] != {}:
@@ -257,6 +284,12 @@ def case_plan(task, source):
 
 def finalize_cases(task, output, manifest):
     """Keep the compact legacy inventory outputs available at the task root."""
+    if task['kind'] == 'gedes_audit':
+        module = _CASE_SUPPORT.get((task['id'], task['version']))
+        if module is None:
+            raise RuntimeError('GeDES audit support was not loaded for this task')
+        module.finalize_cases(task, output, manifest, sys.modules[__name__])
+        return
     if task['kind'] != 'gpu_inventory':
         return
     case_outputs = {case_id: output / 'cases' / case_id for case_id in manifest['cases']}
@@ -393,7 +426,7 @@ def days_cuda_smoke(source: Path, output: Path):
 
 def prepare(kind, params):
     handlers = {"gpu_inventory": inventory, "gedes_smoke": gedes_smoke,
-                "days_cuda_smoke": days_cuda_smoke}
+                "days_cuda_smoke": days_cuda_smoke, "gpu_transfer": _gpu_transfer}
     if kind not in handlers or params != {}:
         raise ValueError(f"unsupported task kind or parameters: {kind!r}")
     return handlers[kind]
