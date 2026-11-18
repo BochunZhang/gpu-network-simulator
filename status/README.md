@@ -1,4 +1,4 @@
-CPFS 在 `status/{父任务标识}-{两位子任务编号}/v{发布时间的Unix秒}.json` 记录每次执行的领取、源码提交、执行主机、结果和归档状态。首次迁移的子任务沿用原来的三位编号目录和整数版本，例如 `status/000-system-info/v2.json`，对应 `system-000-init-environment-00` 的历史执行。
+CPFS 在 `status/{父任务标识}-{两位子任务编号}/v{发布时间的Unix秒}.json` 记录每次执行的领取、源码提交、执行主机、结果和归档状态。此前实验的回执作为历史资料单独备份。[历史实验索引](../history/pre-review-20261118/README.md)
 
 分析端导入 `results-remote/` 的原始结果包后，生成同目录下的 `v{version}.archived.json` 并提交到 Git。CPFS 执行器拉取回执，验证执行身份和压缩包 SHA-256，再将数据从 `results/` 移到 `results-archive/`。状态和回执的 `archive_name` 字段保存完整包名。
 

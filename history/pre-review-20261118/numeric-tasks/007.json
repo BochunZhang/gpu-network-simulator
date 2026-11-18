@@ -1,0 +1,12 @@
+{
+  "id": "007",
+  "name": "Single GPU persistent RC and CQE dependency checks",
+  "slug": "training-roce-checks",
+  "version": 1,
+  "command": "bash tools/runner.sh --task 007 --once",
+  "kind": "training_roce_checks",
+  "params": {},
+  "resources": {"gpus": 1},
+  "enabled": false,
+  "description": "Compare scalar and single-device CUDA packet and local completion behavior on bounded public synthetic communication fixtures; inject loss and receiver-not-ready and verify dependent and independent progress."
+}

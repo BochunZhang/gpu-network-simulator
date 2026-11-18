@@ -163,6 +163,57 @@ class RunnerTest(unittest.TestCase):
         fresh = runner.Queue(self.checkout)
         self.assertEqual([t['id'] for t, _ in fresh.tasks(source)], ['nsx-000-topology-00'])
 
+    def test_archive_boundary_frees_slots_and_preserves_future_publication_history(self):
+        parent = 'nsx-000-topology'
+        stamp = '2026-11-18T00:00:00Z'
+        manifest = {'id': parent, 'name': 'Old topology', 'status': stamp,
+                    'subtasks': {'00': {'kind': 'new_kind', 'params': {}, 'status': stamp}}}
+        legacy = {'id': '000', 'slug': 'new-kind', 'version': 1, 'published_at': stamp}
+        self.publish_catalog({**manifest, 'legacy': legacy})
+        old_commit = self.queue.source()
+        active_file = self.author / 'tasks' / f'{parent}.json'
+        backup_file = self.author / 'archive' / active_file.name
+        backup_file.parent.mkdir()
+        active_file.rename(backup_file)
+        (self.author / 'tasks/README.md').write_text('Reviewed tasks only.\n')
+
+        def publish_change(message):
+            self.git(self.author, 'add', '.')
+            self.git(self.author, 'commit', '-m', message)
+            self.git(self.remote, 'fetch', str(self.author), 'main:main')
+            return self.queue.source()
+
+        archived = publish_change('Archive old experiments')
+        with patch.object(runner, 'ARCHIVED_CATALOG_COMMIT', old_commit):
+            self.assertEqual(self.queue.tasks(archived), [])
+            self.commit_task()
+            shallow = self.root / 'shallow'
+            self.git(self.root, 'clone', '--depth=1', self.remote.as_uri(), str(shallow))
+            source = self.queue.source()
+            for controller in (self.queue, runner.Queue(shallow)):
+                with self.assertRaisesRegex(runner.RunnerError, 'invalid classified task path'):
+                    controller.tasks(source)
+            # Restoring the backed-up alias also cannot re-activate a numeric execution.
+            self.publish_catalog({**manifest, 'legacy': legacy})
+            with self.assertRaisesRegex(runner.RunnerError, 'historical execution aliases'):
+                self.queue.tasks(self.queue.source())
+            reviewed = '2026-11-19T00:00:00Z'
+            manifest.update(name='Reviewed topology', status=reviewed)
+            manifest['subtasks']['00']['status'] = reviewed
+            self.publish_catalog(manifest)
+            published = self.queue.source()
+            [(task, _)] = self.queue.tasks(published)
+            self.assertEqual(task['id'], parent + '-00')
+            self.assertNotIn('legacy_id', task)
+            self.assertNotIn('legacy_base', task)
+            self.assertTrue(backup_file.exists())
+
+            active_file.unlink()
+            deleted = publish_change('Invalid removal of reviewed task')
+            for controller in (self.queue, runner.Queue(self.checkout)):
+                with self.assertRaisesRegex(runner.RunnerError, 'must remain in the catalog'):
+                    controller.tasks(deleted)
+
     def test_incremental_cli_reuses_passed_case_from_failed_archived_v2(self):
         self.commit_case_task(2, {'mode': 'full'}, fail=True, value='v2')
         self.case_cli(expected=1)

@@ -1,0 +1,14 @@
+{
+  "id": "006",
+  "name": "NSX-inspired four-GPU event exchange",
+  "slug": "nsx-four-gpu",
+  "version": 1,
+  "command": "bash tools/runner.sh --task 006 --once",
+  "kind": "nsx_four_gpu",
+  "params": {},
+  "resources": {
+    "gpus": 4
+  },
+  "enabled": true,
+  "description": "Compare an independent fixed forwarding fixture on one and four GPUs using staged and peer CUDA transfers. Verify per-owner event order, exactly-once delivery and drain against a serial reference."
+}

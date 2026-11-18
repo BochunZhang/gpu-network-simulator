@@ -1,0 +1,14 @@
+{
+  "id": "002",
+  "name": "Days AGO Scalar CPU CUDA comparison",
+  "version": 1,
+  "kind": "days_cuda_smoke",
+  "params": {},
+  "resources": {
+    "gpus": 1
+  },
+  "enabled": false,
+  "description": "Enable after a separately recorded SM100 port; the pinned upstream supports SM86, SM89 and SM121.",
+  "slug": "days-cuda",
+  "command": "bash tools/runner.sh --task 002 --once"
+}

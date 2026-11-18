@@ -1,0 +1,17 @@
+{
+  "archive_name": "004-gedes-drain.v1.tar.gz",
+  "archive_sha256": "9af4a69d52068a674caa006aed13f9553417f0ae8b81e8f28f949970b7f00b25",
+  "archive_size": 67299,
+  "archived_at": "2026-11-18T08:49:24+00:00",
+  "claim": "8fefb3401472434194551f874b0547a1",
+  "command": "bash tools/runner.sh --task 004 --once",
+  "command_source": "recorded",
+  "id": "004",
+  "name": "GeDES fixed-workload transport drain audit",
+  "schema_version": 1,
+  "slug": "gedes-drain",
+  "source_commit": "0abcf12d76a44aca93170d516552dc8c9a5d8e57",
+  "state": "succeeded",
+  "task_sha256": "e373249c59d1172f5d19efe2de84c9285695b0b96655bcf7f41a1d1fed50fc4c",
+  "version": 1
+}

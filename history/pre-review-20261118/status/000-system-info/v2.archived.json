@@ -1,0 +1,24 @@
+{
+  "archive_name": "000-system-info.v2.tar.gz",
+  "archive_sha256": "abb3f7fa41f25ddbf98fa0d817625d3101726c8fa4762916df9a3ed95c6b97a8",
+  "archive_size": 5155,
+  "archived_at": "2026-11-18T05:48:29+00:00",
+  "artifacts_manifest_sha256": "3eb996f919b1545a53e1d970a5b0d02fc55a60dd266e09bb450f76f684e3e0a4",
+  "case_counts": {
+    "executed": 5,
+    "failed": 0,
+    "reused": 0,
+    "skipped": 0
+  },
+  "claim": "0902fdd3afab4a2c90a2ad7af365af4a",
+  "command": "bash tools/runner.sh --task 000 --once",
+  "command_source": "recorded",
+  "id": "000",
+  "name": "GB200 four-GPU hardware inventory",
+  "schema_version": 1,
+  "slug": "system-info",
+  "source_commit": "d3d36476d178e97f2edec55f8a1bc67b44828efb",
+  "state": "succeeded",
+  "task_sha256": "6c3cb760eccfbabdbe45d1e2372e150c04547cf52c45982f16e728c44c0a9b56",
+  "version": 2
+}

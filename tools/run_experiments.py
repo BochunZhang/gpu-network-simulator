@@ -31,6 +31,9 @@ TERMINAL = {'succeeded', 'failed', 'abandoned'}
 RESULT_SUFFIXES = {'.json', '.csv', '.txt'}
 FILE_LIMIT = 2 * 1024**2
 ARCHIVE_LIMIT = 16 * 1024**2
+# The first classified catalog imported historical experiments. Its publications
+# live in the backup and do not allocate slots in the reviewed queue.
+ARCHIVED_CATALOG_COMMIT = '8d027d9f20839fa53992aabb81d00cb1cfc20c3c'
 ID_PATTERN = r'[0-9]{3}'
 CONTROLLER_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 SLUG_PATTERN = task_catalog.SHORT_NAME_PATTERN
@@ -355,7 +358,6 @@ class Queue:
         for published in previous:
             category, index, _ = published.split('-', 2)
             last_index[category] = max(last_index.get(category, ''), index)
-        legacy_ids = set()
         for entry in filter(None, tree.split('\0')):
             header, path = entry.split('\t', 1)
             if not path.endswith('.json') or re.fullmatch(r'tasks/[0-9]{6}\.json', path):
@@ -370,6 +372,8 @@ class Queue:
             else:
                 manifest = json.loads(self.git('cat-file', 'blob', blob).stdout,
                                       object_pairs_hook=unique_fields)
+                if isinstance(manifest, dict) and 'legacy' in manifest:
+                    raise RunnerError(f'historical execution aliases cannot be published in the reviewed catalog: {path}')
                 releases = task_catalog.expand(manifest, path)
                 if prior:
                     task_catalog.validate_transition(prior[1], manifest)
@@ -381,21 +385,18 @@ class Queue:
             if prior is None and index <= last_index.get(category, ''):
                 raise RunnerError(f'new tasks must follow the published {category} indices: {key}')
             slots.add(slot)
-            alias = item[1].get('legacy', {}).get('id')
-            if alias is not None:
-                if alias in legacy_ids:
-                    raise RunnerError(f'duplicate historical task ID: {alias}')
-                legacy_ids.add(alias)
             catalog[key] = item
         if previous.keys() - catalog.keys():
             raise RunnerError('published tasks must remain in the catalog; set status to ignore')
         return catalog
 
-    def classified_tasks(self, source):
+    def classified_tasks(self, source, *, reviewed):
         commits = self.git('log', '--first-parent', '--reverse', '--format=%H', source,
                            '--', ':(glob)tasks/*-*.json').stdout.splitlines()
-        if not commits:
+        if not commits and not reviewed:
             return None
+        if ARCHIVED_CATALOG_COMMIT in commits:
+            commits = commits[commits.index(ARCHIVED_CATALOG_COMMIT) + 1:]
         cached = getattr(self, '_catalog_commit', None)
         if cached in commits:
             commits = commits[commits.index(cached) + 1:]
@@ -422,7 +423,8 @@ class Queue:
 
     def load_tasks(self, source):
         paths = self.git('ls-tree', '-rz', '--name-only', source, '--', 'tasks/').stdout.split('\0')
-        releases = self.classified_tasks(source)
+        # The tracked marker also identifies an empty reviewed queue in a shallow clone.
+        releases = self.classified_tasks(source, reviewed='tasks/README.md' in paths)
         if releases is not None:
             known = {f'tasks/{key}.json' for key in self._catalog}
             for path in paths:

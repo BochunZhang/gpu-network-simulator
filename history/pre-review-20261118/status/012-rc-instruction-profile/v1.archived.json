@@ -1,0 +1,17 @@
+{
+  "archive_name": "012-rc-instruction-profile.v1.tar.gz",
+  "archive_sha256": "17c1b805b5b0f72470073626bc3c3c4ffeaf6459f47c5939560e4bd2be1f80ff",
+  "archive_size": 71440,
+  "archived_at": "2026-11-18T11:17:48+00:00",
+  "claim": "d4c0114ff4aa4312bb5f713dfa1b771f",
+  "command": "bash tools/runner.sh --task 012 --once",
+  "command_source": "recorded",
+  "id": "012",
+  "name": "Single-GPU RC instruction working set",
+  "schema_version": 1,
+  "slug": "rc-instruction-profile",
+  "source_commit": "32afe699578c4bdd5df9a1c3fb8a9770fa5f7811",
+  "state": "succeeded",
+  "task_sha256": "b2bce6bc79efb916b4cdd1cbfb4090dec77620042d631e785f65fe9f793d4840",
+  "version": 1
+}

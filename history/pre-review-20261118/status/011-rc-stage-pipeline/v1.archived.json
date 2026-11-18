@@ -1,0 +1,17 @@
+{
+  "archive_name": "011-rc-stage-pipeline.v1.tar.gz",
+  "archive_sha256": "cdab0fdf0f6c166be4a46845e40390c983ef42c5d2b7b1d211c73296e8a21bd6",
+  "archive_size": 26262,
+  "archived_at": "2026-11-18T11:17:48+00:00",
+  "claim": "0f58a16a6c3948ce8624cde14016470c",
+  "command": "bash tools/runner.sh --task 011 --once",
+  "command_source": "recorded",
+  "id": "011",
+  "name": "Single-GPU RC stage and output pipeline",
+  "schema_version": 1,
+  "slug": "rc-stage-pipeline",
+  "source_commit": "32afe699578c4bdd5df9a1c3fb8a9770fa5f7811",
+  "state": "succeeded",
+  "task_sha256": "4244d8777846167f4f329d622c86b5c5546b19a33bf1efedd96cf980ad755b89",
+  "version": 1
+}
