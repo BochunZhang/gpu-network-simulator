@@ -1,0 +1,20 @@
+{
+  "id": "system-000-init-environment",
+  "name": "GB200 four-GPU environment inventory",
+  "status": "2026-11-18T13:21:27Z",
+  "subtasks": {
+    "00": {
+      "status": "2026-11-18T13:21:27Z",
+      "kind": "gpu_inventory",
+      "params": {},
+      "resources": {
+        "gpus": 4
+      },
+      "enabled": true,
+      "description": "Collect a fresh four-GPU hardware, driver, topology, NVLink and build-tool inventory.",
+      "execution": {
+        "mode": "full"
+      }
+    }
+  }
+}
