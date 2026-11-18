@@ -99,8 +99,12 @@ __global__ void decode_tiles(const Descriptor* source, Ready* intermediate, Outp
         if constexpr (fused) {
             __syncthreads();
             if (lane == 32) {
-#if defined(RC_STAGE_UNROLL)
-#pragma unroll RC_STAGE_UNROLL
+#if RC_STAGE_UNROLL == 1
+#pragma unroll 1
+#elif RC_STAGE_UNROLL == 4
+#pragma unroll 4
+#elif RC_STAGE_UNROLL == 8
+#pragma unroll 8
 #endif
                 for (int j = 0; j < count; ++j)
                     output[local + start + j] = queue.commit(ordered[j]);
