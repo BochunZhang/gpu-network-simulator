@@ -87,6 +87,76 @@ class ArchiveResultsTest(unittest.TestCase):
             importer.archive_package(package, self.results, self.status)
         self.assertEqual(runner.read_json(receipt_path), receipt)
 
+    def test_labelled_archive_keeps_original_bytes_and_uses_release_paths(self):
+        child = 'gedes-000-smoke-02'
+        label = 'v1-261118-000000'
+        archive_name = f'{child}.{label}.tar.gz'
+        fields = {'parent_id': 'gedes-000-smoke', 'subtask_id': '02', 'id': child, 'slug': 'smoke',
+                  'task_status': '2026-11-17T00:00:00Z', 'subtask_status': '2026-11-18T00:00:00Z',
+                  'version': 1794960000, 'version_label': label, 'archive_name': archive_name}
+        package, row = self.package(metadata=fields)
+        exact = package.read_bytes()
+        status_dir = self.status / child
+        status_dir.mkdir(parents=True)
+        (status_dir / 'unrelated.archived.json').write_text('not a receipt')
+
+        receipt_path = importer.archive_package(package, self.results, self.status)
+
+        self.assertEqual(receipt_path, status_dir / f'{label}.archived.json')
+        receipt = runner.read_json(receipt_path)
+        self.assertEqual(receipt['version'], 1794960000)
+        self.assertEqual(receipt['version_label'], label)
+        self.assertEqual(receipt['archive_name'], archive_name)
+        self.assertEqual((self.results / child / archive_name).read_bytes(), exact)
+        self.assertEqual(runner.read_json(self.results / child / label / 'result.json'), row)
+        self.assertFalse((status_dir / 'v1794960000.archived.json').exists())
+        package.write_bytes(exact)
+        with patch.object(runner, 'timestamp', return_value='later'):
+            self.assertEqual(importer.archive_package(package, self.results, self.status), receipt_path)
+        self.assertEqual(runner.read_json(receipt_path), receipt)
+
+    def test_labelled_and_unlabelled_receipts_cannot_claim_same_publication(self):
+        child = 'gedes-000-smoke-02'
+        fields = {'parent_id': 'gedes-000-smoke', 'subtask_id': '02', 'id': child, 'slug': 'smoke',
+                  'task_status': '2026-11-17T00:00:00Z', 'subtask_status': '2026-11-18T00:00:00Z',
+                  'version': 1794960000}
+        package, _ = self.package(metadata=fields)
+        exact = package.read_bytes()
+        receipt_path = importer.archive_package(package, self.results, self.status)
+        receipt_bytes = receipt_path.read_bytes()
+        labelled, _ = self.package('labelled.tar.gz', {**fields, 'version_label': 'v1-261118-000000'})
+
+        with self.assertRaisesRegex(importer.ArchiveError, 'incompatible archival receipt'):
+            importer.archive_package(labelled, self.results, self.status)
+
+        self.assertTrue(labelled.is_file())
+        self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
+        self.assertEqual((self.results / child / f'{child}.v1794960000.tar.gz').read_bytes(), exact)
+        self.assertFalse((self.results / child / 'v1-261118-000000').exists())
+
+    def test_labelled_import_rejects_a_receipt_alias_for_the_same_publication(self):
+        child = 'gedes-000-smoke-02'
+        label = 'v1-261118-000000'
+        fields = {'parent_id': 'gedes-000-smoke', 'subtask_id': '02', 'id': child, 'slug': 'smoke',
+                  'task_status': '2026-11-17T00:00:00Z', 'subtask_status': '2026-11-18T00:00:00Z',
+                  'version': 1794960000, 'version_label': label}
+        package, _ = self.package(metadata=fields)
+        exact = package.read_bytes()
+        receipt_path = importer.archive_package(package, self.results, self.status)
+        receipt = runner.read_json(receipt_path)
+        package.write_bytes(exact)
+        for alias, archived in [('renamed', receipt), ('v2-261118-000000', {
+                **receipt, 'version_label': 'v2-261118-000000',
+                'archive_name': f'{child}.v2-261118-000000.tar.gz'})]:
+            with self.subTest(alias=alias):
+                alias_path = receipt_path.with_name(f'{alias}.archived.json')
+                runner.write_json(alias_path, archived)
+                with self.assertRaisesRegex(importer.ArchiveError, 'incompatible archival receipt'):
+                    importer.archive_package(package, self.results, self.status)
+                self.assertTrue(package.is_file())
+                self.assertEqual(runner.read_json(receipt_path), receipt)
+                alias_path.unlink()
+
     def test_classified_record_and_receipt_must_identify_the_same_publication(self):
         fields = {'parent_id': 'gedes-000-smoke', 'subtask_id': '02', 'id': 'gedes-000-smoke-02',
                   'task_status': '2026-11-17T00:00:00Z', 'subtask_status': '2026-11-18T00:00:00Z',

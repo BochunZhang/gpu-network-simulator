@@ -132,6 +132,9 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(set(self.store.read()), {(child0, batch), (child1, batch), (child0, batch + 1)})
         self.assertEqual(runner.sha256_file(package), checksum)
         self.assertEqual(self.store.read()[child0, batch]['claim'], first_run['claim'])
+        self.assertEqual(package.name, f'{child0}.v1-261118-000000.tar.gz')
+        self.assertTrue((self.results / child0 / 'v2-261118-000001' / 'result.json').is_file())
+        self.assertTrue((self.status_dir / child1 / 'v1-261118-000000.json').is_file())
 
         first['status'] = 'ignore'
         self.publish_catalog(manifest)
@@ -183,6 +186,54 @@ class RunnerTest(unittest.TestCase):
         source = self.queue.source()
         fresh = runner.Queue(self.checkout)
         self.assertEqual([t['id'] for t, _ in fresh.tasks(source)], ['nsx-000-topology-00'])
+
+    def test_publication_labels_include_unclaimed_releases_and_survive_restart(self):
+        first = '2026-11-18T00:00:10Z'
+        second = '2026-11-18T00:00:20Z'
+        third = '2026-11-18T00:00:30Z'
+        parent = 'days-ago-000-topology'
+        child = {'kind': 'new_kind', 'params': {}, 'status': first}
+        manifest = {'id': parent, 'name': 'Topology', 'status': first, 'subtasks': {'00': child}}
+        self.publish_catalog(manifest)
+        _, task, digest = self.source_task(parent + '-00')
+        self.assertEqual(task['version_label'], 'v1-261118-000010')
+        self.assertEqual(runner.task_catalog.execution_digest(task), digest)
+
+        child.update(enabled=False, description='Paused')
+        self.publish_catalog(manifest)
+        _, paused, paused_digest = self.source_task(parent + '-00')
+        self.assertEqual((paused['version_label'], paused_digest), (task['version_label'], digest))
+
+        child['status'] = second
+        self.publish_catalog(manifest)
+        self.publish_catalog({**manifest, 'id': 'gedes-000-other'})
+        child.update(status=third, enabled=True)
+        manifest['subtasks']['01'] = {**child}
+        self.publish_catalog(manifest)
+        source = self.queue.source()
+        current = self.queue.tasks(source)
+        self.assertEqual(current, runner.Queue(self.checkout).tasks(source))
+        self.assertEqual({task['subtask_id']: task['version_label'] for task, _ in current
+                          if task['parent_id'] == parent},
+                         {'00': 'v3-261118-000030', '01': 'v1-261118-000030'})
+
+        child['status'] = 'ignore'
+        self.publish_catalog(manifest)
+        _, retired, _ = self.source_task(parent + '-00')
+        self.assertEqual(retired['subtask_status'], 'ignore')
+        _, _, _, history = self.queue._catalog[parent]
+        self.assertEqual(list(history[retired['id']].values()),
+                         ['v1-261118-000010', 'v2-261118-000020', 'v3-261118-000030'])
+
+    def test_publication_label_cannot_be_guessed_from_a_shallow_clone(self):
+        stamp = '2026-11-18T00:00:10Z'
+        child = {'status': stamp, 'kind': 'new_kind', 'params': {}}
+        self.publish_catalog({'id': 'gedes-000-topology', 'name': 'Topology',
+                              'status': stamp, 'subtasks': {'00': child}})
+        shallow = self.root / 'shallow'
+        self.git(self.root, 'clone', '--depth=1', self.remote.as_uri(), str(shallow))
+        with self.assertRaisesRegex(runner.RunnerError, 'publication labels require the complete task history'):
+            runner.Queue(shallow).tasks(self.queue.source())
 
     def test_archive_boundary_frees_slots_and_preserves_future_publication_history(self):
         parent = 'nsx-000-topology'
@@ -328,6 +379,7 @@ class RunnerTest(unittest.TestCase):
         result = runner.read_json(output / 'result.json')
         receipt = {key: result[key] for key in
                    ('id', 'slug', 'name', 'version', 'claim', 'source_commit', 'task_sha256', 'state', 'command')}
+        receipt.update({key: result[key] for key in runner.RELEASE_FIELDS if key in result})
         receipt.update(schema_version=1, archive_sha256=runner.sha256_file(runner.archive_path(self.results, result)),
                        archived_at='2026-11-18T00:00:00+00:00')
         return output, receipt
@@ -599,6 +651,34 @@ class RunnerTest(unittest.TestCase):
         self.store.archive_receipts(self.queue.archived_receipts(source), self.results,
                                     self.checkout / 'results-archive')
         self.assertFalse(output.exists())
+
+    def test_labeled_receipt_archives_the_matching_claim(self):
+        stamp = '2026-11-18T13:29:35Z'
+        parent = 'days-ago-000-topology'
+        child = {'status': stamp, 'kind': 'new_kind', 'params': {}}
+        self.publish_catalog({'id': parent, 'name': 'Fixture', 'status': stamp, 'subtasks': {'00': child}})
+        task_id = parent + '-00'
+        output, receipt = self.completed_fixture(task_id=task_id)
+        package = runner.archive_path(self.results, receipt)
+        self.assertEqual(output.name, 'v1-261118-132935')
+        self.assertEqual(receipt['version'], 1795008575)
+        target = self.author / 'status' / task_id
+        target.mkdir(parents=True)
+        runner.write_json(target / 'v1-261118-132935.archived.json', receipt)
+        self.git(self.author, 'add', 'status')
+        self.git(self.author, 'commit', '-m', 'Confirm labeled result')
+        self.git(self.remote, 'fetch', str(self.author), 'main:main')
+        receipts = self.queue.archived_receipts(self.queue.source())
+        self.assertEqual(receipts, [receipt])
+
+        archive = self.checkout / 'results-archive'
+        wrong = {**receipt, 'version_label': 'v2-261118-132935'}
+        errors = self.store.archive_receipts([wrong], self.results, archive)
+        self.assertIn('does not match execution', errors[0]['reason'])
+        self.assertTrue(package.is_file())
+        self.assertEqual(self.store.archive_receipts(receipts, self.results, archive), [])
+        self.assertFalse(output.exists())
+        self.assertEqual(runner.sha256_file(runner.archive_path(archive, receipt)), receipt['archive_sha256'])
 
     def test_two_processes_claim_same_version_once(self):
         source, task, digest = self.source_task()

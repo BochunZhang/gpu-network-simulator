@@ -184,16 +184,40 @@ def validate_existing_files(destination, files, results):
 
 
 def existing_receipt(status_dir, receipt):
-    directory = (receipt['id'] + '-*' if re.fullmatch(runner.ID_PATTERN, receipt['id'])
-                 else runner.task_label(receipt))
-    matches = sorted(status_dir.glob(f"{directory}/v{receipt['version']}.archived.json"))
-    for path in matches:
-        current = runner.validate_receipt(runner.read_json(path), path)
-        if (any(current[key] != receipt[key] for key in (*IDENTITY, 'slug', 'command', 'archive_sha256'))):
+    expected = f'{runner.version_name(receipt)}.archived.json'
+    unix_name = f"v{receipt['version']}.archived.json"
+    if re.fullmatch(runner.ID_PATTERN, receipt['id']):
+        paths = status_dir.glob(f"{receipt['id']}-*/{expected}")
+        date_suffix = None
+    else:
+        paths = (status_dir / runner.task_label(receipt)).glob('*.archived.json')
+        first_label = runner.task_catalog.publication_label(1, receipt['subtask_status'])
+        date_suffix = first_label.removeprefix('v1') + '.archived.json'
+    matched = None
+    for path in sorted(paths):
+        known_name = path.name in (expected, unix_name) or (
+            date_suffix is not None and path.name.endswith(date_suffix)
+            and re.fullmatch(runner.VERSION_NAME_PATTERN, path.name.removesuffix('.archived.json')))
+        try:
+            reject_symlink_path(path, status_dir)
+            current = runner.read_json(path)
+        except (ArchiveError, OSError, ValueError):
+            if known_name:
+                raise
+            continue
+        # Detect renamed duplicate receipts by their publication identity, even
+        # when their filename does not follow either supported naming scheme.
+        if not known_name and (not isinstance(current, dict) or current.get('id') != receipt['id']
+                               or current.get('version') != receipt['version']):
+            continue
+        runner.validate_receipt(current, path)
+        if (path.name != expected or runner.version_name(current) != runner.version_name(receipt)
+                or any(current[key] != receipt[key] for key in (*IDENTITY, 'slug', 'command', 'archive_sha256'))):
             raise ArchiveError(f'an incompatible archival receipt already exists: {path}')
-    if len(matches) > 1:
-        raise ArchiveError('multiple archival receipts exist for the same task version')
-    return runner.read_json(matches[0]) if matches else None
+        if matched is not None:
+            raise ArchiveError('multiple archival receipts exist for the same task version')
+        matched = current
+    return matched
 
 
 def archive_package(package, results_dir, status_dir):
@@ -213,9 +237,10 @@ def archive_package(package, results_dir, status_dir):
         row, files = inspect_package(frozen, extracted)
         receipt = receipt_for(row, frozen)
         label = runner.task_label(receipt)
-        destination = results_dir / label / f"v{row['version']}"
+        destination = runner.run_path(results_dir, receipt)
         tarpath = runner.archive_path(results_dir, receipt)
-        receipt_path = status_dir / label / f"v{row['version']}.archived.json"
+        receipt_path = status_dir / label / f'{runner.version_name(receipt)}.archived.json'
+        reject_symlink_path(receipt_path, status_dir)
         previous = existing_receipt(status_dir, receipt)
         validate_existing_files(destination, files, results_dir)
         existing_packages = []

@@ -14,6 +14,7 @@ CATEGORY_PATTERN = r'[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*'
 PARENT_PATTERN = rf'(?P<category>{CATEGORY_PATTERN})-(?P<index>[0-9]{{3}})-(?P<slug>{SHORT_NAME_PATTERN})'
 CHILD_PATTERN = rf'{PARENT_PATTERN}-[0-9]{{2}}'
 STATUS_PATTERN = r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+VERSION_LABEL_PATTERN = r'v[1-9][0-9]*-[0-9]{6}-[0-9]{6}'
 CHILD_FIELDS = {'status', 'name', 'kind', 'params', 'execution', 'resources', 'enabled', 'description'}
 
 
@@ -33,10 +34,37 @@ def release_version(status):
 def execution_digest(task):
     # The same payload yields exactly the digest written by numeric-version controllers.
     metadata = {'description', 'enabled', 'slug', 'command', 'parent_id', 'subtask_id',
-                'task_status', 'subtask_status', 'legacy_id', 'legacy_slug', 'legacy_base'}
+                'task_status', 'subtask_status', 'legacy_id', 'legacy_slug', 'legacy_base',
+                'version_label'}
     definition = {key: value for key, value in task.items() if key not in metadata}
     encoded = json.dumps(definition, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + '\n'
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def publication_label(ordinal, status):
+    version = release_version(status)
+    if type(ordinal) is not int or ordinal < 1 or version is None:
+        raise ValueError('publication label requires a positive ordinal and a UTC timestamp')
+    published = datetime.fromtimestamp(version, timezone.utc)
+    return f'v{ordinal}-{published:%y%m%d-%H%M%S}'
+
+
+def label_releases(releases, previous):
+    """Attach labels from validated Git history without changing the execution identity."""
+    publications = dict(previous)
+    annotated = []
+    for task, digest in releases:
+        status = task['subtask_status']
+        if status == 'ignore' or not re.fullmatch(CHILD_PATTERN, task['id']):
+            annotated.append((task, digest))
+            continue
+        history = publications.get(task['id'], {})
+        label = history.get(task['version'])
+        if label is None:
+            label = publication_label(len(history) + 1, status)
+            publications[task['id']] = {**history, task['version']: label}
+        annotated.append(({**task, 'version_label': label}, digest))
+    return annotated, publications
 
 
 def expand(manifest, path):

@@ -25,12 +25,14 @@ class RetirementTest(unittest.TestCase):
         return {'parent_id': self.parent, 'subtask_id': child, 'task_status': '2026-11-01T00:00:00Z',
                 'subtask_status': 'ignore', **kwargs}
 
-    def run_row(self, task_id, version, state, child='00', finish=True):
+    def run_row(self, task_id, version, state, child='00', finish=True, version_label=None):
         task = {'id': task_id, 'version': version, 'name': 'test', 'slug': 'test', 'kind': 'fixture',
                 'command': 'test'}
         if task_id.startswith(self.parent):
             published = datetime.fromtimestamp(version, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             task.update(self.definition(child, subtask_status=published))
+        if version_label is not None:
+            task['version_label'] = version_label
         row = self.store.claim(task, 'c' * 64, 'a' * 40, self.results, 'worker')
         if not finish:
             return row
@@ -138,6 +140,24 @@ class RetirementTest(unittest.TestCase):
         self.assertNotIn('archive_sha256', status)
         self.assertFalse(runner.archive_path(self.archive, row).exists())
         self.assertTrue(self.store.reservation('001', 1).is_dir())
+
+    def test_named_abandoned_raw_moves_and_clears_named_error(self):
+        task_id, version = self.parent + '-00', 1794960000
+        label = 'v1-261118-000000'
+        row = self.run_row(task_id, version, 'failed', finish=False, version_label=label)
+        output = self.results / task_id / label
+        output.mkdir(parents=True)
+        runner.write_json(output / 'run.json', {**row, 'version_label': 'v2-261118-000000'})
+        self.store.abandon(self.results, task_id, label)
+        self.assertEqual(len(self.retire(self.definition())), 1)
+        error = self.store.status_dir / task_id / f'{label}.archive-error.json'
+        self.assertTrue(error.is_file())
+        self.assertTrue(output.is_dir())
+
+        runner.write_json(output / 'run.json', row)
+        self.assertEqual(self.retire(self.definition()), [])
+        self.assertFalse(error.exists())
+        self.assertTrue((self.archive / task_id / label / 'run.json').is_file())
 
     def test_abandoned_raw_with_existing_package_or_terminal_record_requires_sealed_archive(self):
         row = self.run_row('001', 1, 'failed', finish=False)

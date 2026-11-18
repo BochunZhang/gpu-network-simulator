@@ -29,7 +29,8 @@ def verified_retirement_receipt(row, results, archive_dir):
             with tempfile.TemporaryDirectory(prefix='gpu-retire-') as staging:
                 packaged, _ = archive_results.inspect_package(path, Path(staging))
                 if (any(packaged[key] != row[key] for key in archive_results.IDENTITY)
-                        or runner.effective_slug(packaged) != runner.effective_slug(row)):
+                        or runner.effective_slug(packaged) != runner.effective_slug(row)
+                        or runner.version_name(packaged) != runner.version_name(row)):
                     raise archive_results.ArchiveError(f'package execution identity mismatch: {path}')
                 return archive_results.receipt_for(packaged, path)
     return None
@@ -45,6 +46,7 @@ def archive_abandoned_raw(store, row, results, archive_dir):
         current = store.read(row['id']).get(key, {})
         owner = runner.read_json(store.reservation(*key) / 'owner.json')
         if (any(record.get('state') != 'abandoned' or not record.get('finished_at')
+                or runner.version_name(record) != runner.version_name(row)
                 or any(record.get(field) != row[field] for field in identity)
                 for record in (current, owner)) or current.get('archive_sha256')):
             raise archive_results.ArchiveError('raw archival requires a confirmed abandoned reservation')
@@ -52,7 +54,7 @@ def archive_abandoned_raw(store, row, results, archive_dir):
             if any(p.exists() or p.is_symlink() for p in runner.archive_candidates(root, row)):
                 raise archive_results.ArchiveError('a package exists; retry sealed archive verification')
         dest = runner.run_path(archive_dir, row)
-        candidates = {runner.run_path(results, row), results / row['id'] / f"v{row['version']}", dest}
+        candidates = {*runner.run_candidates(results, row), dest}
         found = []
         for path in candidates:
             root = archive_dir if path == dest else results
@@ -68,7 +70,8 @@ def archive_abandoned_raw(store, row, results, archive_dir):
         record_path = raw / 'run.json'
         archive_results.reject_symlink_path(record_path, archive_dir if raw == dest else results)
         run = runner.validate_record(runner.read_json(record_path), record_path)
-        if run['state'] != 'running' or any(run[field] != row[field] for field in identity):
+        if (run['state'] != 'running' or runner.version_name(run) != runner.version_name(row)
+                or any(run[field] != row[field] for field in identity)):
             raise archive_results.ArchiveError('abandoned raw run does not match reservation')
         if raw != dest:
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -110,7 +113,7 @@ def reconcile_ignored(tasks, store, results, archive_dir, active_claim=None, *, 
         if (row['id'] not in retired_ids or row['state'] not in runner.TERMINAL
                 or row['claim'] == active_claim or row.get('disposition') == 'ignored'):
             continue
-        path = store.status_dir / runner.task_label(row) / f"v{row['version']}.archive-error.json"
+        path = store.status_dir / runner.task_label(row) / f'{runner.version_name(row)}.archive-error.json'
         receipt = published.get(key)
         if receipt is None:
             try:
@@ -127,10 +130,12 @@ def reconcile_ignored(tasks, store, results, archive_dir, active_claim=None, *, 
                            'state': 'archive_error', 'disposition': 'ignored',
                            'execution_state': row['state'], 'reason': str(error),
                            'updated_at': runner.timestamp()}
+                if 'version_label' in row:
+                    failure['version_label'] = row['version_label']
                 path.parent.mkdir(parents=True, exist_ok=True)
                 runner.write_json(path, failure)
                 failures.append(failure)
-                print(f"archive pending for ignored {row['id']} v{row['version']}: {error}", file=sys.stderr)
+                print(f"archive pending for ignored {row['id']} {runner.version_name(row)}: {error}", file=sys.stderr)
                 continue
         failures.extend(store.archive_receipts([receipt], results, archive_dir, active_claim, retire=True))
     return failures

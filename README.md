@@ -119,41 +119,43 @@ bash tools/runner.sh --task system-000-inventory-refresh-00 --once
 
 更换基线时，使用对应产物清单的实际摘要。基线需要终态 `result.json` 与已封存的产物清单，异常退出留下的未封存检查点保留供排查。先完成基线，再发布引用它的新版本。追加子任务时保留基线子任务的清单与历史结果。
 
-runner 在永久领取前检查基线，从 CPFS 的 `results/` 或 `results-archive/` 校验并冻结所需文件。缺少基线时写入 `status/{子任务标识}/v{version}.waiting.json`，不消耗该版本的永久领取记录，继续查找其他任务。基线在归档移动中的位置变化由共享锁协调。
+runner 在永久领取前检查基线，从 CPFS 的 `results/` 或 `results-archive/` 校验并冻结所需文件。缺少基线时写入 `status/{子任务标识}/{version_label}.waiting.json`，不消耗该版本的永久领取记录，继续查找其他任务。基线在归档移动中的位置变化由共享锁协调。
 
 每个 case 的输入、相关实现、依赖产物和必要环境共同决定复用键。只有通过校验且文件完整的兼容 case 才能复用。失败、新增、依赖变化或产物损坏的 case 重新执行。基线整体失败时，独立通过且兼容的 case 仍可复用。`execution.force_rerun` 可以列出本次必须执行的 case，`execution.targets` 可以选择目标及其依赖。
 
-新版本写入独立的 `results/{子任务标识}/v{version}/`。其产物清单记录每个 case 的 `executed`/`reused` 来源、执行结果、文件哈希与耗时，结果记录中的 `case_counts` 汇总执行、复用、失败和跳过数量。每个 case 完成后原子保存清单，修正后的重新发布使用该子任务的下一次发布时间。所有目标 case 通过后，新版本才记为成功。
+新版本写入独立的 `results/{子任务标识}/{version_label}/`。其产物清单记录每个 case 的 `executed`/`reused` 来源、执行结果、文件哈希与耗时，结果记录中的 `case_counts` 汇总执行、复用、失败和跳过数量。每个 case 完成后原子保存清单，修正后的重新发布使用该子任务的下一次发布时间。所有目标 case 通过后，新版本才记为成功。
 
 当前 `gpu_inventory` 有 `hardware-info`、`topology`、`nvlink-check`、`toolchain` 和 `inventory-report` 五个 case。前四项在本次设备上重新采集，确定性的 `inventory-report` 可在输入和实现一致时复用。其他旧版处理器继续支持完整运行，增加 case 接口后可使用增量模式。当前增量机制覆盖已提交 case 的复用和重跑，仿真内部的中途恢复需要模型实现完整状态快照。
 
 ## CPFS 锁与状态
 
-运行时目录位于同一个共享仓库下，各台设备使用同一套目录。新发布的子任务用完整子任务标识作为目录名，用 UTC 发布时间的 Unix 秒作为运行记录中的整数 `version`。以下是上文示意子任务 `01` 的路径。
+运行时目录位于同一个共享仓库下，各台设备使用同一套目录。每个子任务首次发布从 `v1` 开始，以新时间戳发布时序号加一。序号按 Git 发布记录计算，暂停或恢复领取沿用该次发布的序号。UTC 发布时间按 `yymmdd-hhmmss` 附在序号后，形成 `version_label`。领取锁和增量配置继续使用 UTC 发布时间的 Unix 秒，对应记录中的整数 `version`。以下是上文示意子任务 `01` 首次发布的路径。
 
 ```text
 .lock/system-000-inventory-refresh-01.task.lock/
 .lock/system-000-inventory-refresh-01.v1795003200.lock/
-status/system-000-inventory-refresh-01/v1795003200.json
-results/system-000-inventory-refresh-01/v1795003200/
-results/system-000-inventory-refresh-01/system-000-inventory-refresh-01.v1795003200.tar.gz
+status/system-000-inventory-refresh-01/v1-261118-120000.json
+results/system-000-inventory-refresh-01/v1-261118-120000/
+results/system-000-inventory-refresh-01/system-000-inventory-refresh-01.v1-261118-120000.tar.gz
 ```
+
+已按旧格式领取的执行沿用原始路径和包名。升级时等在途执行结束，停止共享这套目录的各台旧 runner，在共享 checkout 执行 `git pull --ff-only`，再逐台启动新版 runner。浅克隆可用 `git fetch --unshallow origin` 补齐用于计算序号的发布历史。
 
 领取通过原子 `mkdir` 竞争。完成后先保存终态，再释放任务执行锁，保留版本领取记录。版本锁中保存主机、进程、领取标识及版本信息。重复启动会跳过已领取的版本。同一共享 checkout 的 Git 拉取和源码导出通过短期目录锁串行化，实验从独立快照执行。
 
 CPFS 挂载需要提供跨客户端互斥的目录创建与可见的元数据更新。CPFS 的 NFS 协议服务不支持 NLM 和原子追加，因此共享协调使用目录与独立文件，每个实验单独记录日志。当前测试在本地文件系统验证了竞争与恢复，真实 CPFS 跨主机验证需要在用户设备上执行。[CPFS 限制](https://www.alibabacloud.com/help/en/cpfs/cpfsonecs/product-overview/limits-1)
 
-状态包括 `running`、`succeeded`、`failed` 和 `abandoned`。崩溃遗留的锁保留给人工恢复。先在记录的原主机上停止轮询器并确认实验进程已经退出，再执行以下命令。恢复命令使用领取记录中的执行 ID 与整数版本。需要重跑时，在开发端更新子任务发布时间。下例中的参数取自上文示意记录。
+状态包括 `running`、`succeeded`、`failed` 和 `abandoned`。崩溃遗留的锁保留给人工恢复。先在记录的原主机上停止轮询器并确认实验进程已经退出，再执行以下命令。恢复命令接受领取记录中的版本标签或整数版本。需要重跑时，在开发端更新子任务发布时间。下例中的参数取自上文示意记录。
 
 ```bash
-bash tools/runner.sh --abandon system-000-inventory-refresh-01 1795003200
+bash tools/runner.sh --abandon system-000-inventory-refresh-01 v1-261118-120000
 ```
 
 如果原主机的 Git 拉取进程崩溃并留下 Git 协调锁，确认该进程已退出后，在原主机执行 `bash tools/runner.sh --recover-git-lock`。环境初始化崩溃遗留的锁需要根据其中的主机和进程记录人工检查后恢复。若崩溃发生在目录创建后、`owner.json` 写入前，该目录会保持阻塞。此时先停止可能持有该锁的轮询器及子进程，确认已全部退出，再人工移走该孤立目录并保留恢复记录。正常运行时保留 `.lock/`、`status/` 和 `results/`，供后续启动检查。
 
 ## 结果回收与归档
 
-设备完成后，CPFS 的 `results/{子任务标识}/v{version}/` 保存执行记录与原始输出。压缩包位于同级，完整文件名由状态记录中的 `archive_name` 给出，格式为 `{子任务标识}.v{发布时间的Unix秒}.tar.gz`。
+设备完成后，CPFS 的 `results/{子任务标识}/{version_label}/` 保存执行记录与原始输出。压缩包位于同级，完整文件名由状态记录中的 `archive_name` 给出，格式为 `{子任务标识}.{version_label}.tar.gz`。
 
 用户将原始压缩包下载到本地仓库的 `results-remote/` 后，运行归档工具。
 
@@ -161,13 +163,13 @@ bash tools/runner.sh --abandon system-000-inventory-refresh-01 1795003200
 python3 tools/archive_results.py
 ```
 
-归档工具核验身份、包内容和 SHA-256，在本地 `results/` 保留原包及提取内容，并生成 `status/{子任务标识}/v{version}.archived.json`。重复导入同一个包会校验并跳过。成功消费的输入包会从 `results-remote/` 移除，冲突或损坏的输入保留供排查。
+归档工具核验身份、包内容和 SHA-256，在本地 `results/` 保留原包及提取内容，并生成 `status/{子任务标识}/{version_label}.archived.json`。重复导入同一个包会校验并跳过。成功消费的输入包会从 `results-remote/` 移除，冲突或损坏的输入保留供排查。
 
 分析端将回执提交并推送到 `main`。CPFS 执行器核对领取标识、源码提交、任务摘要、执行状态和包的 SHA-256，再将数据目录及原包移到 `results-archive/{子任务标识}/`。
 
 废弃的子任务由 runner 校验结果身份、原包内容和 SHA-256，直接向 CPFS 的 `results-archive/` 归档。已有下载归档回执的包沿用其校验值。归档后，执行记录的 `disposition` 为 `ignored`。仍在运行的实验完成后再处理，归档失败时保留原数据并在下次轮询重试。实验的 `state` 保持 `succeeded` 或 `failed` 等原结果，`delivery_state` 记录 `awaiting_download` 或 `archived`。失败实验同样可以回收归档。移动中断时可继续处理，遇到不同内容的目标文件会停止并保留数据。崩溃恢复后继续使用同一组结果目录和归档目录。
 
-某个版本的压缩包缺失、改名未被识别或校验冲突时，runner 会保留该版本数据，并写入 `status/{子任务标识}/v{version}.archive-error.json` 等诊断记录，列出原因、预期校验和和搜索路径，继续处理其他归档确认及新任务。补齐或修正文件后，后续轮询重新尝试。文件只改名时 SHA-256 保持一致，原始压缩包按确认记录校验。
+某个版本的压缩包缺失、改名未被识别或校验冲突时，runner 会保留该版本数据，并写入 `status/{子任务标识}/{version_label}.archive-error.json` 等诊断记录，列出原因、预期校验和和搜索路径，继续处理其他归档确认及新任务。补齐或修正文件后，后续轮询重新尝试。文件只改名时 SHA-256 保持一致，原始压缩包按确认记录校验。
 
 任务处理器通过拉取的提交更新，runner 控制器修复需要在共享 checkout 更新后重启进程。遇到旧命名兼容问题时，先执行 `git pull --ff-only`，再重启 `bash tools/runner.sh`；运行中的旧控制器不会因 Git 拉取而替换自身代码。
 

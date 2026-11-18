@@ -98,6 +98,38 @@ class IncrementalTest(unittest.TestCase):
         with self.assertRaises(engine.IncrementalError):
             engine.validate_execution({**sibling, 'id': 'system-001-unrelated-01'})
 
+    def test_named_compound_category_baseline_before_and_after_archive(self):
+        parent = 'days-ago-000-test'
+        version = 1794960000
+        label = 'v1-261118-000000'
+        base = {**self.task, 'id': parent + '-00', 'version': version}
+        output = self.results / base['id'] / label
+        output.mkdir(parents=True)
+        record = self.record(base)
+        manifest = engine.run_cases(base, [self.case('first')], output, record)
+        terminal = {**record, 'state': manifest['state'], 'version_label': label}
+        engine.write_json(output / 'result.json', terminal)
+        later = {**base, 'id': parent + '-01', 'version': version + 1, 'execution': {
+            'mode': 'incremental', 'base': {'id': base['id'], 'version': version,
+                'artifacts_manifest_sha256': engine.file_digest(output / 'artifacts-manifest.json')}}}
+
+        prepared = engine.prepare_base(later, self.results, self.archive, self.root / 'first')
+        self.assertEqual(prepared['provenance']['version'], version)
+        target = self.archive / base['id'] / label
+        target.parent.mkdir(parents=True)
+        output.rename(target)
+        prepared = engine.prepare_base(later, self.results, self.archive, self.root / 'after-archive')
+        self.assertEqual((Path(prepared['root']) / 'cases/first/value.txt').read_text(), 'stable')
+
+        duplicate = self.results / base['id'] / f'v{version}'
+        duplicate.mkdir()
+        with self.assertRaisesRegex(engine.BaseUnavailable, 'ambiguous baseline'):
+            engine.prepare_base(later, self.results, self.archive, self.root / 'duplicate')
+        duplicate.rmdir()
+        engine.write_json(target / 'result.json', {**terminal, 'version_label': 'v2-261118-000000'})
+        with self.assertRaisesRegex(engine.BaseUnavailable, 'version label does not match'):
+            engine.prepare_base(later, self.results, self.archive, self.root / 'mismatched-label')
+
     def test_changed_implementation_invalidates_dependency_chain(self):
         output, _ = self.full([self.case('producer'), self.case('consumer', dependencies=['producer']),
                                self.case('independent')])

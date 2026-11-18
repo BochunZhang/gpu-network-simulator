@@ -71,7 +71,7 @@ def _case_ids(value, name):
 
 def _allowed_base_id(task, base_id):
     task_id = task.get('id')
-    child_pattern = rf'[a-z][a-z0-9]*-[0-9]{{3}}-{CASE_PATTERN}-[0-9]{{2}}'
+    child_pattern = rf'[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*-[0-9]{{3}}-{CASE_PATTERN}-[0-9]{{2}}'
     if not isinstance(task_id, str) or not isinstance(base_id, str):
         return False
     if re.fullmatch(r'[0-9]{3}', task_id):
@@ -188,8 +188,17 @@ def prepare_base(task, results_dir, archive_dir, destination):
         if not isinstance(slug, str) or not re.fullmatch(CASE_PATTERN, slug):
             raise IncrementalError('incremental task requires a safe slug')
         labels.append(f"{base['id']}-{slug}")
-    candidates = [Path(root) / label / f"v{base['version']}"
-                  for root in (results_dir, archive_dir) for label in labels]
+    parents = [Path(root) / label for root in (results_dir, archive_dir) for label in labels]
+    numeric_name = f"v{base['version']}"
+    candidates = [parent / numeric_name for parent in parents]
+    if not re.fullmatch(r'[0-9]{3}', base['id']):
+        try:
+            published = datetime.fromtimestamp(base['version'], timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            raise BaseUnavailable('baseline version is outside the supported UTC date range') from None
+        suffix = published.strftime('%y%m%d-%H%M%S')
+        candidates.extend(path for parent in parents for path in parent.glob(f'v*-{suffix}')
+                          if re.fullmatch(rf'v[1-9][0-9]*-{suffix}', path.name))
     found = [path for path in candidates if path.is_dir()]
     if len(found) != 1:
         reason = 'missing' if not found else 'ambiguous'
@@ -206,6 +215,9 @@ def prepare_base(task, results_dir, archive_dir, destination):
                 or any(not isinstance(result.get(key), str) or not result[key]
                        for key in ('claim', 'source_commit', 'task_sha256'))):
             raise BaseUnavailable('baseline terminal execution is missing or incompatible')
+        if (result.get('version_label', numeric_name) != root.name
+                or root.name == numeric_name and 'version_label' in result):
+            raise BaseUnavailable('baseline version label does not match the result directory')
         manifest_path = _regular_path(root, 'artifacts-manifest.json')
         if manifest_path.stat().st_size > 2 * 1024**2:
             raise BaseUnavailable('baseline artifact manifest exceeds 2 MiB')
