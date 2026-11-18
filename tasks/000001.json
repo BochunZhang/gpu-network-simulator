@@ -1,8 +1,0 @@
-{
-  "id": 1,
-  "version": 2,
-  "kind": "gpu_inventory",
-  "params": {},
-  "description": "Record NVIDIA GPUs, NVLink topology, and toolchain without running a simulator.",
-  "worker": "gpu01"
-}

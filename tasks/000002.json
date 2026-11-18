@@ -1,8 +1,0 @@
-{
-  "id": 2,
-  "version": 2,
-  "kind": "gedes_smoke",
-  "params": {},
-  "description": "Build the pinned GeDES source and run the upstream Fat-tree k=8 CUDA smoke.",
-  "worker": "gpu01"
-}

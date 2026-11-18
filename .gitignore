@@ -1,4 +1,7 @@
 /results/
 /status/*/
+/.lock/
+/.python/
+/.venv/
 __pycache__/
 *.py[cod]

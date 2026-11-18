@@ -52,15 +52,31 @@ def gpu_rows(log_path):
     return rows
 
 
-def selected_gpu(output):
-    rows = gpu_rows(output / "gpu-list.csv")
-    selected = os.environ.get("GPU_NET_SIM_GPU_UUID")
+def visible_gpus(rows):
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible is not None and visible != selected:
-        raise ValueError("unset CUDA_VISIBLE_DEVICES or set it to the same full UUID as GPU_NET_SIM_GPU_UUID")
+    if visible is None:
+        return rows
+    if visible.strip() in {"", "-1"}:
+        return []
+    selected = []
+    for value in visible.split(","):
+        selector = value.strip()
+        matches = [row for row in rows if row[0] == selector or
+                   (selector.startswith("GPU-") and row[1].startswith(selector))]
+        if len(matches) != 1 or matches[0] in selected:
+            raise ValueError("CUDA_VISIBLE_DEVICES must contain unique physical indices or GPU UUIDs")
+        selected.append(matches[0])
+    return selected
+
+
+def selected_gpu(output):
+    rows = visible_gpus(gpu_rows(output / "gpu-list.csv"))
+    if not rows:
+        raise ValueError("CUDA_VISIBLE_DEVICES exposes no GPUs")
+    selected = os.environ.get("GPU_NET_SIM_GPU_UUID")
     row = next((r for r in rows if r[1] == selected), None) if selected is not None else rows[0]
     if row is None:
-        raise ValueError("GPU_NET_SIM_GPU_UUID must exactly match a physical UUID in nvidia-smi -L")
+        raise ValueError("GPU_NET_SIM_GPU_UUID must match a GPU inside CUDA_VISIBLE_DEVICES")
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": row[1]}
     write_json(output / "gpu.json", {"uuid": row[1], "name": row[2], "compute_cap": row[3],
                                      "memory_mib": row[4], "driver": row[5], "pci_bus": row[6]})
@@ -91,7 +107,9 @@ def inventory(source: Path, output: Path):
     write_json(output / "summary.json", {
         "scope": "GPU and toolchain inventory; no simulation run",
         "platform": platform.platform(), "python": platform.python_version(),
-        "cpu_count": os.cpu_count(), "gpu_count": len(rows), "probes": outcomes,
+        "cpu_count": os.cpu_count(), "gpu_count": len(rows),
+        "visible_gpu_count": len(visible_gpus(rows)),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "probes": outcomes,
     })
 
 

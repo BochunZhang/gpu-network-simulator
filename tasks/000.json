@@ -1,0 +1,12 @@
+{
+  "id": "000",
+  "name": "GB200 four-GPU hardware inventory",
+  "version": 1,
+  "kind": "gpu_inventory",
+  "params": {},
+  "resources": {
+    "gpus": 4
+  },
+  "enabled": true,
+  "description": "Record all four NVIDIA GPUs, memory, SM capability, NVLink topology, driver and build tools."
+}

@@ -1,0 +1,12 @@
+{
+  "id": "001",
+  "name": "GeDES Fat-tree k8 CUDA smoke",
+  "version": 1,
+  "kind": "gedes_smoke",
+  "params": {},
+  "resources": {
+    "gpus": 1
+  },
+  "enabled": true,
+  "description": "Build the pinned GeDES source for the observed GPU architecture and check positive completed flows."
+}
