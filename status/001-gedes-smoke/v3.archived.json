@@ -1,0 +1,24 @@
+{
+  "archive_name": "001-gedes-smoke.v3.tar.gz",
+  "archive_sha256": "37549fd84fdc7f99a9c113b1040ec24f14d919cf2c83bcc5321f1396d8387036",
+  "archive_size": 42901,
+  "archived_at": "2026-11-18T08:01:53+00:00",
+  "artifacts_manifest_sha256": "43b7ad4feb68954dc26fc3177c1d5630851c22952b7f11ec68c59039bc5ca032",
+  "case_counts": {
+    "executed": 5,
+    "failed": 0,
+    "reused": 0,
+    "skipped": 0
+  },
+  "claim": "ddefa0fdf1804d50a4591fb1919e7167",
+  "command": "bash tools/runner.sh --task 001 --once",
+  "command_source": "recorded",
+  "id": "001",
+  "name": "GeDES completion and single-GPU timing audit",
+  "schema_version": 1,
+  "slug": "gedes-smoke",
+  "source_commit": "4ce8139aa8deec5324a7e4bba0dd8c13725af9c1",
+  "state": "succeeded",
+  "task_sha256": "a63c3345668690c1b81faf867c867a493af14bba38c60867f672846ec6e11af0",
+  "version": 3
+}
