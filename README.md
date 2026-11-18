@@ -4,7 +4,7 @@
 
 ## 在 GPU 机器上启动
 
-需要 POSIX 主机（CUDA 实验用 Linux）、Python 3.9+、Git，以及私有仓库的 **Contents 读写权限**。同时需要能读论文代码的公开仓库。以普通用户运行，先配置非交互 Git 认证。GeDES 需要可用的 NVIDIA 驱动、`nvcc`、C++ 编译器和 CMake；Days AGO 另需 Rust/Cargo 和兼容 CUDA 13 的 `nvcc`。使用权限充足且有余量的数据盘。
+需要 POSIX 主机（CUDA 实验用 Linux）、Python 3.9+ 和 Git。仓库公开可读，执行 worker 的账号需要本仓库的 **Contents 写权限**，用于领取任务和提交状态。同时需要能访问论文代码的公开仓库。以普通用户运行，先配置非交互 Git 认证。GeDES 需要可用的 NVIDIA 驱动、`nvcc`、C++ 编译器和 CMake。Days AGO 另需 Rust/Cargo 和兼容 CUDA 13 的 `nvcc`。使用权限充足且有余量的数据盘。
 
 ```bash
 git clone https://github.com/BochunZhang/gpu-network-simulator.git
