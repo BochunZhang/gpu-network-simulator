@@ -39,6 +39,7 @@ class RunnerTest(unittest.TestCase):
         (self.author / 'tasks').mkdir()
         (self.author / 'tools').mkdir()
         shutil.copyfile(REPO / 'tools/run_experiments.py', self.author / 'tools/run_experiments.py')
+        shutil.copyfile(REPO / 'tools/incremental.py', self.author / 'tools/incremental.py')
         self.commit_task()
         self.git(self.root, 'clone', str(self.remote), str(self.checkout))
         self.lock_dir, self.status_dir, self.results = (self.checkout / name for name in ('.lock', 'status', 'results'))
@@ -66,6 +67,103 @@ class RunnerTest(unittest.TestCase):
         source = self.queue.source()
         task, digest = next(pair for pair in self.queue.tasks(source) if pair[0]['id'] == task_id)
         return source, task, digest
+
+    def commit_case_task(self, version, execution, fail=False, value='unchanged', comment=''):
+        task = {'id': '000', 'slug': 'new-kind', 'name': 'Incremental fixture', 'version': version,
+                'kind': 'case_fixture', 'command': 'bash tools/runner.sh --task 000 --once',
+                'params': {'fail': fail, 'value': value}, 'execution': execution}
+        runner.write_json(self.author / 'tasks/000.json', task)
+        (self.author / 'tools/experiment_handlers.py').write_text(
+            f'# {comment}\n'
+            'def case_plan(task, source):\n'
+            '    def stable(output, dependencies):\n'
+            "        (output / 'value.txt').write_text('stable result')\n"
+            '    def mutable(output, dependencies):\n'
+            "        (output / 'value.txt').write_text(task['params']['value'])\n"
+            "        if task['params']['fail']: raise RuntimeError('fixture failure')\n"
+            "    return [{'id':'stable','implementation':'stable-v1','inputs':{},'reuse':True,'run':stable},\n"
+            "            {'id':'mutable','implementation':'mutable-v1','inputs':task['params'],'reuse':True,'run':mutable}]\n",
+            encoding='utf-8')
+        self.git(self.author, 'add', '.')
+        self.git(self.author, 'commit', '-m', f'incremental fixture v{version} {comment}')
+        self.git(self.remote, 'fetch', str(self.author), 'main:main')
+        return task
+
+    def case_cli(self, expected=0):
+        process = subprocess.run([sys.executable, '-B', str(self.checkout / 'tools/run_experiments.py'),
+                                  '--task', '000', '--once'], text=True, capture_output=True, timeout=30)
+        self.assertEqual(process.returncode, expected, process.stdout + process.stderr)
+        return process
+
+    def test_incremental_cli_reuses_passed_case_from_failed_archived_v2(self):
+        self.commit_case_task(2, {'mode': 'full'}, fail=True, value='v2')
+        self.case_cli(expected=1)
+        output2 = self.results / '000-new-kind/v2'
+        result2 = runner.read_json(output2 / 'result.json')
+        self.assertEqual(result2['case_counts'], {'executed': 2, 'reused': 0, 'failed': 1, 'skipped': 0})
+        receipt = {key: result2[key] for key in ('id', 'slug', 'name', 'version', 'claim', 'source_commit',
+                                                'task_sha256', 'state', 'command')}
+        receipt.update(schema_version=1, archived_at='2026-11-18T00:00:00+00:00',
+                       archive_sha256=runner.sha256_file(output2.with_suffix('.tar.gz')))
+        self.store.archive_receipts([receipt], self.results, self.checkout / 'results-archive')
+        self.assertFalse(output2.exists())
+        execution = {'mode': 'incremental', 'base': {'id': '000', 'version': 2,
+                     'artifacts_manifest_sha256': result2['artifacts_manifest_sha256']}}
+        self.commit_case_task(3, execution, fail=False, value='v3', comment='unrelated source text changed')
+        self.case_cli()
+        output3 = self.results / '000-new-kind/v3'
+        result3 = runner.read_json(output3 / 'result.json')
+        self.assertEqual(result3['case_counts'], {'executed': 1, 'reused': 1, 'failed': 0, 'skipped': 0})
+        self.assertEqual(result3['base']['version'], 2)
+        manifest = runner.read_json(output3 / 'artifacts-manifest.json')
+        self.assertEqual(manifest['cases']['stable']['origin'], 'reused')
+        self.assertEqual(manifest['cases']['mutable']['origin'], 'executed')
+        self.assertEqual((output3 / 'cases/mutable/value.txt').read_text(), 'v3')
+        self.assertEqual((self.checkout / 'results-archive/000-new-kind/v2/cases/mutable/value.txt').read_text(), 'v2')
+        with tarfile.open(output3.with_suffix('.tar.gz')) as archive:
+            self.assertIn('artifacts-manifest.json', archive.getnames())
+            self.assertIn('cases/stable/value.txt', archive.getnames())
+        self.case_cli()
+        self.assertEqual(self.store.read()['000', 3]['state'], 'succeeded')
+        self.commit_case_task(3, execution, value='changed without increasing version')
+        rejected = self.case_cli(expected=1)
+        self.assertIn('changed without increasing version', rejected.stderr)
+        self.assertEqual((output3 / 'cases/mutable/value.txt').read_text(), 'v3')
+
+    def test_missing_incremental_base_waits_without_claim_and_other_task_runs(self):
+        self.commit_case_task(3, {'mode': 'incremental', 'base': {'id': '000', 'version': 2,
+                              'artifacts_manifest_sha256': '0' * 64}})
+        self.case_cli()
+        self.assertFalse(self.store.guard('000').exists())
+        self.assertFalse(self.store.reservation('000', 3).exists())
+        waiting = runner.read_json(self.status_dir / '000-new-kind/v3.waiting.json')
+        self.assertEqual(waiting['state'], 'waiting_for_base')
+        self.assertEqual(self.store.read(), {})
+        self.commit_task(task_id='001', marker='unblocked independent task')
+        process = subprocess.run([sys.executable, '-B', str(self.checkout / 'tools/run_experiments.py'), '--once'],
+                                 text=True, capture_output=True, timeout=30)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(self.store.read()['001', 1]['state'], 'succeeded')
+        self.assertFalse(self.store.reservation('000', 3).exists())
+
+    def test_case_finalizer_cannot_mutate_committed_artifacts(self):
+        self.commit_case_task(2, {'mode': 'full'})
+        handler = self.author / 'tools/experiment_handlers.py'
+        handler.write_text(handler.read_text() +
+                           '\ndef finalize_cases(task, output, manifest):\n'
+                           "    (output / 'cases/stable/value.txt').write_text('invalid mutation')\n"
+                           "    manifest.clear()\n")
+        self.git(self.author, 'add', '.')
+        self.git(self.author, 'commit', '-m', 'unsafe fixture finalizer')
+        self.git(self.remote, 'fetch', str(self.author), 'main:main')
+        self.case_cli(expected=1)
+        output = self.results / '000-new-kind/v2'
+        result = runner.read_json(output / 'result.json')
+        manifest = runner.read_json(output / 'artifacts-manifest.json')
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(manifest['state'], 'failed')
+        self.assertEqual(manifest['cases']['stable']['state'], 'failed')
+        self.assertEqual(result['case_counts']['failed'], 1)
 
     def claim(self, task_id='000'):
         source, task, digest = self.source_task(task_id)

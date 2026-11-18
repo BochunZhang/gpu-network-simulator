@@ -47,13 +47,14 @@ tail -f /tmp/gpu-network-runner.log
   "id": "000",
   "name": "GB200 four-GPU hardware inventory",
   "slug": "system-info",
-  "version": 1,
+  "version": 2,
   "command": "bash tools/runner.sh --task 000 --once",
   "kind": "gpu_inventory",
   "params": {},
   "resources": {"gpus": 4},
   "enabled": true,
-  "description": "Record GPUs, memory, NVLink topology and the toolchain."
+  "execution": {"mode": "full"},
+  "description": "Collect fresh cases and publish an artifact manifest."
 }
 ```
 
@@ -69,6 +70,7 @@ tail -f /tmp/gpu-network-runner.log
 | `resources.gpus` | 可选，所需最少可见 GPU 数量，默认 0。设备满足数量后才能领取。 |
 | `enabled` | 可选，默认 `true`。设为 `false` 暂停领取。 |
 | `description` | 可选，实验说明与通过条件。 |
+| `execution` | 可选，`full` 或带基线的 `incremental`。省略时按完整运行处理。 |
 
 运行状态包含任务名称、简称、入口命令、源码提交和执行主机。处理器将实际调用的程序、完整参数、工作目录、退出码与时间写入 `commands.json`，并带入结果记录。新增 `slug` 和 `command` 保持现有实验版本，旧的 `000/v1` 状态和结果继续读取。
 
@@ -81,6 +83,37 @@ tail -f /tmp/gpu-network-runner.log
 | `002` | Days AGO Scalar/CPU/CUDA 对照 | 1 | 暂停，待固定源码增加 GB200 `sm_100` 支持后启用并递增版本。 |
 
 旧版六位编号的状态和结果原样保留，当前调度器使用三位编号清单。
+
+## 同编号增量执行
+
+任务 000 现发布 v2，先执行完整采集并产生 `artifacts-manifest.json`。基于 v2 继续执行时，保留编号与简称，在同一清单中发布 v3，并引用 v2 产物清单的 SHA-256。以下是清单中的执行配置片段，其他必填字段继续保留。
+
+```json
+{
+  "id": "000",
+  "slug": "system-info",
+  "version": 3,
+  "execution": {
+    "mode": "incremental",
+    "base": {
+      "id": "000",
+      "version": 2,
+      "artifacts_manifest_sha256": "<v2 产物清单的 SHA-256>"
+    },
+    "reuse": "verified-compatible"
+  }
+}
+```
+
+SHA-256 来自实际完成的 v2 结果记录或校验归档后的确认状态。占位文本需要替换为实际摘要。基线需要终态 `result.json` 与已封存的产物清单，异常退出留下的未封存检查点保留供排查。先完成基线，再发布引用它的新版本。当前队列每个编号只有一份最新清单，基线尚未执行时保留其清单供设备领取。
+
+runner 在永久领取前检查基线，从 CPFS 的 `results/` 或 `results-archive/` 校验并冻结所需文件。缺少基线时写入 `status/000-system-info/v3.waiting.json`，不消耗该版本的永久领取记录，继续查找其他任务。基线在归档移动中的位置变化由共享锁协调。
+
+每个 case 的输入、相关实现、依赖产物和必要环境共同决定复用键。只有通过校验且文件完整的兼容 case 才能复用。失败、新增、依赖变化或产物损坏的 case 重新执行。基线整体失败时，独立通过且兼容的 case 仍可复用。`execution.force_rerun` 可以列出本次必须执行的 case，`execution.targets` 可以选择目标及其依赖。
+
+新版本写入独立的 `results/000-system-info/v3/`。其产物清单记录每个 case 的 `executed`/`reused` 来源、执行结果、文件哈希与耗时，结果记录中的 `case_counts` 汇总执行、复用、失败和跳过数量。每个 case 完成后原子保存清单，失败后的修正继续沿用任务 000 的新版本。所有目标 case 通过后，新版本才记为成功。
+
+当前 `gpu_inventory` 有 `hardware-info`、`topology`、`nvlink-check`、`toolchain` 和 `inventory-report` 五个 case。前四项在本次设备上重新采集，确定性的 `inventory-report` 可在输入和实现一致时复用。其他旧版处理器继续支持完整运行，增加 case 接口后可使用增量模式。当前增量机制覆盖已提交 case 的复用和重跑，仿真内部的中途恢复需要模型实现完整状态快照。
 
 ## CPFS 锁与状态
 

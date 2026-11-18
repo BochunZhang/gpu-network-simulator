@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -67,6 +68,27 @@ class ArchiveResultsTest(unittest.TestCase):
             importer.archive_package(duplicate, self.results, self.status)
         self.assertFalse(duplicate.exists())
         self.assertEqual(json.loads(receipt_path.read_text()), receipt)
+
+    def test_verified_case_manifest_is_exposed_in_receipt(self):
+        manifest = b'{"schema_version": 1, "cases": {}}'
+        checksum = hashlib.sha256(manifest).hexdigest()
+        member = tarfile.TarInfo('artifacts-manifest.json')
+        member.size = len(manifest)
+        counts = {'executed': 1, 'reused': 2, 'failed': 0, 'skipped': 0}
+        package, _ = self.package(metadata={
+            'artifacts_manifest_sha256': checksum, 'case_counts': counts,
+            'archive_files': ['result.json', 'summary.txt', 'artifacts-manifest.json'],
+        }, extra=[(member, manifest)])
+        receipt = json.loads(importer.archive_package(package, self.results, self.status).read_text())
+        self.assertEqual(receipt['artifacts_manifest_sha256'], checksum)
+        self.assertEqual(receipt['case_counts'], counts)
+        bad, _ = self.package('bad-manifest.tar.gz', metadata={
+            'artifacts_manifest_sha256': '0' * 64,
+            'archive_files': ['result.json', 'summary.txt', 'artifacts-manifest.json'],
+        }, extra=[(member, manifest)])
+        with self.assertRaisesRegex(importer.ArchiveError, 'manifest checksum'):
+            importer.archive_package(bad, self.results, self.status)
+        self.assertTrue(bad.exists())
 
     def test_legacy_package_infers_slug_without_changing_tar_or_record(self):
         package, row = self.package()

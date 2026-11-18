@@ -122,6 +122,11 @@ def inspect_package(package, extracted):
     if (not isinstance(declared, list) or any(not isinstance(name, str) for name in declared)
             or len(set(declared)) != len(declared) or set(declared) != set(files)):
         raise ArchiveError('archive_files does not match the package contents')
+    manifest_sha = row.get('artifacts_manifest_sha256')
+    if manifest_sha is not None and (
+            not isinstance(manifest_sha, str) or not re.fullmatch(r'[0-9a-f]{64}', manifest_sha)
+            or files.get('artifacts-manifest.json') != manifest_sha):
+        raise ArchiveError('artifact manifest checksum does not match the result record')
     return row, files
 
 
@@ -141,6 +146,15 @@ def receipt_for(row, package):
         'archive_sha256': runner.sha256_file(package), 'archive_size': package.stat().st_size,
         'archived_at': runner.timestamp(),
     }
+    if 'artifacts_manifest_sha256' in row:
+        receipt['artifacts_manifest_sha256'] = row['artifacts_manifest_sha256']
+    if 'case_counts' in row:
+        counts = row['case_counts']
+        if (not isinstance(counts, dict) or any(
+                key not in {'executed', 'reused', 'failed', 'skipped'}
+                or type(value) is not int or value < 0 for key, value in counts.items())):
+            raise ArchiveError('invalid per-case counts in result record')
+        receipt['case_counts'] = counts
     runner.validate_receipt(receipt, package)
     return receipt
 

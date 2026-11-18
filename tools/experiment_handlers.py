@@ -2,6 +2,7 @@
 
 import csv
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -38,12 +39,14 @@ def pass_lock():
     return (int(lock_fd),) if lock_fd else ()
 
 
-def command(args, log, cwd=None, env=None):
-    journal = log.parent / 'commands.json'
+def command(args, log, cwd=None, env=None, journal_dir=None):
+    journal_root = Path(journal_dir) if journal_dir is not None else log.parent
+    journal = journal_root / 'commands.json'
     records = json.loads(journal.read_text()) if journal.exists() else []
     argv = [str(argument) for argument in args]
     record = {'argv': argv, 'command': shlex.join(argv),
-              'cwd': str(Path(cwd or Path.cwd()).resolve()), 'log': log.name,
+              'cwd': str(Path(cwd or Path.cwd()).resolve()),
+              'log': log.relative_to(journal_root).as_posix(),
               'started_at': datetime.now(timezone.utc).isoformat(), 'state': 'running'}
     records.append(record)
     write_json(journal, records)
@@ -68,12 +71,12 @@ def command(args, log, cwd=None, env=None):
     return time.monotonic() - start
 
 
-def gpu_rows(log_path):
+def gpu_rows(log_path, journal_dir=None):
     command([
         "nvidia-smi",
         "--query-gpu=index,uuid,name,compute_cap,memory.total,driver_version,pci.bus_id",
         "--format=csv,noheader,nounits",
-    ], log_path)
+    ], log_path, journal_dir=journal_dir)
     rows = [list(map(str.strip, row)) for row in csv.reader(log_path.read_text().splitlines())]
     if not rows or any(len(row) != 7 or not row[1].startswith("GPU-")
                        or not re.fullmatch(r"[0-9]{1,2}\.[0-9]", row[3]) for row in rows):
@@ -140,6 +143,135 @@ def inventory(source: Path, output: Path):
         "visible_gpu_count": len(visible_gpus(rows)),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "probes": outcomes,
     })
+
+
+TOOLCHAIN_PROBES = {
+    'nvcc': ['nvcc', '--version'],
+    'cmake': ['cmake', '--version'],
+    'rustc': ['rustc', '--version'],
+    'cargo': ['cargo', '--version'],
+}
+
+
+def _inventory_hardware(output, dependencies):
+    rows = gpu_rows(output / 'gpu-list.csv', journal_dir=output.parent.parent)
+    write_json(output / 'hardware.json', {
+        'platform': platform.platform(), 'python': platform.python_version(),
+        'cpu_count': os.cpu_count(), 'gpu_count': len(rows),
+        'visible_gpu_count': len(visible_gpus(rows)),
+        'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'), 'gpus': rows,
+    })
+
+
+def _inventory_probe(output, label, args):
+    record = {'command': args, 'status': 'not installed'}
+    if shutil.which(args[0]):
+        try:
+            command(args, output / f'{label}.txt', journal_dir=output.parent.parent)
+        except Exception as error:
+            record.update(status='failed', error=str(error))
+            write_json(output / 'probe.json', record)
+            raise
+        record['status'] = 'ok'
+    write_json(output / 'probe.json', record)
+
+
+def _inventory_topology(output, dependencies):
+    _inventory_probe(output, 'topology', ['nvidia-smi', 'topo', '-m'])
+
+
+def _inventory_nvlink(output, dependencies):
+    _inventory_probe(output, 'nvlink', ['nvidia-smi', 'nvlink', '-s'])
+
+
+def _inventory_toolchain(output, dependencies):
+    outcomes = {}
+    failures = []
+    for label, args in TOOLCHAIN_PROBES.items():
+        if not shutil.which(args[0]):
+            outcomes[label] = 'not installed'
+            continue
+        try:
+            command(args, output / f'{label}.txt', journal_dir=output.parent.parent)
+            outcomes[label] = 'ok'
+        except Exception as error:
+            outcomes[label] = f'failed: {error}'
+            failures.append(label)
+    write_json(output / 'tools.json', outcomes)
+    if failures:
+        raise RuntimeError('toolchain probes failed: ' + ', '.join(failures))
+
+
+def _inventory_summary(case_outputs):
+    def read(case_id, filename):
+        directory = case_outputs.get(case_id)
+        path = directory / filename if directory is not None else None
+        return json.loads(path.read_text()) if path is not None and path.is_file() else {}
+
+    hardware = read('hardware-info', 'hardware.json')
+    probes = read('toolchain', 'tools.json')
+    probes['topology'] = read('topology', 'probe.json').get('status', 'not executed')
+    probes['nvlink'] = read('nvlink-check', 'probe.json').get('status', 'not executed')
+    return {
+        'scope': 'GPU and toolchain inventory; no simulation run',
+        **{key: value for key, value in hardware.items() if key != 'gpus'}, 'probes': probes,
+    }
+
+
+def _inventory_report(output, dependencies):
+    write_json(output / 'summary.json', _inventory_summary(dependencies))
+
+
+def _case_implementation(*functions):
+    source = '\n'.join(inspect.getsource(function) for function in functions)
+    return hashlib.sha256(source.encode('utf-8')).hexdigest()
+
+
+def case_plan(task, source):
+    """Describe inventory stages for the runner's case engine."""
+    if task['kind'] != 'gpu_inventory':
+        return None
+    if task['params'] != {}:
+        raise ValueError('gpu_inventory does not accept handler parameters')
+    cases = [
+        {'id': 'hardware-info', 'depends_on': [], 'run': _inventory_hardware,
+         'implementation': _case_implementation(_inventory_hardware, gpu_rows, visible_gpus),
+         'inputs': {'schema': 1}, 'reuse': False},
+        {'id': 'topology', 'depends_on': ['hardware-info'], 'run': _inventory_topology,
+         'implementation': _case_implementation(_inventory_topology, _inventory_probe),
+         'inputs': {'schema': 1}, 'reuse': False},
+        {'id': 'nvlink-check', 'depends_on': ['hardware-info'], 'run': _inventory_nvlink,
+         'implementation': _case_implementation(_inventory_nvlink, _inventory_probe),
+         'inputs': {'schema': 1}, 'reuse': False},
+        {'id': 'toolchain', 'depends_on': [], 'run': _inventory_toolchain,
+         'implementation': _case_implementation(_inventory_toolchain),
+         'inputs': {'schema': 1, 'commands': TOOLCHAIN_PROBES}, 'reuse': False},
+        {'id': 'inventory-report',
+         'depends_on': ['hardware-info', 'topology', 'nvlink-check', 'toolchain'],
+         'run': _inventory_report,
+         'implementation': _case_implementation(_inventory_report, _inventory_summary, write_json),
+         'inputs': {'schema': 1}, 'reuse': True},
+    ]
+    return cases
+
+
+def finalize_cases(task, output, manifest):
+    """Keep the compact legacy inventory outputs available at the task root."""
+    if task['kind'] != 'gpu_inventory':
+        return
+    case_outputs = {case_id: output / 'cases' / case_id for case_id in manifest['cases']}
+    summary = _inventory_summary(case_outputs)
+    summary['case_states'] = {case_id: case['state'] for case_id, case in manifest['cases'].items()}
+    summary['case_counts'] = manifest.get('summary', {})
+    write_json(output / 'summary.json', summary)
+    exports = {'hardware-info': ['gpu-list.csv'], 'topology': ['topology.txt'],
+               'nvlink-check': ['nvlink.txt'],
+               'toolchain': [f'{name}.txt' for name in TOOLCHAIN_PROBES]}
+    for case_id, filenames in exports.items():
+        for filename in filenames:
+            source = output / 'cases' / case_id / filename
+            if source.is_file():
+                shutil.copyfile(source, output / filename)
 
 
 def checkout(upstream, scratch, output, env):

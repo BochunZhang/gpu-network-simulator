@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import copy
 import fcntl
 import hashlib
 import importlib.util
@@ -11,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -100,6 +102,27 @@ def sha256_file(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def load_python_module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RunnerError(f'cannot load Python module: {path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
+
+
+def runtime_engine():
+    path = Path(__file__).with_name('incremental.py')
+    if not path.is_file():
+        raise RunnerError('incremental runtime is missing; update the shared checkout and restart the runner')
+    return load_python_module(path, 'runner_incremental_protocol')
 
 
 def validate_receipt(row, path=None):
@@ -273,8 +296,13 @@ class Queue:
                     or not isinstance(task.get('description', ''), str)
                     or not isinstance(resources, dict) or set(resources) - {'gpus'}
                     or type(resources.get('gpus', 0)) is not int or resources.get('gpus', 0) < 0
-                    or set(task) - {'id', 'name', 'slug', 'command', 'version', 'kind', 'params', 'resources', 'enabled', 'description'}):
+                    or set(task) - {'id', 'name', 'slug', 'command', 'version', 'kind', 'params', 'resources', 'enabled', 'description', 'execution'}):
                 raise RunnerError(f'invalid task manifest: {path}')
+            if 'execution' in task:
+                try:
+                    runtime_engine().validate_execution(task)
+                except ValueError as error:
+                    raise RunnerError(f'invalid execution configuration: {path}: {error}') from error
             definition = {key: value for key, value in task.items() if key not in {'description', 'enabled', 'slug', 'command'}}
             digest = hashlib.sha256(encode(definition).encode()).hexdigest()
             tasks.append((task, digest))
@@ -339,10 +367,16 @@ class ClaimStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json(path, row)
 
-    def claim(self, task, digest, source, results, worker):
+    def claim(self, task, digest, source, results, worker, prepared_base=None):
         task_id, version = task['id'], task['version']
+        execution = task.get('execution', {'mode': 'full'})
+        if execution.get('mode') == 'incremental':
+            provenance = prepared_base.get('provenance', {}) if isinstance(prepared_base, dict) else {}
+            if any(provenance.get(key) != value for key, value in execution['base'].items()):
+                raise RunnerError('incremental task must prepare its verified baseline before claiming')
         row = {'id': task_id, 'name': task['name'], 'slug': task['slug'],
                'command': task['command'], 'version': version, 'kind': task['kind'],
+               'execution': execution,
                'task_sha256': digest, 'source_commit': source, 'worker': worker,
                'host_id': host_identity(), 'claim': uuid.uuid4().hex,
                'state': 'running', 'delivery_state': 'awaiting_download', 'claimed_at': timestamp()}
@@ -547,22 +581,36 @@ def prepare_archive(output, record):
     tarpath = output.with_suffix('.tar.gz')
     tmp_tar = tarpath.with_suffix('.tmp')
     metadata = output / '.archive-metadata.json'
-    selected, total = [], 0
-    for path in sorted(output.iterdir()):
-        if (path.name.startswith('.') or path.name in {'result.json', 'run.json'}
-                or path.suffix not in RESULT_SUFFIXES or path.is_symlink() or not path.is_file()):
+    selected, omitted, total = [], [], 0
+    candidates = []
+    for path in output.rglob('*'):
+        relative = path.relative_to(output)
+        if (any(part.startswith('.') for part in relative.parts)
+                or relative.as_posix() in {'result.json', 'run.json'}
+                or path.suffix not in RESULT_SUFFIXES or path.is_symlink() or not path.is_file()
+                or any(parent.is_symlink() for parent in path.parents if parent.is_relative_to(output))):
             continue
+        candidates.append(path)
+    # Keep provenance and the case manifest ahead of optional per-case data.
+    priority = {'artifacts-manifest.json', 'summary.json', 'commands.json'}
+    candidates.sort(key=lambda path: (path.relative_to(output).as_posix() not in priority,
+                                     path.relative_to(output).as_posix()))
+    for path in candidates:
         size = path.stat().st_size
         if size <= FILE_LIMIT and total + size <= ARCHIVE_LIMIT:
             total += size
             selected.append(path)
-    record['archive_files'] = ['result.json', *[path.name for path in selected]]
+        else:
+            omitted.append(path.relative_to(output).as_posix())
+    record['archive_files'] = ['result.json', *[path.relative_to(output).as_posix() for path in selected]]
+    if omitted:
+        record['archive_omitted'] = omitted
     write_json(metadata, record)
     try:
         with tarfile.open(tmp_tar, 'w:gz') as archive:
             archive.add(metadata, arcname='result.json')
             for path in selected:
-                archive.add(path, arcname=path.name)
+                archive.add(path, arcname=path.relative_to(output).as_posix())
         tmp_tar.replace(tarpath)
     finally:
         metadata.unlink(missing_ok=True)
@@ -571,7 +619,8 @@ def prepare_archive(output, record):
 
 def execute(queue, output):
     run = execution_metadata(read_json(output / 'run.json'))
-    record = dict(run)
+    record = {key: value for key, value in run.items() if key != 'prepared_base'}
+    prepared = run.get('prepared_base')
     try:
         with tempfile.TemporaryDirectory(prefix='gpu-network-simulator-source-') as temp:
             source = Path(temp) / 'source'
@@ -579,15 +628,45 @@ def execute(queue, output):
             pinned = source / 'tools' / 'experiment_handlers.py'
             if not pinned.is_file():
                 raise RunnerError('pinned source lacks tools/experiment_handlers.py')
-            record['pinned_handler_sha256'] = hashlib.sha256(pinned.read_bytes()).hexdigest()
-            spec = importlib.util.spec_from_file_location('pinned_experiment_handlers', pinned)
-            handlers = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(handlers)
-            handlers.prepare(run['task']['kind'], run['task']['params'])(source, output)
-        record.update(state='succeeded', exit_code=0)
+            record['pinned_handler_sha256'] = sha256_file(pinned)
+            handlers = load_python_module(pinned, 'pinned_experiment_handlers')
+            plan_factory = getattr(handlers, 'case_plan', None)
+            plan = plan_factory(run['task'], source) if plan_factory else None
+            if plan is not None:
+                engine_path = source / 'tools' / 'incremental.py'
+                if not engine_path.is_file():
+                    raise RunnerError('case-based handler requires pinned tools/incremental.py')
+                engine = load_python_module(engine_path, 'pinned_incremental_engine')
+                manifest = engine.run_cases(run['task'], plan, output, record, prepared)
+                if prepared:
+                    record['base'] = prepared['provenance']
+                finalize = getattr(handlers, 'finalize_cases', None)
+                try:
+                    if finalize:
+                        finalize(run['task'], output, copy.deepcopy(manifest))
+                finally:
+                    manifest = engine.verify_outputs(output, manifest)
+                    record['artifacts_manifest_sha256'] = sha256_file(output / 'artifacts-manifest.json')
+                    record['case_counts'] = {key: manifest['summary'][key]
+                                             for key in ('executed', 'reused', 'failed', 'skipped')}
+                record.update(state=manifest['state'], exit_code=int(manifest['state'] != 'succeeded'))
+                if manifest['state'] != 'succeeded':
+                    record['error'] = 'one or more required cases did not pass'
+            else:
+                execution = run['task'].get('execution', {'mode': 'full'})
+                if execution.get('mode') != 'full' or execution.get('targets') or execution.get('force_rerun'):
+                    raise RunnerError('this handler does not expose incremental cases')
+                handlers.prepare(run['task']['kind'], run['task']['params'])(source, output)
+                record.update(state='succeeded', exit_code=0)
     except Exception as exc:
         traceback.print_exc()
         record.update(state='failed', exit_code=getattr(exc, 'returncode', 1), error=str(exc))
+    finally:
+        if prepared:
+            snapshot = Path(prepared['root']).resolve()
+            allowed = output.parents[1] / '.incremental-inputs'
+            if snapshot.is_relative_to(allowed.resolve()):
+                shutil.rmtree(snapshot, ignore_errors=True)
     record['finished_at'] = timestamp()
     command_log = output / 'commands.json'
     if command_log.is_file():
@@ -629,20 +708,100 @@ def gpu_count():
     return len(selected)
 
 
-def start_task(queue, source, store, results, worker, fd, available_gpus, task_id=None):
+def prepare_incremental_base(task, store, results, archive_dir, engine):
+    execution = engine.validate_execution(task)
+    base = execution['base']
+    operation = store.lock_dir / f"archive-{base['id']}-v{base['version']}.lock"
+    store.lock_dir.mkdir(parents=True, exist_ok=True)
+    owner = {'claim': uuid.uuid4().hex, 'host_id': host_identity(), 'pid': os.getpid(),
+             'operation': 'prepare-base'}
+    try:
+        operation.mkdir()
+    except FileExistsError as error:
+        try:
+            prior = read_json(operation / 'owner.json')
+        except FileNotFoundError:
+            raise engine.BaseUnavailable('baseline is locked without complete owner metadata') from error
+        if prior.get('host_id') != host_identity():
+            raise engine.BaseUnavailable('baseline archive or preparation is in progress') from error
+        # The original host lock is held and no experiment on this host is active.
+        owner = prior
+    else:
+        write_json(operation / 'owner.json', owner)
+    staging = None
+    try:
+        staging_parent = results / '.incremental-inputs'
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f"{task['id']}-v{task['version']}-", dir=staging_parent))
+        return engine.prepare_base(task, results, archive_dir, staging)
+    except BaseException:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+    finally:
+        remove_owned_directory(operation, owner)
+
+
+def start_task(queue, source, store, results, worker, fd, available_gpus, task_id=None, archive_dir=None):
+    archive_dir = archive_dir or queue.root / 'results-archive'
     for task, digest in queue.tasks(source):
         if task_id is not None and task['id'] != task_id:
             continue
         if not task.get('enabled', True) or task.get('resources', {}).get('gpus', 0) > available_gpus:
             continue
-        row = store.claim(task, digest, source, results, worker)
+        prepared = None
+        waiting = store.status_dir / task_label(task) / f"v{task['version']}.waiting.json"
+        if task.get('execution', {}).get('mode', 'full') == 'incremental':
+            # Cheap checks avoid repeatedly copying a baseline for an already
+            # reserved version. The final claim still uses atomic mkdir.
+            reservation = store.reservation(task['id'], task['version'])
+            if reservation.exists():
+                try:
+                    previous = read_json(reservation / 'owner.json')
+                except FileNotFoundError:
+                    continue
+                if previous.get('task_sha256') != digest:
+                    raise RunnerError(f"task {task['id']} changed without increasing version {task['version']}")
+                waiting.unlink(missing_ok=True)
+                continue
+            if store.guard(task['id']).exists():
+                continue
+            engine = runtime_engine()
+            try:
+                prepared = prepare_incremental_base(task, store, results, archive_dir, engine)
+            except engine.BaseUnavailable as error:
+                if store.reservation(task['id'], task['version']).exists():
+                    waiting.unlink(missing_ok=True)
+                    continue
+                waiting.parent.mkdir(parents=True, exist_ok=True)
+                write_json(waiting, {'id': task['id'], 'slug': task['slug'], 'name': task['name'],
+                                     'version': task['version'], 'command': task['command'],
+                                     'state': 'waiting_for_base', 'source_commit': source,
+                                     'reason': str(error), 'updated_at': timestamp()})
+                if store.reservation(task['id'], task['version']).exists():
+                    waiting.unlink(missing_ok=True)
+                    continue
+                print(f"task {task['id']} v{task['version']} waiting for baseline: {error}", flush=True)
+                continue
+        try:
+            row = store.claim(task, digest, source, results, worker, prepared)
+        except BaseException:
+            if prepared:
+                shutil.rmtree(prepared['root'], ignore_errors=True)
+            raise
         if row is None:
+            if prepared:
+                shutil.rmtree(prepared['root'], ignore_errors=True)
             continue
+        waiting.unlink(missing_ok=True)
         output = run_path(results, row)
         output.mkdir(parents=True)
         script = Path(__file__).resolve()
-        write_json(output / 'run.json', {**row, 'task': task, 'lock_dir': str(store.lock_dir),
-                                      'runner_sha256': hashlib.sha256(script.read_bytes()).hexdigest()})
+        run = {**row, 'task': task, 'lock_dir': str(store.lock_dir),
+               'runner_sha256': hashlib.sha256(script.read_bytes()).hexdigest()}
+        if prepared:
+            run['prepared_base'] = prepared
+        write_json(output / 'run.json', run)
         env = {**os.environ, 'GPU_NET_SIM_LOCK_FD': str(fd)}
         with (output / 'worker.log').open('wb') as log:
             child = subprocess.Popen([sys.executable, str(script), '--_execute', str(output)],
@@ -677,7 +836,7 @@ def poll(queue, store, args, fd):
             store.archive_receipts(queue.archived_receipts(source), args.results_dir, archive_dir,
                                    active[2] if active else None)
             if active is None:
-                active = start_task(queue, source, store, args.results_dir, args.worker_id, fd, args.gpu_count, getattr(args, 'task', None))
+                active = start_task(queue, source, store, args.results_dir, args.worker_id, fd, args.gpu_count, getattr(args, 'task', None), archive_dir)
                 if active is None and args.once:
                     return 0
         except (RunnerError, OSError, ValueError) as exc:

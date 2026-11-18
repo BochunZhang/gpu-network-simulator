@@ -1,14 +1,17 @@
 {
   "id": "000",
   "name": "GB200 four-GPU hardware inventory",
-  "version": 1,
+  "version": 2,
   "kind": "gpu_inventory",
   "params": {},
   "resources": {
     "gpus": 4
   },
   "enabled": true,
-  "description": "Record all four NVIDIA GPUs, memory, SM capability, NVLink topology, driver and build tools.",
+  "description": "Collect fresh GB200 hardware, toolchain and NVLink cases and publish a validated per-case artifact manifest for later incremental versions.",
   "slug": "system-info",
-  "command": "bash tools/runner.sh --task 000 --once"
+  "command": "bash tools/runner.sh --task 000 --once",
+  "execution": {
+    "mode": "full"
+  }
 }
