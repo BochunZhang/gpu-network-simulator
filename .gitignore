@@ -1,3 +1,4 @@
 /results/
+/status/*/
 __pycache__/
 *.py[cod]

@@ -1,7 +1,8 @@
 {
   "id": 3,
-  "version": 1,
+  "version": 2,
   "kind": "days_cuda_smoke",
   "params": {},
-  "description": "Compare Days AGO Scalar, CPU, and CUDA native TCP fixture fingerprints on a supported GPU."
+  "description": "Compare Days AGO Scalar, CPU, and CUDA native TCP fixture fingerprints on a supported GPU.",
+  "worker": "gpu01"
 }

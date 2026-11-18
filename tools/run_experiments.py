@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one allowlisted experiment at a time from a Git-backed queue."""
+"""Run assigned scientific experiments from a pull-only Git queue."""
 
 import argparse
 import contextlib
@@ -8,7 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import socket
 import subprocess
@@ -20,15 +20,13 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 
-import experiment_handlers
-
-
 LOCK_PATH = Path("/tmp/gpu-network-simulator.lock")
 POLL_SECONDS = 10
 TERMINAL = {"succeeded", "failed", "abandoned"}
 RESULT_SUFFIXES = {".json", ".csv", ".txt"}
 FILE_LIMIT = 2 * 1024**2
 ARCHIVE_LIMIT = 16 * 1024**2
+WORKER_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
 
 
 class RunnerError(Exception):
@@ -62,8 +60,26 @@ def write_json(path, value):
     tmp.replace(path)
 
 
-def status_path(task_id, version):
-    return f"status/{task_id:06d}/v{version}.json"
+def validate_worker(worker):
+    if not isinstance(worker, str) or not re.fullmatch(WORKER_PATTERN, worker):
+        raise RunnerError("worker must be a 1-64 character identifier using letters, digits, _, . or -")
+    return worker
+
+
+def validate_record(row, path):
+    if (
+        not isinstance(row, dict)
+        or type(row.get("id")) is not int or row["id"] < 1
+        or type(row.get("version")) is not int or row["version"] < 1
+        or row.get("state") not in TERMINAL | {"running"}
+        or not isinstance(row.get("claim"), str)
+        or not isinstance(row.get("host_id"), str)
+        or not isinstance(row.get("task_sha256"), str)
+        or not isinstance(row.get("source_commit"), str)
+    ):
+        raise RunnerError(f"invalid local execution record: {path}")
+    validate_worker(row.get("worker"))
+    return row
 
 
 @contextlib.contextmanager
@@ -81,77 +97,30 @@ def device_lock(path):
 
 
 class Queue:
-    def __init__(self, root, source_branch, status_branch):
+    def __init__(self, root, source_branch="main"):
         self.root = root
         self.source_ref = f"refs/heads/{source_branch}"
-        self.status_ref = f"refs/heads/{status_branch}"
-        self.status_snapshot = ("", {})
-        if self.source_ref == self.status_ref:
-            raise RunnerError("source and status branches must be different")
-        for ref in (self.source_ref, self.status_ref):
-            self.git("check-ref-format", ref)
+        self.git("check-ref-format", self.source_ref)
 
-    def git(self, *args, input_text=None, env=None, check=True, timeout=30):
+    def git(self, *args, timeout=30):
         try:
             proc = subprocess.run(
-                ["git", *args],
-                cwd=self.root,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})},
-                input=input_text,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
+                ["git", *args], cwd=self.root,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                text=True, encoding="utf-8", errors="replace", capture_output=True,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
             raise RunnerError(f"git {args[0]} timed out after {timeout} seconds") from exc
-        if proc.returncode and check:
+        if proc.returncode:
             raise RunnerError(f"git {args[0]}: {proc.stderr.strip() or proc.stdout.strip()}")
         return proc
 
-    def fetch(self, ref, local_ref):
-        self.git("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin", f"+{ref}:{local_ref}")
-        return self.git("rev-parse", local_ref).stdout.strip()
-
     def source(self):
-        return self.fetch(self.source_ref, "refs/gpu-network-simulator/source")
-
-    def statuses(self):
-        remote = self.git("ls-remote", "--heads", "origin", self.status_ref).stdout.strip()
-        if not remote:
-            return "", {}
-        head = remote.split()[0]
-        if head == self.status_snapshot[0]:
-            return self.status_snapshot
-        local_ref = "refs/gpu-network-simulator/status"
-        local = self.git("rev-parse", "--verify", local_ref, check=False).stdout.strip()
-        if head != local:
-            head = self.fetch(self.status_ref, local_ref)
-        rows = {}
-        for path in self.git("ls-tree", "-rz", "--name-only", head, "--", "status/").stdout.split("\0"):
-            if re.fullmatch(r"status/\d{6,}/v[1-9]\d*\.json", path):
-                row = self.json_at(head, path)
-                if (
-                    type(row.get("id")) is not int
-                    or type(row.get("version")) is not int
-                    or path != status_path(row["id"], row["version"])
-                    or row.get("state") not in TERMINAL | {"running"}
-                    or not isinstance(row.get("claim"), str)
-                ):
-                    raise RunnerError(f"invalid status: {path}")
-                rows[row["id"], row["version"]] = row
-        self.status_snapshot = head, rows
-        return self.status_snapshot
-
-    def json_at(self, head, path):
-        try:
-            value = json.loads(self.git("show", f"{head}:{path}").stdout)
-        except ValueError as exc:
-            raise RunnerError(f"invalid JSON at {head}:{path}: {exc}") from exc
-        if not isinstance(value, dict):
-            raise RunnerError(f"expected object at {head}:{path}")
-        return value
+        local_ref = "refs/gpu-network-simulator/source"
+        self.git("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin",
+                 f"+{self.source_ref}:{local_ref}")
+        return self.git("rev-parse", local_ref).stdout.strip()
 
     def tasks(self, source):
         paths = self.git("ls-tree", "-rz", "--name-only", source, "--", "tasks/").stdout.split("\0")
@@ -159,8 +128,13 @@ class Queue:
         for path in paths:
             if not path.endswith(".json"):
                 continue
-            task = self.json_at(source, path)
+            task = json.loads(self.git("show", f"{source}:{path}").stdout)
+            if not isinstance(task, dict):
+                raise RunnerError(f"expected task object: {path}")
             task_id, version = task.get("id"), task.get("version")
+            if "worker" not in task:
+                raise RunnerError(f"task requires explicit worker assignment: {path}")
+            validate_worker(task["worker"])
             if (
                 type(task_id) is not int or task_id < 1
                 or path != f"tasks/{task_id:06d}.json"
@@ -168,10 +142,10 @@ class Queue:
                 or not isinstance(task.get("kind"), str)
                 or not isinstance(task.get("params"), dict)
                 or not isinstance(task.get("description", ""), str)
-                or set(task) - {"id", "version", "kind", "params", "description"}
+                or set(task) - {"id", "version", "worker", "kind", "params", "description"}
             ):
                 raise RunnerError(f"invalid task manifest: {path}")
-            definition = {k: v for k, v in task.items() if k != "description"}
+            definition = {key: value for key, value in task.items() if key != "description"}
             try:
                 digest = hashlib.sha256(encode(definition).encode("utf-8")).hexdigest()
             except ValueError as exc:
@@ -179,36 +153,55 @@ class Queue:
             tasks.append((task, digest))
         return sorted(tasks, key=lambda item: item[0]["id"])
 
-    def publish(self, parent, row):
-        task_id, version = row["id"], row["version"]
-        with tempfile.TemporaryDirectory(prefix="gpu-network-simulator-index-") as temp:
-            env = {
-                "GIT_INDEX_FILE": str(Path(temp) / "index"),
-                "GIT_AUTHOR_NAME": "GPU Network Simulator",
-                "GIT_AUTHOR_EMAIL": "gpu-network-simulator@localhost",
-                "GIT_COMMITTER_NAME": "GPU Network Simulator",
-                "GIT_COMMITTER_EMAIL": "gpu-network-simulator@localhost",
-            }
-            self.git("read-tree", parent or "--empty", env=env)
-            blob = self.git("hash-object", "-w", "--stdin", input_text=encode(row)).stdout.strip()
-            self.git("update-index", "--add", "--cacheinfo", f"100644,{blob},{status_path(task_id, version)}", env=env)
-            tree = self.git("write-tree", env=env).stdout.strip()
-            parents = ["-p", parent] if parent else []
-            commit = self.git(
-                "commit-tree", tree, *parents, "-m", f"Task {task_id} v{version}: {row['state']}", env=env
-            ).stdout.strip()
-        # Every write is a child of the observed head. The lease also covers
-        # initialization and a remote reset where a normal push could fast-forward.
-        push = self.git(
-            "push", "--porcelain", f"--force-with-lease={self.status_ref}:{parent}",
-            "origin", f"{commit}:{self.status_ref}", check=False,
-        )
-        if push.returncode:
-            print(f"status push not confirmed: {push.stderr.strip() or push.stdout.strip()}", file=sys.stderr)
-        return push.returncode == 0
+
+class StatusStore:
+    def __init__(self, root, worker):
+        self.root = root / validate_worker(worker)
+        self.worker = worker
+
+    def path(self, task_id, version):
+        return self.root / f"{task_id:06d}" / f"v{version}.json"
+
+    def read(self):
+        rows = {}
+        for path in sorted(self.root.glob("*/v*.json")):
+            row = validate_record(json.loads(path.read_text(encoding="utf-8")), path)
+            if row["worker"] != self.worker or path != self.path(row["id"], row["version"]):
+                raise RunnerError(f"local status path does not match execution record: {path}")
+            rows[row["id"], row["version"]] = row
+        return rows
+
+    def save(self, row):
+        validate_record(row, self.root)
+        if row["worker"] != self.worker:
+            raise RunnerError("execution worker does not match local status directory")
+        path = self.path(row["id"], row["version"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, row)
+
+    def reconcile(self, results):
+        rows = self.read()
+        for path in sorted(results.glob("*/v*/result.json")):
+            row = validate_record(json.loads(path.read_text(encoding="utf-8")), path)
+            if row["worker"] != self.worker or path.parent != run_path(results, row):
+                raise RunnerError(f"result path or worker does not match local queue: {path}")
+            if row["state"] not in TERMINAL:
+                raise RunnerError(f"result is not terminal: {path}")
+            current = rows.get((row["id"], row["version"]))
+            if current:
+                immutable = ("claim", "host_id", "worker", "source_commit", "task_sha256")
+                if any(current[key] != row[key] for key in immutable):
+                    raise RunnerError(f"result does not match local execution record: {path}")
+                if current["state"] in TERMINAL:
+                    if current["state"] != row["state"]:
+                        raise RunnerError(f"result and local status disagree: {path}")
+                    continue
+            self.save(row)
+            rows[row["id"], row["version"]] = row
+        return rows
 
 
-def validate_task(task, handlers=experiment_handlers):
+def validate_task(task, handlers):
     try:
         return handlers.prepare(task["kind"], task["params"])
     except ValueError as exc:
@@ -255,7 +248,6 @@ def execute(queue, output):
     run = json.loads((output / "run.json").read_text(encoding="utf-8"))
     record = dict(run)
     try:
-        validate_task(run["task"])
         with tempfile.TemporaryDirectory(prefix="gpu-network-simulator-source-") as temp:
             source = Path(temp) / "source"
             queue.git("worktree", "add", "--detach", str(source), run["source_commit"], timeout=180)
@@ -267,8 +259,7 @@ def execute(queue, output):
                 spec = importlib.util.spec_from_file_location("pinned_experiment_handlers", pinned)
                 handlers = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(handlers)
-                handler = validate_task(run["task"], handlers)
-                handler(source, output)
+                validate_task(run["task"], handlers)(source, output)
             finally:
                 queue.git("worktree", "remove", "--force", str(source), timeout=180)
         record.update(state="succeeded", exit_code=0)
@@ -285,90 +276,60 @@ def execute(queue, output):
     return int(record["state"] != "succeeded")
 
 
-def flush_terminal(queue, results, head, statuses):
-    for path in sorted(results.glob("*/v*/result.json")):
-        ack = path.with_name(".status-published")
-        if ack.exists():
-            continue
-        row = json.loads(path.read_text(encoding="utf-8"))
-        remote = statuses.get((row["id"], row["version"]))
-        if not remote or remote["claim"] != row["claim"]:
-            raise RunnerError(f"no matching remote claim for {path}")
-        if remote["state"] == "running":
-            terminal = {**remote, **{key: row[key] for key in ("state", "finished_at", "exit_code")}}
-            if not queue.publish(head, terminal):
-                raise RunnerError(f"status update pending for {path}")
-            head, statuses = queue.statuses()
-        elif remote["state"] != row["state"]:
-            print(f"retaining local result for {path}; remote state is {remote['state']}", file=sys.stderr)
-        ack.touch()
-    return head, statuses
-
-
-def start_task(queue, source, head, statuses, results, worker, fd):
+def start_task(queue, source, store, statuses, results, fd):
+    unfinished = next((row for row in statuses.values() if row["state"] == "running"), None)
+    if unfinished:
+        raise RunnerError(
+            f"unfinished local execution {unfinished['id']} v{unfinished['version']}; "
+            f"after confirming it stopped, use --abandon {unfinished['id']} {unfinished['version']}"
+        )
     for task, digest in queue.tasks(source):
+        if task["worker"] != store.worker:
+            continue
         task_id, version = task["id"], task["version"]
         prior = [row for (i, _), row in statuses.items() if i == task_id]
         current = statuses.get((task_id, version))
-        if current and current.get("task_sha256") != digest:
+        if current and current["task_sha256"] != digest:
             raise RunnerError(f"task {task_id} changed without increasing version {version}")
-        if any(row["version"] >= version or row["state"] == "running" for row in prior):
+        if any(row["version"] >= version for row in prior):
             continue
-        validate_task(task)
         row = {
-            "id": task_id,
-            "version": version,
-            "kind": task["kind"],
-            "task_sha256": digest,
-            "source_commit": source,
-            "worker": worker,
-            "host_id": host_identity(),
-            "claim": uuid.uuid4().hex,
-            "state": "running",
-            "claimed_at": timestamp(),
+            "id": task_id, "version": version, "kind": task["kind"],
+            "task_sha256": digest, "source_commit": source,
+            "worker": store.worker, "host_id": host_identity(),
+            "claim": uuid.uuid4().hex, "state": "running", "claimed_at": timestamp(),
         }
         output = run_path(results, row)
         if output.exists():
             raise RunnerError(f"local result path already exists: {output}")
-        if not queue.publish(head, row):
-            raise RunnerError(f"claim not confirmed for task {task_id} v{version}")
+        # Persist before launching. A crash here requires local abandonment.
+        store.save(row)
         output.mkdir(parents=True)
         script = Path(__file__).resolve()
-        runner_sha256 = {
-            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in (script, Path(experiment_handlers.__file__))
-        }
+        runner_sha256 = {script.name: hashlib.sha256(script.read_bytes()).hexdigest()}
         write_json(output / "run.json", {**row, "task": task, "runner_sha256": runner_sha256})
         env = {**os.environ, "GPU_NET_SIM_LOCK_FD": str(fd)}
         with (output / "worker.log").open("wb") as log:
             child = subprocess.Popen(
                 [sys.executable, str(script), "--_execute", str(output)],
-                env=env,
-                start_new_session=True,
-                stdout=log,
-                stderr=subprocess.STDOUT,
+                env=env, start_new_session=True, stdout=log, stderr=subprocess.STDOUT,
                 pass_fds=(fd,),
             )
         print(f"running task {task_id} v{version} at {source[:12]} in {output}", flush=True)
         return child, output
 
 
-def abandon(queue, results, task_id, version, worker):
-    head, statuses = queue.statuses()
-    head, statuses = flush_terminal(queue, results, head, statuses)
-    row = statuses.get((task_id, version))
+def abandon(store, results, task_id, version):
+    row = store.reconcile(results).get((task_id, version))
     if not row or row["state"] != "running":
-        raise RunnerError(f"task {task_id} v{version} has no running claim")
-    # The caller holds the same device lock as the original dispatcher and
-    # experiment. Only that host can attest that they no longer hold it.
-    if row.get("host_id") != host_identity():
-        raise RunnerError("abandonment requires the claiming host")
-    if not queue.publish(head, {**row, "state": "abandoned", "finished_at": timestamp(), "abandoned_by": worker}):
-        raise RunnerError("abandonment not confirmed; inspect remote status")
+        raise RunnerError(f"task {task_id} v{version} has no running local execution")
+    if row["host_id"] != host_identity():
+        raise RunnerError("abandonment requires the original execution host")
+    store.save({**row, "state": "abandoned", "finished_at": timestamp()})
     print(f"abandoned task {task_id} v{version}; raise its version to rerun")
 
 
-def poll(queue, args, fd):
+def poll(queue, store, args, fd):
     active = None
     while True:
         result = None
@@ -377,17 +338,17 @@ def poll(queue, args, fd):
             result = child.returncode
             if not (output / "result.json").is_file():
                 print(f"worker exited without a terminal record: {output}", file=sys.stderr)
-                result = 1
+                return 1
             active = None
         next_poll = time.monotonic() + POLL_SECONDS
         try:
-            head, statuses = queue.statuses()
-            head, statuses = flush_terminal(queue, args.results_dir, head, statuses)
-            source = queue.source()
+            # Finish local bookkeeping even when the public origin is offline.
+            statuses = store.reconcile(args.results_dir)
             if args.once and result is not None:
-                return max(1, result) if result else 0
+                return int(result != 0)
+            source = queue.source()
             if active is None:
-                active = start_task(queue, source, head, statuses, args.results_dir, args.worker_id, fd)
+                active = start_task(queue, source, store, statuses, args.results_dir, fd)
                 if active is None and args.once:
                     return 0
         except (RunnerError, OSError, ValueError) as exc:
@@ -411,28 +372,30 @@ def main():
         fd = int(os.environ["GPU_NET_SIM_LOCK_FD"])
         if not os.path.samestat(os.fstat(fd), LOCK_PATH.stat()):
             raise RunnerError("worker has no inherited device lock")
-        return execute(Queue(root, "main", "experiment-status"), Path(sys.argv[2]))
+        return execute(Queue(root), Path(sys.argv[2]))
 
     cli = argparse.ArgumentParser(description=__doc__)
     mode = cli.add_mutually_exclusive_group()
-    mode.add_argument("--once", action="store_true", help="claim and finish at most one task")
+    mode.add_argument("--once", action="store_true", help="finish at most one assigned task")
     mode.add_argument(
         "--abandon", nargs=2, metavar=("ID", "VERSION"), type=int,
-        help="mark a running claim after confirming its experiment process has stopped",
+        help="locally mark a stopped experiment after confirming its process has exited",
     )
     cli.add_argument("--source-branch", default="main")
-    cli.add_argument("--status-branch", default="experiment-status")
+    cli.add_argument("--status-dir", type=Path, default=root / "status")
     cli.add_argument("--results-dir", type=Path, default=root / "results")
-    cli.add_argument("--worker-id", default=socket.gethostname())
+    cli.add_argument("--worker-id", default="gpu01")
     args = cli.parse_args()
+    args.status_dir = args.status_dir.resolve()
     args.results_dir = args.results_dir.resolve()
     try:
         with device_lock(LOCK_PATH) as fd:
-            queue = Queue(root, args.source_branch, args.status_branch)
+            store = StatusStore(args.status_dir, args.worker_id)
             if args.abandon:
-                abandon(queue, args.results_dir, *args.abandon, args.worker_id)
+                abandon(store, args.results_dir, *args.abandon)
                 return 0
-            return poll(queue, args, fd)
+            print(f"pull-only worker {store.worker}; local status {store.root}", flush=True)
+            return poll(Queue(root, args.source_branch), store, args, fd)
     except (RunnerError, OSError, ValueError) as exc:
         print(exc, file=sys.stderr)
         return 1
