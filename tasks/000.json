@@ -1,17 +1,23 @@
 {
   "id": "000",
   "name": "GB200 four-GPU hardware inventory",
-  "version": 2,
+  "version": 3,
   "kind": "gpu_inventory",
   "params": {},
   "resources": {
     "gpus": 4
   },
   "enabled": true,
-  "description": "Collect fresh GB200 hardware, toolchain and NVLink cases and publish a validated per-case artifact manifest for later incremental versions.",
+  "description": "Validate incremental execution against the completed v2 baseline: refresh live probes and reuse only compatible derived artifacts.",
   "slug": "system-info",
   "command": "bash tools/runner.sh --task 000 --once",
   "execution": {
-    "mode": "full"
+    "mode": "incremental",
+    "base": {
+      "id": "000",
+      "version": 2,
+      "artifacts_manifest_sha256": "3eb996f919b1545a53e1d970a5b0d02fc55a60dd266e09bb450f76f684e3e0a4"
+    },
+    "reuse": "verified-compatible"
   }
 }
