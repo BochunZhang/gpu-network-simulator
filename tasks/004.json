@@ -1,0 +1,14 @@
+{
+  "id": "004",
+  "name": "GeDES fixed-workload transport drain audit",
+  "slug": "gedes-drain",
+  "version": 1,
+  "command": "bash tools/runner.sh --task 004 --once",
+  "kind": "gedes_drain",
+  "params": {},
+  "resources": {
+    "gpus": 1
+  },
+  "enabled": true,
+  "description": "Check flow, TCP and queue drain in the fixed GeDES k4 and k8 fixtures, with a real one-round early-stop control."
+}

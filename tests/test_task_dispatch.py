@@ -11,17 +11,22 @@ import experiment_handlers as handlers
 
 
 class TaskDispatchTest(unittest.TestCase):
-    def test_new_transfer_handler_uses_pinned_file_and_helpers(self):
+    def test_external_handlers_use_pinned_file_and_helpers(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'tools').mkdir()
             (root / 'output').mkdir()
-            (root / 'tools/gpu_transfer.py').write_text(
-                'def run(source, output, helpers):\n'
-                '    (output / "dispatch.txt").write_text(str(source) + helpers.GEDES[1])\n')
-            with patch.dict(sys.modules, {'gpu_transfer': types.ModuleType('old_gpu_transfer')}):
-                handlers.prepare('gpu_transfer', {})(root, root / 'output')
-            self.assertEqual((root / 'output/dispatch.txt').read_text(), str(root) + handlers.GEDES[1])
+            for kind in ('gpu_transfer', 'gedes_drain', 'nsx_single_gpu', 'nsx_four_gpu'):
+                with self.subTest(kind=kind):
+                    (root / 'tools' / f'{kind}.py').write_text(
+                        'def run(source, output, helpers):\n'
+                        f'    (output / "{kind}.txt").write_text(str(source) + helpers.GEDES[1])\n')
+                    with patch.dict(sys.modules, {kind: types.ModuleType(f'old_{kind}')}):
+                        handlers.prepare(kind, {})(root, root / 'output')
+                    self.assertEqual((root / 'output' / f'{kind}.txt').read_text(),
+                                     str(root) + handlers.GEDES[1])
+                    with self.assertRaises(ValueError):
+                        handlers.prepare(kind, {'override': True})
 
     def test_audit_finalize_keeps_its_task_version_support(self):
         with tempfile.TemporaryDirectory() as temporary:

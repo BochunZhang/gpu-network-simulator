@@ -1,6 +1,7 @@
 """Fixed scientific experiment handlers. Task manifests cannot supply commands or URLs."""
 
 import csv
+from functools import partial
 import hashlib
 import importlib.util
 import inspect
@@ -41,8 +42,8 @@ def _support_module(source, name):
     return _SUPPORT_MODULES[key]
 
 
-def _gpu_transfer(source, output):
-    _support_module(source, 'gpu_transfer').run(source, output, sys.modules[__name__])
+def _run_pinned(kind, source, output):
+    _support_module(source, kind).run(source, output, sys.modules[__name__])
 
 
 def write_json(path, result):
@@ -426,7 +427,9 @@ def days_cuda_smoke(source: Path, output: Path):
 
 def prepare(kind, params):
     handlers = {"gpu_inventory": inventory, "gedes_smoke": gedes_smoke,
-                "days_cuda_smoke": days_cuda_smoke, "gpu_transfer": _gpu_transfer}
+                "days_cuda_smoke": days_cuda_smoke}
+    if params == {} and kind in {"gpu_transfer", "gedes_drain", "nsx_single_gpu", "nsx_four_gpu"}:
+        return partial(_run_pinned, kind)
     if kind not in handlers or params != {}:
         raise ValueError(f"unsupported task kind or parameters: {kind!r}")
     return handlers[kind]
