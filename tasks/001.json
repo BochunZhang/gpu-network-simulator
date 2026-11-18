@@ -1,14 +1,14 @@
 {
   "id": "001",
   "name": "GeDES completion and single-GPU timing audit",
-  "version": 2,
+  "version": 3,
   "kind": "gedes_audit",
   "params": {},
   "resources": {
     "gpus": 1
   },
   "enabled": true,
-  "description": "Build a pinned host-instrumented GeDES binary, run k4 and repeated k8 cases, record upstream completion and separate normal from detailed host timing.",
+  "description": "Fix the flow-start queue allocation, then rerun the pinned k4 and k8 cases with post-sync TCP-node and channel-block completion counts.",
   "slug": "gedes-smoke",
   "command": "bash tools/runner.sh --task 001 --once",
   "execution": {

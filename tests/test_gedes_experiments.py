@@ -28,6 +28,9 @@ void SetFlowTimeRange(int) {}
 void create_thread_pool(int) {}
 void SetInitialMemoryPoolSize(int) {}
 void InitializeMemoryPools() {}
+struct CompletionCounts {
+ int64_t completed_nodes, total_nodes, completed_channel_blocks, total_channel_blocks;
+};
 struct Topology {
  int rounds = 0;
  void SetFattreeProperties(int,int,int,int) {}
@@ -44,6 +47,14 @@ struct Topology {
 #else
  return rounds >= 3;
 #endif
+ }
+ int ReadCompletionCounts(CompletionCounts &counts) const {
+#ifdef FIXTURE_NEVER_FINISH
+   counts = {16, 16, 2, 3};
+#else
+   counts = {16, 16, 3, 3};
+#endif
+   return 0;
  }
  void RunGraph() { ++rounds; }
  void RecordFlowResults(std::string path) {
@@ -75,9 +86,11 @@ int main(int argc, char *argv[]) {
 '''
 
 
-def run_line(detail=False, finished=True, rounds=3):
+def run_line(detail=False, finished=True, rounds=3, hosts=16, channel_blocks=3):
     return ('record=gedes_run rounds=' + str(rounds) + ' max_rounds=1000000 '
             f'upstream_finished={int(finished)} detail={int(detail)} '
+            f'completed_nodes={hosts} total_nodes={hosts} '
+            f'completed_channel_blocks={channel_blocks - int(not finished)} total_channel_blocks={channel_blocks} '
             'init_seconds=0.1 loop_seconds=0.2 tail_sync_seconds=0.01 output_seconds=0.03 '
             f'finish_check_seconds={0.001 if detail else -1} run_graph_seconds={0.15 if detail else -1}\n')
 
@@ -106,7 +119,8 @@ class Helpers:
         k = int(next(item.split('=', 1)[1] for item in args if item.startswith('--ft_k=')))
         write_flows(Path(output), k ** 3 // 4)
         log.write_text(run_line(detail='--audit_detail=1' in args, finished=self.finished,
-                                rounds=3 if self.finished else audit.MAX_ROUNDS))
+                                rounds=3 if self.finished else audit.MAX_ROUNDS,
+                                hosts=k ** 3 // 4, channel_blocks=3 * k ** 3 // 64))
         return 0.4
 
 
@@ -147,6 +161,8 @@ class GeDESAuditTest(unittest.TestCase):
         measured = audit.parse_audit(result.stdout)
         self.assertEqual(measured['rounds'], audit.MAX_ROUNDS)
         self.assertEqual(measured['upstream_finished'], 0)
+        self.assertEqual(measured['completed_channel_blocks'], 2)
+        self.assertEqual(measured['total_channel_blocks'], 3)
         self.assertIn('completion predicate', audit.validate_run(
             measured, audit.flow_statistics(self.root / 'flows.csv', 16), False)[0])
 
@@ -173,6 +189,13 @@ class GeDESAuditTest(unittest.TestCase):
         self.assertNotIn('g++-12', result)
         self.assertEqual(result.count('${CMAKE_CURRENT_SOURCE_DIR}'), 2)
 
+    def test_flow_start_queue_capacity_covers_generated_timestamps(self):
+        original = '    GPUQueue<int64_t> *flow_start_instants = create_gpu_queue<int64_t>(100);'
+        patched = audit.fix_flow_start_queue(original)
+        self.assertIn('std::max<size_t>(100, m_flow_start_instants.size())', patched)
+        with self.assertRaisesRegex(ValueError, 'flow-start queue layout'):
+            audit.fix_flow_start_queue(original.replace('(100)', '(200)'))
+
     def test_measurement_and_csv_gates_reject_false_completion_and_invalid_records(self):
         for text in ('', run_line() + run_line(), run_line().replace('loop_seconds=0.2', 'loop_seconds=nan'),
                      run_line().replace('finish_check_seconds=-1', 'finish_check_seconds=0')):
@@ -184,6 +207,9 @@ class GeDESAuditTest(unittest.TestCase):
         measured = audit.parse_audit(run_line(finished=False, rounds=audit.MAX_ROUNDS))
         failures = audit.validate_run(measured, flows, False)
         self.assertEqual(len(failures), 2)
+        measured['completed_channel_blocks'] = measured['total_channel_blocks']
+        self.assertIn('completion readback disagrees with the upstream finish flag',
+                      audit.validate_run(measured, flows, False))
         self.assertEqual(flows['valid_completed_rows'], 15)
         # Completion timestamps do not enter the reported input digest.
         input_digest = flows['reported_input_sha256']
@@ -206,6 +232,8 @@ class GeDESAuditTest(unittest.TestCase):
         self.assertFalse(summary['passed'])
         self.assertEqual(summary['flows']['valid_completed_rows'], 128)
         self.assertEqual(summary['measurements']['rounds'], audit.MAX_ROUNDS)
+        self.assertEqual(summary['measurements']['completed_nodes'], 128)
+        self.assertEqual(summary['measurements']['completed_channel_blocks'], 23)
         self.assertIn('transport drain unverified', summary['scope'])
 
     def test_build_failure_keeps_log_tail_in_downloadable_feedback(self):

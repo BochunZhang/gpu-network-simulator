@@ -87,6 +87,12 @@ AUDIT_BODY = r'''    std::cout << "Building Network" << std::endl;
         std::cerr << "Cuda error: " << cudaGetErrorString(audit_sync_error != cudaSuccess ? audit_sync_error : audit_last_error) << std::endl;
         return 1;
     }
+    VDES::CompletionCounts audit_counts{};
+    const auto audit_readback_error = topology.ReadCompletionCounts(audit_counts);
+    if (audit_readback_error != cudaSuccess) {
+        std::cerr << "GeDES completion readback failed: " << cudaGetErrorString(audit_readback_error) << std::endl;
+        return 1;
+    }
     const auto audit_output_start = AuditClock::now();
     topology.RecordFlowResults(output_file_name);
     const auto audit_output_end = AuditClock::now();
@@ -94,6 +100,10 @@ AUDIT_BODY = r'''    std::cout << "Building Network" << std::endl;
               << "record=gedes_run rounds=" << audit_rounds
               << " max_rounds=" << audit_max_rounds
               << " upstream_finished=" << (audit_upstream_finished ? 1 : 0)
+              << " completed_nodes=" << audit_counts.completed_nodes
+              << " total_nodes=" << audit_counts.total_nodes
+              << " completed_channel_blocks=" << audit_counts.completed_channel_blocks
+              << " total_channel_blocks=" << audit_counts.total_channel_blocks
               << " detail=" << (audit_detail ? 1 : 0)
               << " init_seconds=" << std::chrono::duration<double>(audit_init_end - audit_init_start).count()
               << " loop_seconds=" << audit_loop_seconds
@@ -144,12 +154,70 @@ def seed_workload(original):
         '      static std::mt19937 gen(41U);'), 1)
 
 
+def fix_flow_start_queue(original):
+    anchor = '    GPUQueue<int64_t> *flow_start_instants = create_gpu_queue<int64_t>(100);'
+    if original.count(anchor) != 1:
+        raise ValueError('unexpected GeDES flow-start queue layout')
+    # Preserve the original minimum capacity for smaller cases.
+    return original.replace(anchor, anchor.replace(
+        '(100)', '(std::max<size_t>(100, m_flow_start_instants.size()))'), 1)
+
+
+def patch_completion_headers(source, output):
+    timer_anchor = '    class VDESTimer\n'
+    timer_counts = '''    struct CompletionCounts
+    {
+        int64_t completed_nodes;
+        int64_t total_nodes;
+        int64_t completed_channel_blocks;
+        int64_t total_channel_blocks;
+    };
+
+'''
+    timer_finish_anchor = '        bool IsFinished();\n'
+    topology_finish_anchor = '    bool IsFinished();\n'
+    timer_readback = '''
+        cudaError_t ReadCompletionCounts(CompletionCounts &counts) const
+        {
+            counts.total_nodes = m_node_num_gpu;
+            counts.total_channel_blocks = m_ch_block_num_gpu;
+            const auto status = cudaMemcpy(&counts.completed_nodes, m_completed_node_num_gpu,
+                                           sizeof(counts.completed_nodes), cudaMemcpyDeviceToHost);
+            if (status != cudaSuccess) return status;
+            return cudaMemcpy(&counts.completed_channel_blocks, m_ch_completed_ch_num_gpu,
+                              sizeof(counts.completed_channel_blocks), cudaMemcpyDeviceToHost);
+        }
+'''
+    topology_readback = '''
+    cudaError_t ReadCompletionCounts(CompletionCounts &counts) const
+    {
+      return m_timer_comtroller.ReadCompletionCounts(counts);
+    }
+'''
+    patched_hashes = {}
+    for name, insertions in (
+            ('vdes_timer.h', ((timer_anchor, timer_counts + timer_anchor),
+                              (timer_finish_anchor, timer_finish_anchor + timer_readback))),
+            ('topology.h', ((topology_finish_anchor, topology_finish_anchor + topology_readback),))):
+        path = source / 'code/c++/include' / name
+        patched = path.read_text()
+        for anchor, replacement in insertions:
+            if patched.count(anchor) != 1:
+                raise ValueError(f'unexpected GeDES completion layout in {name}')
+            patched = patched.replace(anchor, replacement, 1)
+        path.write_text(patched)
+        (output / f'{name}-audited.txt').write_text(patched)
+        patched_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return patched_hashes
+
+
 def parse_audit(log):
     lines = [line for line in log.splitlines() if line.startswith('record=gedes_run ')]
     if len(lines) != 1:
         raise ValueError('expected exactly one GeDES completion record')
     fields = dict(item.split('=', 1) for item in lines[0].split()[1:])
-    integers = ('rounds', 'max_rounds', 'upstream_finished', 'detail')
+    integers = ('rounds', 'max_rounds', 'upstream_finished', 'detail',
+                'completed_nodes', 'total_nodes', 'completed_channel_blocks', 'total_channel_blocks')
     seconds = ('init_seconds', 'loop_seconds', 'tail_sync_seconds', 'output_seconds',
                'finish_check_seconds', 'run_graph_seconds')
     try:
@@ -205,6 +273,13 @@ def validate_run(measurements, flows, detail):
         reasons.append('timing mode does not match the requested case')
     if not measurements['upstream_finished']:
         reasons.append('upstream completion predicate was false at loop exit')
+    counts = [(measurements['completed_nodes'], measurements['total_nodes']),
+              (measurements['completed_channel_blocks'], measurements['total_channel_blocks'])]
+    if (measurements['total_nodes'] != flows['expected_rows']
+            or any(total <= 0 or not 0 <= completed <= total for completed, total in counts)):
+        reasons.append('completion readback contains invalid counts')
+    elif bool(measurements['upstream_finished']) != all(completed == total for completed, total in counts):
+        reasons.append('completion readback disagrees with the upstream finish flag')
     if measurements['rounds'] == 0:
         reasons.append('no graph rounds executed')
     if flows['csv_rows'] != flows['expected_rows'] or flows['valid_completed_rows'] != flows['csv_rows']:
@@ -216,7 +291,8 @@ def _source_audit(src):
     paths = ['main.cc', 'code/c++/src/components/topology.cc',
              'code/c++/src/components/vdes_timer.cc', 'code/c++/src/components/vdes_timer_kernel.cu',
              'code/c++/src/transport/tcp_controller.cc', 'code/c++/src/transport/tcp_controller.cu',
-             'code/c++/include/conf.h', 'code/c++/src/config/config.cc']
+             'code/c++/include/conf.h', 'code/c++/src/config/config.cc',
+             'code/c++/include/topology.h', 'code/c++/include/vdes_timer.h']
     return {
         'revision': UPSTREAM_REVISION,
         'files': {name: hashlib.sha256((src / name).read_bytes()).hexdigest() for name in paths},
@@ -229,6 +305,8 @@ def _source_audit(src):
             'kernel_instrumentation': False,
             'protocol_modifications': False,
             'workload_rng': 'active CreateFlows exponential generator seeded to 41U',
+            'flow_start_queue': 'capacity covers all generated start timestamps',
+            'completion_readback': 'post-sync timer node and channel-block reductions',
             'v1_workload_equivalence': 'not asserted; upstream used random_device',
         },
     }
@@ -250,9 +328,10 @@ def _build_impl(output, dependencies, helpers):
         patched_main = instrument_main(original_main)
         patched_cmake = patch_cmake(original_cmake)
         topology_file = src / 'code/c++/src/components/topology.cc'
-        seeded_topology = seed_workload(topology_file.read_text())
-        topology_file.write_text(seeded_topology)
-        (output / 'topology-seeded.txt').write_text(seeded_topology)
+        patched_topology = fix_flow_start_queue(seed_workload(topology_file.read_text()))
+        topology_file.write_text(patched_topology)
+        (output / 'topology-audited.txt').write_text(patched_topology)
+        header_hashes = patch_completion_headers(src, output)
         (src / 'main.cc').write_text(patched_main)
         (src / 'CMakeLists.txt').write_text(patched_cmake)
         (output / 'main-audited.txt').write_text(patched_main)
@@ -267,7 +346,8 @@ def _build_impl(output, dependencies, helpers):
         shutil.copyfile(build / 'CMakeCache.txt', output / 'CMakeCache.txt')
         audit.update(main_patched_sha256=hashlib.sha256(patched_main.encode()).hexdigest(),
                      cmake_patched_sha256=hashlib.sha256(patched_cmake.encode()).hexdigest(),
-                     topology_seeded_sha256=hashlib.sha256(seeded_topology.encode()).hexdigest(),
+                     topology_patched_sha256=hashlib.sha256(patched_topology.encode()).hexdigest(),
+                     completion_headers_patched_sha256=header_hashes,
                      binary_sha256=hashlib.sha256((output / 'GeDES').read_bytes()).hexdigest(),
                      compute_capability=capability, build_mode='Release')
         helpers.write_json(output / 'build.json', audit)
@@ -366,7 +446,7 @@ def _run(output, dependencies, helpers, k, detail=False):
         'timing_mode': 'invasive-host-profile' if detail else 'normal-phase-timing',
         'ft_k': k, 'parameters': PARAMETERS, 'process_seconds': wall,
         'measurements': measurements, 'flows': flows, 'passed': not reasons, 'gate_failures': reasons,
-        'instrumentation': 'host main phase timing plus CreateFlows RNG seed41; protocol and CUDA graph unchanged',
+        'instrumentation': 'host phase timing, seed 41, flow-start queue sizing, and post-sync completion readback',
     }
     helpers.write_json(output / 'summary.json', summary)
     if reasons:
