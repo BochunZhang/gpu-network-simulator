@@ -16,7 +16,8 @@ class TaskDispatchTest(unittest.TestCase):
             root = Path(temporary)
             (root / 'tools').mkdir()
             (root / 'output').mkdir()
-            for kind in ('gpu_transfer', 'gedes_drain', 'nsx_single_gpu', 'nsx_four_gpu'):
+            for kind in ('gpu_transfer', 'gedes_drain', 'nsx_single_gpu', 'nsx_four_gpu',
+                         'training_roce_checks', 'gedes_timeline', 'training_roce_profile', 'training_owner_sweep'):
                 with self.subTest(kind=kind):
                     (root / 'tools' / f'{kind}.py').write_text(
                         'def run(source, output, helpers):\n'

@@ -159,11 +159,11 @@ def drain_failures(snapshot):
     return failures
 
 
-def _case(binary, case, k, early_stop, output, env, v3, helpers):
+def _case(binary, case, k, early_stop, output, env, v3, helpers, prefix=()):
     folder = output / case
     folder.mkdir()
     flow_path = folder / 'flows.csv'
-    args = [str(binary), f'--ft_k={k}', *[f'--{key}={value}' for key, value in v3.PARAMETERS.items()],
+    args = [*prefix, str(binary), f'--ft_k={k}', *[f'--{key}={value}' for key, value in v3.PARAMETERS.items()],
             f'--output={flow_path}']
     if early_stop:
         args.append('--audit_early_stop=1')
@@ -197,6 +197,30 @@ def _case(binary, case, k, early_stop, output, env, v3, helpers):
             'passed': not failures, 'failures': failures}
 
 
+def build_audit(source, output, helpers, v3, scratch, capability, env, patch_main=None):
+    src = helpers.checkout(helpers.GEDES, scratch, output, env) / 'GeDES_code'
+    audit = v3._source_audit(src)
+    drain_source = (source / 'benchmarks/gedes_drain.inc').read_text()
+    hashes = instrument_sources(src, output, v3, drain_source)
+    if patch_main is not None:
+        main = src / 'main.cc'
+        main.write_text(patch_main(main.read_text()))
+        hashes['main.cc'] = hashlib.sha256(main.read_bytes()).hexdigest()
+        (output / 'main.cc-profile.txt').write_bytes(main.read_bytes())
+    build = scratch / 'build'
+    helpers.command(['cmake', '-S', str(src), '-B', str(build), '-DCMAKE_BUILD_TYPE=Release',
+                     '-DCMAKE_CUDA_ARCHITECTURES=' + capability.replace('.', '')],
+                    output / 'configure.log', env=env)
+    helpers.command(['cmake', '--build', str(build), '--parallel', '4'], output / 'build.log', env=env)
+    binary = build / 'GeDES'
+    helpers.write_json(output / 'build.json', {
+        'revision': audit['revision'], 'upstream_source_sha256': audit['files'],
+        'patched_source_sha256': hashes, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+        'compute_capability': capability, 'build_mode': 'Release',
+    })
+    return binary
+
+
 def run(source, output, helpers):
     """Build the audit once and run positive controls and a real early-stop case."""
     v3 = helpers._support_module(source, 'gedes_experiments')
@@ -211,21 +235,7 @@ def run(source, output, helpers):
             helpers.command([tool, '--version'], output / f'{tool}.txt', env=env)
         with TemporaryDirectory(prefix='.gedes-drain-', dir=output) as temporary:
             scratch = Path(temporary)
-            src = helpers.checkout(helpers.GEDES, scratch, output, env) / 'GeDES_code'
-            audit = v3._source_audit(src)
-            drain_source = (source / 'benchmarks/gedes_drain.inc').read_text()
-            hashes = instrument_sources(src, output, v3, drain_source)
-            build = scratch / 'build'
-            helpers.command(['cmake', '-S', str(src), '-B', str(build), '-DCMAKE_BUILD_TYPE=Release',
-                             '-DCMAKE_CUDA_ARCHITECTURES=' + capability.replace('.', '')],
-                            output / 'configure.log', env=env)
-            helpers.command(['cmake', '--build', str(build), '--parallel', '4'], output / 'build.log', env=env)
-            binary = build / 'GeDES'
-            helpers.write_json(output / 'build.json', {
-                'revision': audit['revision'], 'upstream_source_sha256': audit['files'],
-                'patched_source_sha256': hashes, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-                'compute_capability': capability, 'build_mode': 'Release',
-            })
+            binary = build_audit(source, output, helpers, v3, scratch, capability, env)
             summary['build'] = 'succeeded'
             for case, k, early_stop in [('k4', 4, False), ('k8', 8, False), ('k8-early-stop', 8, True)]:
                 try:

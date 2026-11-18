@@ -221,3 +221,25 @@ results-archive/000-system-info/000-system-info.v2.tar.gz
 bash tools/runner.sh --help
 python3 -B -m unittest discover -s tests -v
 ```
+
+## 单卡训练网络机制实验
+
+每项任务选择一张当前可见的物理 GPU。公开用例可以独立构建；完整训练 DAG 在项目的训练后端上另外比较。
+
+| 任务 | 执行与输出 |
+| --- | --- |
+| 007 | 分段 SEND、丢 DATA/ACK、RNR、小型 Ring 和全对全交换。逐项比较单 CTA CUDA 与标量参考的提交、接收 CQE、发送 CQE、字节和排空；保存每例 CSV。 |
+| 008 | 对相同 GeDES k8 二进制先正常运行，再分别用 Nsight Systems 采集第 2000 和 6900 轮起的 16 轮。三次均须保留输入哈希、128 条流、7001 轮及排空门限。返回的 timeline.json 可在 Perfetto 打开；完整 .nsys-rep 和 SQLite 文件保存在 CPFS 原始目录。 |
+| 009 | 短窗 RC 设备内 trace，将 globaltimer、SM、CTA、阶段、QP 和 WR 与虚拟时刻关联，核对插桩前后相同的提交记录。主机同步与设备执行可能重叠。 |
+| 010 | 比较安全时间边界与 CTA 任务分派的组合，用独立顺序参考检验热点队列的输出。 |
+
+合成 RC 用例设定 400 Gbps、每跳 500 ns、一台交换机、每帧固定 64 字节模型开销、4096 字节分段与每 QP 停止等待。训练式后继用端点自己的完成事件解锁。ring 用转发块来源和邻接依赖检查消息顺序，全对全提交固定 peer 交换。真实 SimAI 拓扑、管理网络、PAT 和训练步的验收使用相应训练入口。
+
+从仓库根目录可运行标量检查：
+
+```sh
+c++ -std=c++17 -O2 -x c++ benchmarks/training_roce_engine.cu benchmarks/training_roce_main.cpp -o /tmp/training-roce
+/tmp/training-roce --backend cpu --workload closed-loop --ranks 4 --bytes 8193 --fault drop-ack
+```
+
+GB200 任务使用 `bash tools/runner.sh --task 007 --once`，其余编号同理。

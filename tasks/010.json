@@ -1,0 +1,12 @@
+{
+  "id": "010",
+  "name": "Single GPU causal frontier and ready owner scheduling sweep",
+  "slug": "training-owner-sweep",
+  "version": 1,
+  "command": "bash tools/runner.sh --task 010 --once",
+  "kind": "training_owner_sweep",
+  "params": {},
+  "resources": {"gpus": 1},
+  "enabled": true,
+  "description": "Cross global and local safe horizons with static and dynamic owner assignment on matched single-hot and multi-hot FIFO streams. Compare per-owner output to a scalar oracle, reject an unsafe tie and time five paired resident-loop samples per variant."
+}
