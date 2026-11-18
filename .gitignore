@@ -1,6 +1,7 @@
 /results/
 /results-remote/
 /results-archive/
+/runner.log
 /status/*/*
 !/status/*/v*.archived.json
 /.lock/

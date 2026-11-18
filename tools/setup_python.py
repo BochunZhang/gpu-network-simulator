@@ -17,12 +17,13 @@ import uuid
 
 
 PYTHON_VERSION = "3.12"
+BOOTSTRAP_SCHEMA = 2
 ROOT = Path(__file__).resolve().parents[1]
 INFO_CODE = (
-    "import json,os,sys; print(json.dumps({"
+    "import encodings,json,os,sys,venv; print(json.dumps({"
     "'implementation':sys.implementation.name,"
     "'version':list(sys.version_info[:3]),"
-    "'executable':os.path.realpath(sys.executable),"
+    "'executable':os.path.realpath(getattr(sys,'_base_executable',sys.executable)),"
     "'base_prefix':sys.base_prefix,'prefix':sys.prefix}))"
 )
 
@@ -116,6 +117,10 @@ def managed_runtime(runtime_root, uv):
     managed = runtime_root / "managed"
     env = {**os.environ, "UV_PYTHON_INSTALL_DIR": str(managed),
            "UV_CACHE_DIR": str(runtime_root / "cache"), "UV_NO_CONFIG": "1"}
+    # Corporate CA roots may be installed in the host trust store. This option
+    # keeps certificate verification enabled and also works with older uv.
+    if "UV_NATIVE_TLS" not in env and "UV_SYSTEM_CERTS" not in env:
+        env["UV_NATIVE_TLS"] = "true"
     find = [uv, "python", "find", "--managed-python", "--no-project", "--no-python-downloads", PYTHON_VERSION]
     try:
         executable = Path(command(find, env))
@@ -133,16 +138,12 @@ def managed_runtime(runtime_root, uv):
     return executable, info, metadata
 
 
-def selected_runtime(runtime_root):
-    override = os.environ.get("GPU_NET_SIM_PYTHON")
-    uv = shutil.which("uv")
-    if uv and not override:
-        try:
-            return managed_runtime(runtime_root, uv)
-        except (OSError, RuntimeError, ValueError) as error:
-            print(f"Managed Python setup failed ({error}); using the existing Python runtime.", file=sys.stderr)
-    selected = override or sys.executable
+def existing_runtime(runtime_root, selected):
+    # A Python found in an active virtual environment may be a copied binary.
+    # Probe its base executable again so creation always runs from the original
+    # installation, where relocatable Python can locate its standard library.
     info = python_info(selected)
+    info = python_info(info["executable"])
     system_root = runtime_root / f"system-{runtime_fingerprint(info)}"
     system_root.mkdir(parents=True, exist_ok=True)
     executable = system_root / "python"
@@ -158,6 +159,22 @@ def selected_runtime(runtime_root):
     return executable, info, metadata
 
 
+def selected_runtime(runtime_root):
+    override = os.environ.get("GPU_NET_SIM_PYTHON")
+    if override:
+        return existing_runtime(runtime_root, override)
+    try:
+        # The runner needs only the standard library. Reuse the interpreter
+        # already available on this device before downloading another runtime.
+        return existing_runtime(runtime_root, sys.executable)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"Existing Python runtime is unusable ({error}); trying managed Python.", file=sys.stderr)
+    uv = shutil.which("uv")
+    if uv:
+        return managed_runtime(runtime_root, uv)
+    raise RuntimeError("No usable Python 3.9+ with the venv module was found; set GPU_NET_SIM_PYTHON")
+
+
 def environment_python(root=ROOT):
     if sys.version_info < (3, 9):
         raise RuntimeError("Python 3.9 or newer is required to start the runner")
@@ -167,7 +184,7 @@ def environment_python(root=ROOT):
         runtime_root.mkdir(parents=True, exist_ok=True)
         executable, info, metadata = selected_runtime(runtime_root)
         major, minor = info["version"][:2]
-        environment = root / ".venv" / f"{key}-py{major}.{minor}-{runtime_fingerprint(info)}"
+        environment = root / ".venv" / f"{key}-py{major}.{minor}-{runtime_fingerprint(info)}-b{BOOTSTRAP_SCHEMA}"
         python = environment / "bin" / "python"
         marker = environment / ".runner-environment.json"
         if environment.exists():
@@ -180,11 +197,14 @@ def environment_python(root=ROOT):
         environment.parent.mkdir(parents=True, exist_ok=True)
         try:
             # The runner uses the standard library, so it does not require pip.
-            command([executable, "-m", "venv", "--without-pip", environment])
+            # Invoking the recorded .python symlink here makes Python 3.12
+            # write that symlink's directory as pyvenv.cfg home. Standalone
+            # builds can then fall back to /install and fail to import encodings.
+            command([info["executable"], "-I", "-m", "venv", "--without-pip", environment])
             actual = python_info(python)
             if runtime_fingerprint(actual) != runtime_fingerprint(info) or actual["prefix"] != str(environment):
                 raise RuntimeError(f"Created Python environment has an unexpected runtime: {environment}")
-            write_metadata(marker, metadata)
+            write_metadata(marker, {**metadata, "bootstrap_schema": BOOTSTRAP_SCHEMA})
         except BaseException:
             shutil.rmtree(environment, ignore_errors=True)
             raise

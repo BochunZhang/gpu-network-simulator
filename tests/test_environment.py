@@ -51,6 +51,90 @@ class EnvironmentTest(unittest.TestCase):
         self.assertTrue(runtime.is_symlink())
         self.assertTrue((runtime.parent / "runtime.json").is_file())
 
+    def test_venv_home_uses_the_canonical_base_interpreter(self):
+        result = self.run_wrapper("--once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prefix = Path(json.loads(result.stdout)["prefix"])
+        metadata = json.loads((prefix / ".runner-environment.json").read_text())
+        recorded_reference = Path(metadata["python"])
+        self.assertTrue(recorded_reference.is_symlink())
+        base = Path(metadata["runtime"]["executable"]).resolve()
+        configuration = dict(line.split(" = ", 1) for line in
+                             (prefix / "pyvenv.cfg").read_text().splitlines()
+                             if " = " in line)
+        self.assertEqual(Path(configuration["home"]).resolve(), base.parent)
+        self.assertNotEqual(Path(configuration["home"]).resolve(), recorded_reference.parent)
+
+    def test_existing_external_venv_uses_its_base_interpreter(self):
+        external = self.root.parent / "external-environment"
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(external)],
+                       check=True, capture_output=True, text=True, timeout=30)
+        self.env["GPU_NET_SIM_PYTHON"] = str(external / "bin" / "python")
+        result = self.run_wrapper("--once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prefix = Path(json.loads(result.stdout)["prefix"])
+        metadata = json.loads((prefix / ".runner-environment.json").read_text())
+        self.assertNotEqual(Path(metadata["runtime"]["base_prefix"]), external)
+        runtime = Path(metadata["runtime"]["executable"])
+        self.assertFalse(runtime.is_relative_to(external))
+        checked = subprocess.run(
+            [str(prefix / "bin" / "python"), "-I", "-c",
+             "import encodings,json,sys; print(json.dumps({'base':sys.base_prefix,'prefix':sys.prefix}))"],
+            text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(Path(json.loads(checked.stdout)["prefix"]), prefix)
+
+    def test_old_bootstrap_environment_is_preserved_when_replaced(self):
+        info = setup_python.python_info(sys.executable)
+        major, minor = info["version"][:2]
+        old = self.root / ".venv" / (
+            f"{setup_python.platform_key()}-py{major}.{minor}-{setup_python.runtime_fingerprint(info)}"
+        )
+        (old / "bin").mkdir(parents=True)
+        broken_python = old / "bin" / "python"
+        broken_python.write_text("#!/bin/sh\necho missing-encodings >&2\nexit 1\n")
+        broken_python.chmod(0o755)
+        marker = old / ".runner-environment.json"
+        marker.write_text(json.dumps({"provider": "system-symlink", "runtime": info}))
+        sentinel = old / "keep-for-debugging.txt"
+        sentinel.write_text("old bootstrap evidence")
+        result = self.run_wrapper("--once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prefix = Path(json.loads(result.stdout)["prefix"])
+        self.assertNotEqual(prefix, old)
+        self.assertEqual(sentinel.read_text(), "old bootstrap evidence")
+        self.assertEqual(broken_python.read_text(), "#!/bin/sh\necho missing-encodings >&2\nexit 1\n")
+
+    def test_real_standalone_python_uses_canonical_home_and_loads_stdlib(self):
+        override = os.environ.get("GPU_NET_SIM_TEST_STANDALONE")
+        candidates = [Path(override)] if override else sorted(
+            (Path.home() / ".local/share/uv/python").glob("cpython-3.*-*/bin/python3.*")
+        )
+        candidates = [path for path in candidates if path.is_file()
+                      and (override or path.name.removeprefix("python3.").isdigit())]
+        standalone = next((path for path in candidates if subprocess.run(
+            [str(path), "-I", "-c", "import encodings,sys; assert sys.version_info >= (3,9)"],
+            capture_output=True, text=True, timeout=15).returncode == 0), None)
+        if standalone is None:
+            self.skipTest("No local python-build-standalone runtime; set GPU_NET_SIM_TEST_STANDALONE to exercise it")
+        self.env["GPU_NET_SIM_PYTHON"] = str(standalone)
+        self.env.pop("PYTHONHOME", None)
+        self.env.pop("PYTHONPATH", None)
+        result = self.run_wrapper("--once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prefix = Path(json.loads(result.stdout)["prefix"])
+        configuration = dict(line.split(" = ", 1) for line in
+                             (prefix / "pyvenv.cfg").read_text().splitlines()
+                             if " = " in line)
+        self.assertEqual(Path(configuration["home"]).resolve(), standalone.resolve().parent)
+        checked = subprocess.run(
+            [str(prefix / "bin/python"), "-I", "-c", "import encodings,json,ssl,venv; print('stdlib-ready')"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(checked.stdout.strip(), "stdlib-ready")
+
     def test_help_does_not_create_environment_or_lock(self):
         result = self.run_wrapper("--help")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -121,27 +205,67 @@ class EnvironmentTest(unittest.TestCase):
         def fake_command(args, env):
             commands.append([str(arg) for arg in args])
             self.assertEqual(env["UV_PYTHON_INSTALL_DIR"], str(runtime_root / "managed"))
+            if expected_native_tls is None:
+                self.assertNotIn("UV_NATIVE_TLS", env)
+            else:
+                self.assertEqual(env["UV_NATIVE_TLS"], expected_native_tls)
+            self.assertEqual(env.get("UV_SYSTEM_CERTS"), expected_system_certs)
+            self.assertNotIn("--allow-insecure-host", [str(arg) for arg in args])
             if len(commands) == 1:
                 raise RuntimeError("Python not installed")
             return str(python) if "find" in args else ""
 
-        with patch.object(setup_python, "command", side_effect=fake_command):
-            with patch.object(setup_python, "python_info", return_value=info):
-                selected, _, metadata = setup_python.managed_runtime(runtime_root, "/bin/uv")
+        for configured in ({}, {"UV_NATIVE_TLS": "false"}, {"UV_SYSTEM_CERTS": "false"}):
+            commands.clear()
+            expected_system_certs = configured.get("UV_SYSTEM_CERTS")
+            expected_native_tls = None if expected_system_certs else configured.get("UV_NATIVE_TLS", "true")
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("UV_NATIVE_TLS", None)
+                os.environ.pop("UV_SYSTEM_CERTS", None)
+                os.environ.update(configured)
+                with patch.object(setup_python, "command", side_effect=fake_command):
+                    with patch.object(setup_python, "python_info", return_value=info):
+                        selected, _, metadata = setup_python.managed_runtime(runtime_root, "/bin/uv")
         self.assertEqual(selected, python)
         self.assertEqual(metadata["provider"], "uv")
         self.assertIn(["/bin/uv", "python", "install", "--install-dir", str(runtime_root / "managed"),
                        "--no-bin", setup_python.PYTHON_VERSION], commands)
         self.assertTrue((runtime_root / "managed-runtime.json").is_file())
 
-    def test_failed_managed_download_uses_existing_python(self):
+    def test_working_current_python_avoids_managed_download(self):
         runtime_root = self.root / ".python" / setup_python.platform_key()
         runtime_root.mkdir(parents=True)
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GPU_NET_SIM_PYTHON", None)
             with patch.object(setup_python.shutil, "which", return_value="/bin/uv"):
-                with patch.object(setup_python, "managed_runtime", side_effect=RuntimeError("offline")):
+                with patch.object(setup_python, "managed_runtime", side_effect=AssertionError("unexpected download")) as managed:
                     python, _, metadata = setup_python.selected_runtime(runtime_root)
+                managed.assert_not_called()
         self.assertEqual(metadata["provider"], "system-symlink")
         self.assertTrue(python.is_symlink())
         self.assertTrue(python.is_relative_to(runtime_root))
+
+    def test_unusable_current_python_attempts_managed_runtime(self):
+        runtime_root = self.root / ".python" / setup_python.platform_key()
+        selected = runtime_root / "managed/bin/python"
+        info = {"implementation": "cpython", "version": [3, 12, 1],
+                "executable": str(selected), "base_prefix": str(selected.parent.parent),
+                "prefix": str(selected.parent.parent)}
+        expected = selected, info, {"provider": "uv", "python": str(selected), "runtime": info}
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GPU_NET_SIM_PYTHON", None)
+            with patch.object(setup_python, "existing_runtime", side_effect=RuntimeError("missing standard library")):
+                with patch.object(setup_python.shutil, "which", return_value="/bin/uv"):
+                    with patch.object(setup_python, "managed_runtime", return_value=expected) as managed:
+                        actual = setup_python.selected_runtime(runtime_root)
+        self.assertEqual(actual, expected)
+        managed.assert_called_once_with(runtime_root, "/bin/uv")
+
+    def test_invalid_explicit_python_does_not_select_another_runtime(self):
+        runtime_root = self.root / ".python" / setup_python.platform_key()
+        with patch.dict(os.environ, {"GPU_NET_SIM_PYTHON": "/unavailable/python"}):
+            with patch.object(setup_python, "existing_runtime", side_effect=RuntimeError("explicit runtime missing")):
+                with patch.object(setup_python, "managed_runtime") as managed:
+                    with self.assertRaisesRegex(RuntimeError, "explicit runtime missing"):
+                        setup_python.selected_runtime(runtime_root)
+        managed.assert_not_called()
