@@ -11,8 +11,9 @@ CPFS 运行状态写入 `status/{三位编号}-{简称}/v{version}.json`，例�
 | 任务版本 | 执行结果 | 归档确认 |
 | --- | --- | --- |
 | `000-system-info v2` | succeeded，5 个 case 全部通过 | [v2.archived.json](000-system-info/v2.archived.json) |
+| `000-system-info v3` | succeeded，4 个 case 新执行，1 个兼容复用 | [v3.archived.json](000-system-info/v3.archived.json) |
 | `001-gedes-smoke v1` | succeeded，GeDES k8 smoke 通过 | [v1.archived.json](001-gedes-smoke/v1.archived.json) |
 
-`000-system-info v3` 是基于已完成 v2 的下一版增量任务，使用新版本领取记录，保留 v2 的完成标记。
+`000-system-info v3` 已完成基于 v2 的增量验证，保留 v2 与 v3 各自的完成标记及归档确认。
 
 本批后续版本为 `000 v3`（增量验证）、`001 v2`（GeDES 完成状态与主机阶段诊断）及 `003 v1`（四卡 CUDA copy/P2P 基线）。已完成版本的归档确认继续保留，最新执行进度以 CPFS 中的状态为准。
