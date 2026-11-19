@@ -20,7 +20,11 @@ bash tools/runner.sh --once
 bash tools/runner.sh
 ```
 
-入口自动准备 Python 环境，随后约每 10 秒拉取 `main` 并检查任务。实验运行期间继续检查更新。每个任务使用领取时的 Git 提交快照，后续拉取不会改变正在执行的实验。GPU 设备只通过网络读取公开代码和依赖，结果保存在共享文件系统。
+入口自动准备 Python 环境，由 `tools/runner_loop.py` 持有主机设备锁。runner 约每 10 秒检查任务和控制器更新。控制器及其依赖从 `origin/main` 的同一 Git 提交导出，保存在 `.lock/controller-cache/{工具树哈希}/tools/`。控制器在当前任务完成、结果包封存且状态已核对之后、下次领取之前切换。只改任务清单或回执的提交可直接读取，控制器继续使用当前工具树。共享 checkout 无需随轮询切换。
+
+`--source-branch` 选择任务分支，控制器始终来自 `origin/main`。每个任务固定领取时的实验源码和控制器快照，从启动到打包使用同一份执行代码。共享 Git、锁、状态、结果和 Nsight Systems 安装路径始终以实际 CPFS 仓库目录为根。GPU 设备只通过网络读取公开代码和依赖，结果保存在共享文件系统。
+
+从旧启动入口迁移时，先让各台设备的在途实验封存，停止旧轮询器，在共享 checkout 执行一次 `git pull --ff-only`，然后逐台重启 `bash tools/runner.sh`。首次启动新版入口后，后续控制器更新由 runner 处理。
 
 任务进入终态后，runner 输出一行 `complete <任务标识> <版本> state=<状态> archive_name=<包名>`。成功和已记录的失败均会输出；包未生成时 `archive_name=-`。
 
@@ -101,7 +105,7 @@ bash tools/runner.sh --task system-000-inventory-refresh --once
 bash tools/runner.sh --task system-000-inventory-refresh-00 --once
 ```
 
-运行状态保存执行身份、源码提交和执行主机。子任务的执行命令自动生成。处理器将实际调用的程序、参数、工作目录、退出码与时间写入 `commands.json`。新增处理器可随任务提交发布。**切换到本次空队列时需要更新控制器。** 提交 `8d027d9` 的控制器会将旧清单移出视为非法删除，并停止本轮领取。先让在途实验完成，停止各台旧轮询器，在共享 checkout 执行 `git pull --ff-only`，再在每台设备上重启 `bash tools/runner.sh`。新版会正常轮询空队列。
+运行状态保存执行身份、实验源码提交和执行主机。结果记录用 `runner_controller_commit` 和 `runner_controller_tree` 标识控制器快照，`runner_sha256` 记录该次领取、执行和打包使用的控制器脚本校验和。子任务的执行命令自动生成。处理器将实际调用的程序、参数、工作目录、退出码与时间写入 `commands.json`。新增处理器可随任务提交发布。
 
 ## 子任务的增量执行
 
@@ -143,7 +147,7 @@ results/system-000-inventory-refresh-01/v1-261118-120000/
 results/system-000-inventory-refresh-01/system-000-inventory-refresh-01.v1-261118-120000.tar.gz
 ```
 
-已按旧格式领取的执行沿用原始路径和包名。升级时等在途执行结束，停止共享这套目录的各台旧 runner，在共享 checkout 执行 `git pull --ff-only`，再逐台启动新版 runner。浅克隆可用 `git fetch --unshallow origin` 补齐用于计算序号的发布历史。
+已按旧格式领取的执行沿用原始路径和包名。浅克隆可用 `git fetch --unshallow origin` 补齐用于计算序号的发布历史。
 
 领取通过原子 `mkdir` 竞争。完成后先保存终态，再释放任务执行锁，保留版本领取记录。版本锁中保存主机、进程、领取标识及版本信息。重复启动会跳过已领取的版本。同一共享 checkout 的 Git 拉取和源码导出通过短期目录锁串行化，实验从独立快照执行。
 
@@ -174,8 +178,6 @@ python3 tools/archive_results.py
 废弃的子任务由 runner 校验结果身份、原包内容和 SHA-256，直接向 CPFS 的 `results-archive/` 归档。已有下载归档回执的包沿用其校验值。归档后，执行记录的 `disposition` 为 `ignored`。仍在运行的实验完成后再处理，归档失败时保留原数据并在下次轮询重试。实验的 `state` 保持 `succeeded` 或 `failed` 等原结果，`delivery_state` 记录 `awaiting_download` 或 `archived`。失败实验同样可以回收归档。移动中断时可继续处理，遇到不同内容的目标文件会停止并保留数据。崩溃恢复后继续使用同一组结果目录和归档目录。
 
 某个版本的压缩包缺失、改名未被识别或校验冲突时，runner 会保留该版本数据，并写入 `status/{子任务标识}/{version_label}.archive-error.json` 等诊断记录，列出原因、预期校验和和搜索路径，继续处理其他归档确认及新任务。补齐或修正文件后，后续轮询重新尝试。文件只改名时 SHA-256 保持一致，原始压缩包按确认记录校验。
-
-任务处理器通过拉取的提交更新，runner 控制器修复需要在共享 checkout 更新后重启进程。遇到旧命名兼容问题时，先执行 `git pull --ff-only`，再重启 `bash tools/runner.sh`；运行中的旧控制器不会因 Git 拉取而替换自身代码。
 
 旧版包缺少简称和命令时，工具按实验类型补全简称，并把生成的入口命令标记为复现命令。原始压缩包保持原样，确保已经下载的旧版包也能通过 SHA-256 确认。
 

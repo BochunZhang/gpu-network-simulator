@@ -23,11 +23,12 @@ class EnvironmentTest(unittest.TestCase):
         for name in ("runner.sh", "setup_python.py"):
             shutil.copyfile(REPO / "tools" / name, self.root / "tools" / name)
         (self.root / "tools" / "runner.sh").chmod(0o755)
-        (self.root / "tools" / "run_experiments.py").write_text(
-            "import json,sys\n"
-            "print(json.dumps({'args':sys.argv[1:],'prefix':sys.prefix}))\n",
-            encoding="utf-8",
-        )
+        for entry in ("run_experiments.py", "runner_loop.py"):
+            (self.root / "tools" / entry).write_text(
+                "import json,sys\n"
+                "print(json.dumps({'args':sys.argv[1:],'prefix':sys.prefix}))\n",
+                encoding="utf-8",
+            )
         self.env = {**os.environ, "GPU_NET_SIM_PYTHON": sys.executable, "PYTHONDONTWRITEBYTECODE": "1"}
 
     def run_wrapper(self, *args):

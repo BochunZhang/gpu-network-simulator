@@ -27,6 +27,12 @@ import task_catalog
 
 LOCK_PATH = Path('/tmp/gpu-network-simulator.lock')
 POLL_SECONDS = 10
+CONTROLLER_RELOAD = 75
+REPO_ROOT_ENV = 'GPU_NET_SIM_REPO_ROOT'
+CONTROLLER_LOCK_ENV = 'GPU_NET_SIM_CONTROLLER_LOCK_FD'
+CONTROLLER_HANDOFF_ENV = 'GPU_NET_SIM_CONTROLLER_HANDOFF'
+CONTROLLER_TREE_ENV = 'GPU_NET_SIM_CONTROLLER_TREE'
+CONTROLLER_COMMIT_ENV = 'GPU_NET_SIM_CONTROLLER_COMMIT'
 TERMINAL = {'succeeded', 'failed', 'abandoned'}
 NSYS_REPORT_SUFFIX = '.nsys-rep'
 NSYS_REPORT_ARCHIVE_LIMIT = 8 * 1024**3
@@ -252,6 +258,23 @@ def device_lock(path):
         os.close(fd)
 
 
+@contextlib.contextmanager
+def controller_lock(path):
+    inherited = os.environ.get(CONTROLLER_LOCK_ENV)
+    if inherited is None:
+        with device_lock(path) as fd:
+            yield fd
+        return
+    fd = int(inherited)
+    if not os.path.samestat(os.fstat(fd), path.stat()):
+        raise RunnerError('supervisor inherited the wrong host lock')
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise RunnerError(f'supervisor does not hold the host lock: {path}') from exc
+    yield fd
+
+
 def owner_matches(path, row):
     try:
         owner = read_json(path / 'owner.json')
@@ -344,19 +367,26 @@ class Queue:
         remove_owned_directory(path, owner)
         print('recovered original host shared Git lock', flush=True)
 
-    def source(self):
+    def _fetch(self, remote_ref, local_ref):
         with self.operation(wait_seconds=35):
-            local_ref = 'refs/gpu-network-simulator/source'
             self.git('fetch', '--quiet', '--no-tags', '--no-write-fetch-head', 'origin',
-                     f'+{self.source_ref}:{local_ref}')
+                     f'+{remote_ref}:{local_ref}')
             return self.git('rev-parse', local_ref).stdout.strip()
 
-    def export(self, commit, destination):
+    def source(self):
+        return self._fetch(self.source_ref, 'refs/gpu-network-simulator/source')
+
+    def controller_source(self, task_source):
+        if self.source_ref == 'refs/heads/main':
+            return task_source
+        return self._fetch('refs/heads/main', 'refs/gpu-network-simulator/controller')
+
+    def export(self, commit, destination, *, paths=()):
         destination.mkdir()
         with tempfile.TemporaryDirectory(prefix='gpu-network-simulator-archive-') as temp:
             archive_path = Path(temp) / 'source.tar'
             with self.operation(wait_seconds=240):
-                self.git('archive', '--format=tar', f'--output={archive_path}', commit, timeout=180)
+                self.git('archive', '--format=tar', f'--output={archive_path}', commit, *paths, timeout=180)
             with tarfile.open(archive_path) as archive:
                 for item in archive.getmembers():
                     name = PurePosixPath(item.name)
@@ -501,6 +531,61 @@ class Queue:
             identities.add(identity)
             receipts.append(row)
         return receipts
+
+
+def controller_bundle_files(root):
+    if not root.is_dir() or root.is_symlink():
+        raise RunnerError(f'invalid controller cache directory: {root}')
+    files = {}
+    for path in root.rglob('*'):
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise RunnerError(f'invalid controller cache entry: {path}')
+        files[path.relative_to(root)] = None if path.is_dir() else sha256_file(path)
+    return files
+
+
+def publish_controller(queue, source, tree):
+    cache = queue.lock_dir.resolve() / 'controller-cache'
+    cache.mkdir(parents=True, exist_ok=True)
+    if cache.is_symlink():
+        raise RunnerError(f'invalid controller cache directory: {cache}')
+    script = Path('tools/run_experiments.py')
+    destination = cache / tree
+    with tempfile.TemporaryDirectory(prefix='.stage-', dir=cache) as temp:
+        staged = Path(temp) / 'controller'
+        queue.export(source, staged, paths=('tools',))
+        try:
+            probe = subprocess.run([sys.executable, '-B', str(staged / script), '--_controller-probe'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   timeout=30, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise RunnerError(f'controller probe timed out for {source}') from exc
+        if probe.returncode:
+            raise RunnerError(f'controller probe failed for {source}: {probe.stdout.strip()}')
+        try:
+            staged.rename(destination)
+        except OSError:
+            if not destination.exists():
+                raise
+            if controller_bundle_files(staged) != controller_bundle_files(destination):
+                raise RunnerError(f'controller cache content does not match Git tree {tree}')
+    return destination / script
+
+
+def request_controller_reload(queue, source):
+    handoff = os.environ.get(CONTROLLER_HANDOFF_ENV)
+    if handoff is None:
+        return False
+    commit = queue.controller_source(source)
+    tree = queue.git('rev-parse', f'{commit}:tools').stdout.strip()
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', tree):
+        raise RunnerError(f'invalid controller tools tree for {commit}')
+    if tree == os.environ.get(CONTROLLER_TREE_ENV):
+        return False
+    script = publish_controller(queue, commit, tree)
+    write_json(Path(handoff), {'script': str(script), 'tree': tree, 'commit': commit})
+    print(f'reload controller commit={commit} tree={tree}', flush=True)
+    return True
 
 
 class ClaimStore:
@@ -1120,12 +1205,16 @@ def start_task(queue, source, store, results, worker, fd, available_gpus, task_i
         script = Path(__file__).resolve()
         run = {**row, 'task': task, 'lock_dir': str(store.lock_dir),
                'runner_sha256': CONTROLLER_SHA256}
+        if os.environ.get(CONTROLLER_TREE_ENV):
+            run['runner_controller_tree'] = os.environ[CONTROLLER_TREE_ENV]
+        if os.environ.get(CONTROLLER_COMMIT_ENV):
+            run['runner_controller_commit'] = os.environ[CONTROLLER_COMMIT_ENV]
         if prepared:
             run['prepared_base'] = prepared
         write_json(output / 'run.json', run)
         env = {**os.environ, 'GPU_NET_SIM_LOCK_FD': str(fd)}
         with (output / 'worker.log').open('wb') as log:
-            child = subprocess.Popen([sys.executable, str(script), '--_execute', str(output)],
+            child = subprocess.Popen([sys.executable, '-B', str(script), '--_execute', str(output)],
                                      env=env, start_new_session=True, stdout=log,
                                      stderr=subprocess.STDOUT, pass_fds=(fd,))
         print(f"running task {row['id']} {version_name(row)} on {worker} in {output}", flush=True)
@@ -1164,6 +1253,9 @@ def poll(queue, store, args, fd):
                                       for row in rows.values()):
                 raise RunnerError('unfinished execution on this host; confirm it stopped, then use --abandon ID VERSION')
             source = queue.source()
+            if (active is None and not (args.once and result is not None)
+                    and request_controller_reload(queue, source)):
+                return CONTROLLER_RELOAD
             receipts = queue.archived_receipts(source)
             releases = queue.tasks(source)
             store.archive_receipts(receipts, args.results_dir, archive_dir, active_claim)
@@ -1189,13 +1281,21 @@ def poll(queue, store, args, fd):
 
 
 def main():
-    root = Path(__file__).resolve().parents[1]
+    if sys.argv[1:] == ['--_controller-probe']:
+        import retired_experiments  # Also verifies the archive helper imports.
+
+        runtime_engine()
+        return 0
+    root = Path(os.environ.get(REPO_ROOT_ENV, Path(__file__).resolve().parents[1])).resolve()
     if len(sys.argv) == 3 and sys.argv[1] == '--_execute':
         fd = int(os.environ['GPU_NET_SIM_LOCK_FD'])
         if not os.path.samestat(os.fstat(fd), LOCK_PATH.stat()):
             raise RunnerError('worker has no inherited host lock')
         output = Path(sys.argv[2])
-        return execute(Queue(root, lock_dir=Path(read_json(output / 'run.json')['lock_dir'])), output)
+        run = read_json(output / 'run.json')
+        if run.get('runner_controller_tree') and run['runner_sha256'] != CONTROLLER_SHA256:
+            raise RunnerError('worker controller differs from the controller that claimed the task')
+        return execute(Queue(root, lock_dir=Path(run['lock_dir'])), output)
 
     cli = argparse.ArgumentParser(description=__doc__)
     mode = cli.add_mutually_exclusive_group()
@@ -1216,7 +1316,7 @@ def main():
         if args.task is not None and not (re.fullmatch(EXECUTION_ID_PATTERN, args.task)
                                           or re.fullmatch(task_catalog.PARENT_PATTERN, args.task)):
             raise RunnerError('--task requires a parent, child or historical task ID')
-        with device_lock(LOCK_PATH) as fd:
+        with controller_lock(LOCK_PATH) as fd:
             os.environ['GPU_NET_SIM_LOCK_FD'] = str(fd)
             queue = Queue(root, args.source_branch, args.lock_dir)
             if args.recover_git_lock:

@@ -915,6 +915,127 @@ class RunnerTest(unittest.TestCase):
         self.assertFalse(any('push' in call or 'credential' in call for call in calls))
         self.assertEqual(self.git(self.remote, 'for-each-ref', '--format=%(refname)'), 'refs/heads/main')
 
+    def test_launcher_swaps_controller_after_active_task_finishes(self):
+        checkout_tools = self.checkout / 'tools'
+        author_tools = self.author / 'tools'
+        for name in ('runner.sh', 'runner_loop.py'):
+            shutil.copyfile(REPO / 'tools' / name, author_tools / name)
+        (author_tools / 'setup_python.py').write_text('import sys\nprint(sys.executable)\n')
+        controller = author_tools / 'run_experiments.py'
+        initial_code = controller.read_text().replace('POLL_SECONDS = 10\n', 'POLL_SECONDS = 0.05\n')
+        controller.write_text(initial_code)
+        release = self.root / 'finish-v1'
+        handler = author_tools / 'experiment_handlers.py'
+        handler.write_text(
+            'from pathlib import Path\n'
+            'import time\n'
+            'def prepare(kind, params):\n'
+            '    def run(source, output):\n'
+            '        if params["marker"] == "v1":\n'
+            '            (output / "ready.txt").touch()\n'
+            '            deadline = time.monotonic() + 10\n'
+            f'            while not Path({str(release)!r}).is_file():\n'
+            '                if time.monotonic() >= deadline: raise RuntimeError("fixture not released")\n'
+            '                time.sleep(0.01)\n'
+            '        (output / "summary.txt").write_text(params["marker"])\n'
+            '        (output / "controller-proof.fixture").write_text("new archive format")\n'
+            '        if params["marker"] == "failed": raise RuntimeError("fixture workload failed")\n'
+            '    return run\n',
+        )
+        task_file = self.author / 'tasks' / '000.json'
+        task = runner.read_json(task_file)
+
+        def publish(version, marker):
+            runner.write_json(task_file, {**task, 'version': version, 'params': {'marker': marker}})
+            self.git(self.author, 'add', '.')
+            self.git(self.author, 'commit', '-m', f'Publish controller fixture v{version}')
+            self.git(self.remote, 'fetch', str(self.author), 'main:main')
+            return self.git(self.author, 'rev-parse', 'HEAD')
+
+        first_commit = publish(1, 'v1')
+        self.git(self.checkout, 'pull', '--ff-only')
+        initial_sha = runner.sha256_file(controller)
+        args = ['bash', str(checkout_tools / 'runner.sh'), '--task', '000', '--worker-id', 'fixture node']
+        env = {**os.environ, 'GPU_NET_SIM_PYTHON': sys.executable}
+        log = self.root / 'launcher.log'
+        with log.open('w') as stream:
+            launcher = subprocess.Popen(args, cwd=self.root, env=env, stdout=stream, stderr=subprocess.STDOUT)
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 10
+            while not predicate():
+                if launcher.poll() is not None or time.monotonic() >= deadline:
+                    self.fail(log.read_text())
+                time.sleep(0.02)
+
+        task_results = self.results / '000-new-kind'
+        first_output = task_results / 'v1'
+        try:
+            wait_for(lambda: (first_output / 'ready.txt').exists())
+            first_run = runner.read_json(first_output / 'run.json')
+            self.assertEqual(first_run['runner_sha256'], initial_sha)
+            self.assertEqual(first_run['source_commit'], first_commit)
+            self.assertEqual(first_run['runner_controller_commit'], first_commit)
+            with self.assertRaisesRegex(runner.RunnerError, 'already locked'):
+                with runner.device_lock(runner.LOCK_PATH):
+                    self.fail('launcher did not keep the host lock while the worker was active')
+
+            controller.write_text(initial_code.replace('RESULT_SUFFIXES = {', "RESULT_SUFFIXES = {'.fixture', ", 1))
+            updated_sha = runner.sha256_file(controller)
+            self.assertNotEqual(initial_sha, updated_sha)
+            handler.write_text(handler.read_text().replace('new archive format', 'updated worker source'))
+            second_commit = publish(2, 'v2')
+            wait_for(lambda: self.git(self.checkout, 'rev-parse', 'refs/gpu-network-simulator/source') == second_commit)
+            self.assertFalse((first_output / 'result.json').exists())
+            self.assertFalse((task_results / 'v2').exists())
+            release.touch()
+            wait_for(lambda: 'complete 000 v2 state=succeeded' in log.read_text())
+
+            first = runner.read_json(first_output / 'result.json')
+            second = runner.read_json(task_results / 'v2' / 'result.json')
+            self.assertEqual(first['runner_sha256'], initial_sha)
+            self.assertNotIn('controller-proof.fixture', first['archive_files'])
+            self.assertEqual(second['runner_sha256'], updated_sha)
+            self.assertEqual(second['source_commit'], second_commit)
+            self.assertEqual(second['runner_controller_commit'], second_commit)
+            self.assertEqual(second['runner_controller_tree'], self.git(self.author, 'rev-parse', f'{second_commit}:tools'))
+            with tarfile.open(runner.archive_path(self.results, second)) as archive:
+                self.assertEqual(archive.extractfile('controller-proof.fixture').read(), b'updated worker source')
+
+            third_commit = publish(3, 'task-only publication')
+            wait_for(lambda: 'complete 000 v3 state=succeeded' in log.read_text())
+            third = runner.read_json(task_results / 'v3' / 'result.json')
+            self.assertEqual(third['source_commit'], third_commit)
+            self.assertEqual(third['runner_sha256'], updated_sha)
+            self.assertEqual(third['runner_controller_commit'], second_commit)
+            transcript = log.read_text()
+            updated_startups = [line for line in transcript.splitlines()
+                                if line.startswith('CPFS worker ') and updated_sha in line]
+            self.assertEqual(len(updated_startups), 1, transcript)
+            self.assertIn('fixture node', updated_startups[0])
+            self.assertLess(transcript.index('complete 000 v1'), transcript.index(updated_startups[0]))
+            self.assertEqual(self.git(self.checkout, 'rev-parse', 'HEAD'), first_commit)
+            self.assertEqual(runner.sha256_file(checkout_tools / 'run_experiments.py'), initial_sha)
+            self.assertEqual(self.git(self.checkout, 'status', '--porcelain', '--untracked-files=no'), '')
+        finally:
+            release.touch()
+            if launcher.poll() is None:
+                launcher.terminate()
+                try:
+                    launcher.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    launcher.kill()
+                    launcher.wait()
+                    raise
+        self.assertEqual(launcher.returncode, 143, log.read_text())
+
+        publish(4, 'failed')
+        once = subprocess.run([*args, '--once'], cwd=self.root, env=env, text=True,
+                              capture_output=True, timeout=15)
+        self.assertEqual(once.returncode, 1, once.stdout + once.stderr)
+        self.assertEqual(once.stdout.count('complete 000 v4 state=failed'), 1, once.stdout)
+        self.assertEqual(runner.read_json(task_results / 'v4' / 'result.json')['runner_sha256'], updated_sha)
+
     def test_completion_precedes_network_and_child_crash_retains_claim(self):
         task, row = self.claim()
         output = runner.run_path(self.results, row)

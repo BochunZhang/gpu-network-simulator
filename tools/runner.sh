@@ -11,4 +11,4 @@ if [ "$#" -eq 1 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; then
 fi
 
 environment_python=$("$bootstrap_python" -B "$script_dir/setup_python.py")
-exec "$environment_python" -B -u "$repo_root/tools/run_experiments.py" "$@"
+exec "$environment_python" -B -u "$repo_root/tools/runner_loop.py" "$@"

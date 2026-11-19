@@ -32,8 +32,9 @@ SYNC_NAMES = ("cudaStreamSynchronize", "cuStreamSynchronize")
 
 
 def preflight(output, env, helpers):
-    runner = Path(sys.argv[0]).resolve()
-    nsys = runner.parent.parent / f"NsightSystems-{VERSION}" / "bin" / "nsys"
+    shared_root = env.get("GPU_NET_SIM_REPO_ROOT")
+    root = Path(shared_root).resolve() if shared_root else Path(sys.argv[0]).resolve().parent.parent
+    nsys = root / f"NsightSystems-{VERSION}" / "bin" / "nsys"
     if not nsys.is_file() or not os.access(nsys, os.X_OK):
         raise RuntimeError(f"missing executable Nsight Systems {VERSION} CLI at {nsys}")
     if not re.fullmatch(r"GPU-[a-fA-F0-9-]+", env.get("CUDA_VISIBLE_DEVICES", "")):
