@@ -1,0 +1,22 @@
+{
+  "archive_name": "gedes-000-fat-tree48-27648-02.v1-261119-141841.tar.gz",
+  "archive_sha256": "494c03525e2b316cb70dba879bb2a8964c2592c91fa05db6210a7b3fd8954619",
+  "archive_size": 635824,
+  "archived_at": "2026-11-19T17:26:32+00:00",
+  "claim": "085648932f8244478889671b56f500bf",
+  "command": "bash tools/runner.sh --task gedes-000-fat-tree48-27648-02 --once",
+  "command_source": "recorded",
+  "id": "gedes-000-fat-tree48-27648-02",
+  "name": "GeDES FatTree48 full warp lifetime trace",
+  "parent_id": "gedes-000-fat-tree48-27648",
+  "schema_version": 1,
+  "slug": "fat-tree48-27648",
+  "source_commit": "70fe3040d80bbf6ebe374155a35e3aa43547b22b",
+  "state": "failed",
+  "subtask_id": "02",
+  "subtask_status": "2026-11-19T14:18:41Z",
+  "task_sha256": "d513d8b24385138df30df7a34aaf376511a7def62655172d4e4dab5829ed42a3",
+  "task_status": "2026-11-18T13:29:35Z",
+  "version": 1795097921,
+  "version_label": "v1-261119-141841"
+}

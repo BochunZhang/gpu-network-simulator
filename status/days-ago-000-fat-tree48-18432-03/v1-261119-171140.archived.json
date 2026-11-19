@@ -1,0 +1,22 @@
+{
+  "archive_name": "days-ago-000-fat-tree48-18432-03.v1-261119-171140.tar.gz",
+  "archive_sha256": "b79dc1ba7f78d76229f5d22c1617e41a79046bab0e891392414170d3b953872a",
+  "archive_size": 2319024,
+  "archived_at": "2026-11-19T17:26:32+00:00",
+  "claim": "b1471ae50a3e43e3a99691c4c0acea1c",
+  "command": "bash tools/runner.sh --task days-ago-000-fat-tree48-18432-03 --once",
+  "command_source": "recorded",
+  "id": "days-ago-000-fat-tree48-18432-03",
+  "name": "Days AGO FatTree48 10-second Nsight Systems compute triage",
+  "parent_id": "days-ago-000-fat-tree48-18432",
+  "schema_version": 1,
+  "slug": "fat-tree48-18432",
+  "source_commit": "d0361331ea21018ee6c02b6f3c4139d466e7782d",
+  "state": "succeeded",
+  "subtask_id": "03",
+  "subtask_status": "2026-11-19T17:11:40Z",
+  "task_sha256": "99adf6c72205ae5181705e0345322584d4b53b6d3ed5258bdf6e2217611c4ea3",
+  "task_status": "2026-11-18T13:29:35Z",
+  "version": 1795108300,
+  "version_label": "v1-261119-171140"
+}
