@@ -28,7 +28,9 @@ import task_catalog
 LOCK_PATH = Path('/tmp/gpu-network-simulator.lock')
 POLL_SECONDS = 10
 TERMINAL = {'succeeded', 'failed', 'abandoned'}
-RESULT_SUFFIXES = {'.json', '.csv', '.txt'}
+NSYS_REPORT_SUFFIX = '.nsys-rep'
+NSYS_REPORT_ARCHIVE_LIMIT = 8 * 1024**3
+RESULT_SUFFIXES = {'.json', '.csv', '.txt', NSYS_REPORT_SUFFIX}
 FILE_LIMIT = 2 * 1024**2
 ARCHIVE_LIMIT = 16 * 1024**2
 # The first classified catalog imported historical experiments. Its publications
@@ -883,7 +885,7 @@ def prepare_archive(output, record):
     tarpath.parent.mkdir(parents=True, exist_ok=True)
     tmp_tar = tarpath.with_suffix('.tmp')
     metadata = output / '.archive-metadata.json'
-    selected, omitted, total = [], [], 0
+    selected, omitted, total, trace_total = [], [], 0, 0
     candidates = []
     for path in output.rglob('*'):
         relative = path.relative_to(output)
@@ -899,7 +901,13 @@ def prepare_archive(output, record):
                                      path.relative_to(output).as_posix()))
     for path in candidates:
         size = path.stat().st_size
-        if size <= FILE_LIMIT and total + size <= ARCHIVE_LIMIT:
+        if path.suffix == NSYS_REPORT_SUFFIX:
+            if trace_total + size <= NSYS_REPORT_ARCHIVE_LIMIT:
+                trace_total += size
+                selected.append(path)
+            else:
+                omitted.append(path.relative_to(output).as_posix())
+        elif size <= FILE_LIMIT and total + size <= ARCHIVE_LIMIT:
             total += size
             selected.append(path)
         else:

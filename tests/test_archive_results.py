@@ -70,6 +70,54 @@ class ArchiveResultsTest(unittest.TestCase):
         self.assertFalse(duplicate.exists())
         self.assertEqual(json.loads(receipt_path.read_text()), receipt)
 
+    def test_failed_profile_round_trips_native_report_and_result_receipt(self):
+        task_id = 'gedes-000-fat-tree48-27648-01'
+        label = 'v1-261119-044456'
+        row = {
+            'id': task_id, 'parent_id': 'gedes-000-fat-tree48-27648', 'subtask_id': '01',
+            'slug': 'fat-tree48-27648', 'name': 'GeDES FatTree48 profile',
+            'task_status': '2026-11-18T13:29:35Z', 'subtask_status': '2026-11-19T04:44:56Z',
+            'version': 1795063496, 'version_label': label, 'kind': 'gedes_fat_tree48',
+            'claim': 'profile-attempt', 'host_id': 'remote-host', 'worker': 'node-a',
+            'source_commit': 'a' * 40, 'task_sha256': 'b' * 64, 'state': 'failed', 'exit_code': 1,
+            'command': f'bash tools/runner.sh --task {task_id} --once',
+        }
+        remote_results = self.root / 'cpfs' / 'results'
+        output = runner.run_path(remote_results, row)
+        output.mkdir(parents=True)
+        trace = hashlib.shake_128(b'nsys-trace-fixture').digest(2_340_000)
+        trace_sha = hashlib.sha256(trace).hexdigest()
+        summary = {'passed': False, 'error': 'flow completion times differ'}
+        (output / 'profile.nsys-rep').write_bytes(trace)
+        (output / 'profile.sqlite').write_bytes(b'sqlite export')
+        runner.write_json(output / 'summary.json', summary)
+
+        runner.prepare_archive(output, row)
+        self.assertEqual(set(row['archive_files']), {'result.json', 'summary.json', 'profile.nsys-rep'})
+        remote_package = runner.archive_path(remote_results, row)
+        original = remote_package.read_bytes()
+        original_sha = hashlib.sha256(original).hexdigest()
+        package = self.incoming / remote_package.name
+        package.write_bytes(original)
+        ordinary_limit = 1024**2
+        tar_limit = ordinary_limit + importer.MAX_MEMBERS * 1024 + 1024**2
+        self.assertGreater(len(original), ordinary_limit)
+        with patch.multiple(importer, MAX_BYTES=ordinary_limit, MAX_TAR_BYTES=tar_limit):
+            receipt_path = importer.archive_package(package, self.results, self.status)
+
+        archived_output = self.results / task_id / label
+        self.assertFalse(package.exists())
+        self.assertEqual((archived_output / 'profile.nsys-rep').read_bytes(), trace)
+        self.assertEqual(runner.sha256_file(archived_output / 'profile.nsys-rep'), trace_sha)
+        self.assertEqual(runner.read_json(archived_output / 'summary.json'), summary)
+        self.assertEqual(runner.read_json(archived_output / 'result.json')['state'], 'failed')
+        self.assertFalse((archived_output / 'profile.sqlite').exists())
+        self.assertEqual((output / 'profile.sqlite').read_bytes(), b'sqlite export')
+        self.assertEqual((archived_output.parent / remote_package.name).read_bytes(), original)
+        receipt = runner.read_json(receipt_path)
+        self.assertEqual(receipt['archive_sha256'], original_sha)
+        self.assertEqual(receipt['state'], 'failed')
+
     def test_classified_receipt_remains_idempotent_after_redownload(self):
         child = 'gedes-000-smoke-02'
         fields = {'parent_id': 'gedes-000-smoke', 'subtask_id': '02',

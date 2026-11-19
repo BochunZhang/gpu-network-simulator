@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_BYTES = 64 * 1024**2
 MAX_MEMBERS = 4096
 MAX_TAR_BYTES = MAX_BYTES + MAX_MEMBERS * 1024 + 1024**2
+GZIP_FRAMING_BYTES = 4 * 1024**2
 IDENTITY = ('id', 'version', 'claim', 'source_commit', 'task_sha256', 'state')
 
 
@@ -47,22 +48,29 @@ def import_lock(lock_dir):
             path.rmdir()
 
 
-def copy_limited(source, destination):
+def copy_limited(source, destination, limit, overflow_message):
     total = 0
     while True:
-        chunk = source.read(min(1024**2, MAX_BYTES - total + 1))
+        chunk = source.read(min(1024**2, limit - total + 1))
         if not chunk:
             return
         total += len(chunk)
-        if total > MAX_BYTES:
-            raise ArchiveError('result package exceeds the 64 MiB import limit')
+        if total > limit:
+            raise ArchiveError(overflow_message)
         destination.write(chunk)
+
+
+def compressed_limit(report_bytes):
+    # Incompressible native reports may expand slightly under gzip, in addition
+    # to the member framing already covered by MAX_TAR_BYTES.
+    return MAX_TAR_BYTES + report_bytes + GZIP_FRAMING_BYTES if report_bytes else MAX_BYTES
 
 
 def inspect_package(package, extracted):
     files = {}
     directories = set()
     total = 0
+    report_bytes = 0
     tar_end = 0
     with tarfile.open(package, 'r:gz') as archive:
         for member in archive:
@@ -78,19 +86,30 @@ def inspect_package(package, extracted):
                 directories.add(normalized)
                 tar_end = max(tar_end, member.offset_data)
                 continue
-            total += member.size
-            if member.size < 0 or total > MAX_BYTES:
-                raise ArchiveError('uncompressed result package exceeds 64 MiB')
+            if member.size < 0:
+                raise ArchiveError(f'negative package member size: {member.name!r}')
+            if path.suffix == runner.NSYS_REPORT_SUFFIX:
+                report_bytes += member.size
+                if report_bytes > runner.NSYS_REPORT_ARCHIVE_LIMIT:
+                    raise ArchiveError('uncompressed Nsight Systems reports exceed the import limit')
+            else:
+                total += member.size
+                if total > MAX_BYTES:
+                    raise ArchiveError('uncompressed result package exceeds 64 MiB')
             tar_end = max(tar_end, member.offset_data + ((member.size + 511) // 512) * 512)
             target = extracted / path
             target.parent.mkdir(parents=True, exist_ok=True)
             with archive.extractfile(member) as source, target.open('xb') as destination:
-                copy_limited(source, destination)
+                copy_limited(source, destination, member.size,
+                             f'package member exceeds its declared size: {member.name!r}')
                 destination.flush()
                 os.fsync(destination.fileno())
             if target.stat().st_size != member.size:
                 raise ArchiveError(f'incomplete package member: {member.name}')
             files[normalized] = runner.sha256_file(target)
+    if package.stat().st_size > compressed_limit(report_bytes):
+        raise ArchiveError('result package exceeds the compressed import limit' if report_bytes
+                           else 'result package exceeds the 64 MiB import limit')
     # tarfile stops at its end marker. Drain gzip separately so incomplete or
     # CRC-invalid downloads cannot produce a receipt, including hidden tails.
     offset = 0
@@ -99,7 +118,7 @@ def inspect_package(package, extracted):
             chunk = stream.read(1024**2)
             if not chunk:
                 break
-            if offset + len(chunk) > MAX_TAR_BYTES:
+            if offset + len(chunk) > MAX_TAR_BYTES + report_bytes:
                 raise ArchiveError('compressed package expands beyond the import limit')
             if offset + len(chunk) > tar_end and chunk[max(0, tar_end - offset):].strip(b'\0'):
                 raise ArchiveError('unexpected data after the tar members')
@@ -229,7 +248,8 @@ def archive_package(package, results_dir, status_dir):
         staging = Path(temporary)
         frozen = staging / 'incoming.tar.gz'
         with package.open('rb') as source, frozen.open('xb') as destination:
-            copy_limited(source, destination)
+            copy_limited(source, destination, compressed_limit(runner.NSYS_REPORT_ARCHIVE_LIMIT),
+                         'result package exceeds the compressed import limit')
             destination.flush()
             os.fsync(destination.fileno())
         extracted = staging / 'files'

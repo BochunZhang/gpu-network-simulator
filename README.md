@@ -179,7 +179,9 @@ python3 tools/archive_results.py
 
 旧版包缺少简称和命令时，工具按实验类型补全简称，并把生成的入口命令标记为复现命令。原始压缩包保持原样，确保已经下载的旧版包也能通过 SHA-256 确认。
 
-构建日志和大 trace 保留在远程结果目录，随版本目录一起移入 `results-archive/`。摘要包包含执行记录、小型统计与 CSV，分析时可另取 `worker.log`、`configure.log` 和 `build.log`。
+结果包包含执行记录、小型统计和 CSV，也包含已生成的原始 Nsight Systems `.nsys-rep` 报告。每个执行版本的原始报告合计最多 8 GiB，与小文件配额分别计算。超出配额的报告保留在远程目录，并在 `result.json` 的 `archive_omitted` 中列出。仿真验收失败时，已经生成的报告也会纳入打包。归档后可在本地对应的 `results/{子任务标识}/{version_label}/` 目录中打开报告。
+
+构建日志和派生 SQLite 等大文件保留在远程结果目录，随版本目录一起移入 `results-archive/`。分析时可另取 `worker.log`、`configure.log` 和 `build.log`。
 
 本地检查可运行以下命令，GPU 性能与 CPFS 跨机行为仍以目标设备上的实验为准。
 
