@@ -63,7 +63,9 @@ def copy_limited(source, destination, limit, overflow_message):
 def compressed_limit(report_bytes):
     # Incompressible native reports may expand slightly under gzip, in addition
     # to the member framing already covered by MAX_TAR_BYTES.
-    return MAX_TAR_BYTES + report_bytes + GZIP_FRAMING_BYTES if report_bytes else MAX_BYTES
+    if not report_bytes:
+        return MAX_BYTES
+    return MAX_TAR_BYTES + report_bytes + max(GZIP_FRAMING_BYTES, report_bytes // 1000)
 
 
 def inspect_package(package, extracted):
@@ -71,6 +73,8 @@ def inspect_package(package, extracted):
     directories = set()
     total = 0
     report_bytes = 0
+    warp_bytes = 0
+    warp_capture = False
     tar_end = 0
     with tarfile.open(package, 'r:gz') as archive:
         for member in archive:
@@ -88,7 +92,11 @@ def inspect_package(package, extracted):
                 continue
             if member.size < 0:
                 raise ArchiveError(f'negative package member size: {member.name!r}')
-            if path.suffix == runner.NSYS_REPORT_SUFFIX:
+            if warp_capture and normalized in runner.WARP_TRACE_FILES:
+                warp_bytes += member.size
+                if warp_bytes > runner.WARP_TRACE_ARCHIVE_LIMIT:
+                    raise ArchiveError('uncompressed warp traces exceed the import limit')
+            elif path.suffix == runner.NSYS_REPORT_SUFFIX:
                 report_bytes += member.size
                 if report_bytes > runner.NSYS_REPORT_ARCHIVE_LIMIT:
                     raise ArchiveError('uncompressed Nsight Systems reports exceed the import limit')
@@ -107,8 +115,11 @@ def inspect_package(package, extracted):
             if target.stat().st_size != member.size:
                 raise ArchiveError(f'incomplete package member: {member.name}')
             files[normalized] = runner.sha256_file(target)
-    if package.stat().st_size > compressed_limit(report_bytes):
-        raise ArchiveError('result package exceeds the compressed import limit' if report_bytes
+            if normalized == 'result.json' and member.size <= 2 * 1024**2:
+                metadata = runner.read_json(target)
+                warp_capture = isinstance(metadata, dict) and runner.is_warp_capture(metadata)
+    if package.stat().st_size > compressed_limit(report_bytes + warp_bytes):
+        raise ArchiveError('result package exceeds the compressed import limit' if report_bytes or warp_bytes
                            else 'result package exceeds the 64 MiB import limit')
     # tarfile stops at its end marker. Drain gzip separately so incomplete or
     # CRC-invalid downloads cannot produce a receipt, including hidden tails.
@@ -118,7 +129,7 @@ def inspect_package(package, extracted):
             chunk = stream.read(1024**2)
             if not chunk:
                 break
-            if offset + len(chunk) > MAX_TAR_BYTES + report_bytes:
+            if offset + len(chunk) > MAX_TAR_BYTES + report_bytes + warp_bytes:
                 raise ArchiveError('compressed package expands beyond the import limit')
             if offset + len(chunk) > tar_end and chunk[max(0, tar_end - offset):].strip(b'\0'):
                 raise ArchiveError('unexpected data after the tar members')
@@ -248,7 +259,7 @@ def archive_package(package, results_dir, status_dir):
         staging = Path(temporary)
         frozen = staging / 'incoming.tar.gz'
         with package.open('rb') as source, frozen.open('xb') as destination:
-            copy_limited(source, destination, compressed_limit(runner.NSYS_REPORT_ARCHIVE_LIMIT),
+            copy_limited(source, destination, compressed_limit(runner.NSYS_REPORT_ARCHIVE_LIMIT + runner.WARP_TRACE_ARCHIVE_LIMIT),
                          'result package exceeds the compressed import limit')
             destination.flush()
             os.fsync(destination.fileno())

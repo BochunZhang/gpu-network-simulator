@@ -1,0 +1,23 @@
+---
+title: Time model
+description: The exact nanosecond boundary around Nexosim's legacy simulation clock.
+---
+
+This page describes time in the **legacy Nexosim engine**. The exact executor represents event time directly as `u64` nanoseconds in `EventKey`.
+
+Nexosim stores its monotonic simulation clock as `MonotonicTime`. A `Simulation` exposes it through `time()`, and model handlers can read it through `Context::time()`. The type is defined in `crates/nexosim/src/time.rs`.
+
+## Legacy integer-nanosecond boundary
+
+Legacy configuration still expresses many durations as seconds, but the simulator converts them at the event-clock boundary in `legacy/src/utils/exact_time.rs`:
+
+- Scenario-level values must resolve to a finite, nonnegative integer number of nanoseconds. Positive sub-nanosecond and fractional-nanosecond values are rejected.
+- Positive sampled or controller delays are rounded up to the earliest non-early nanosecond tick.
+- Packet serialization uses checked integer arithmetic and rounds positive delay up.
+- `clock_ns` reads the exact integer offset from the Nexosim epoch.
+
+Some legacy model fields, including `Packet.time`, retain an `f64` seconds view for compatibility, controller calculations, and reports. That view is derived from the integer event clock; it is not a replacement for `Context::time()` or the authoritative event timestamp.
+
+The legacy `time_quantum` setting is implemented by a Nexosim compatibility shim. Exact scenario compilation rejects a nonzero `time_quantum`; exact parallelism instead depends on positive channel lookahead and safe-horizon rounds.
+
+See [/docs/architecture/time-concurrency](/docs/architecture/time-concurrency) for the architecture-level comparison and [/docs/internals](/docs/internals) for exact round execution.

@@ -1,0 +1,66 @@
+---
+title: Days
+description: Days AGO, an exact safe-horizon network simulator whose Scalar, CPU, Metal, and CUDA backends produce byte-identical complete state.
+icon: Network
+---
+
+Days simulates packet networks exactly and in parallel. Its executor, **Days AGO** (Adaptive Guaranteed Ordering), compiles a TOML scenario into a `SimulationImage`, splits the network into logical processes (LPs), and advances them concurrently in rounds bounded by a safe horizon. Lean proofs in `lean/DaysExecutor/` show that round execution reaches the same result as serial execution in canonical event order.
+
+Four backends run the same image:
+
+| Backend | Where it runs |
+| --- | --- |
+| Scalar | one CPU thread; the reference oracle |
+| CPU | a multicore worker pool |
+| Metal | Apple GPUs (not the M1 family) |
+| CUDA | NVIDIA GPUs (built for `sm_86`, `sm_89` and `sm_121`) |
+
+Every backend that accepts a scenario produces byte-identical complete state. A backend that cannot run a mechanism rejects the scenario at validation with a message naming the backend; it never falls back silently.
+
+<Cards>
+  <Card title="Install" href="/docs/install" />
+  <Card title="Quickstart" href="/docs/quickstart" />
+  <Card title="Examples" href="/docs/examples" />
+  <Card title="Configuration" href="/docs/configuration/overview" />
+  <Card title="Architecture" href="/docs/architecture/overview" />
+  <Card title="days CLI" href="/docs/reference/cli/days" />
+</Cards>
+
+## What Days AGO models
+
+- **Topologies:** fat-tree, torus, dragonfly, custom graphs, and the Spectrum-X rail fabric of SimAI, with delay-only NVLink inside a server and SimAI's Murmur3 ECMP.
+- **Transport:** deterministic packet-distribution sources, closed-loop TCP Reno and CUBIC, Mellanox-form DCQCN (the controller of HPCC's ns-3 model and SimAI) on unreliable flows, and RoCE queue pairs with Go-back-N reliability and ECN echo.
+- **Switches:** FIFO, strict-priority, DRR, WRR, and exact-rational WFQ scheduling; TailDrop admission and ECN marking on a Kmin/Kmax/Pmax ramp; PFC.
+- **Collectives:** ring all-reduce, all-gather, reduce-scatter, all-to-all (uniform or seeded imbalanced), and send/receive over TCP or RoCE queue pairs, with delay-only compute stages and counted joins between them.
+- **Workloads:** AICB/SimAI training traces, lowered onto the Spectrum-X fabric with the fabric parameters taken from `SimAI.conf`.
+
+DCQCN, RoCE queue pairs, PFC, the ECN ramp, collectives, compute stages, and stage notifies run on all four backends.
+
+## What makes it exact
+
+- **Integer time and canonical order.** Events carry integer-nanosecond time and a canonical key `(time_ns, phase, origin_node, origin_seq)`; no floating point appears in simulation semantics.
+- **Byte identity across backends.** The CPU pool and each compiled device backend must reproduce the Scalar oracle's complete result byte for byte. Device backends omit only diagnostic-only observation planes, which the comparison excludes.
+- **Refuse-or-run device capacity.** The device planner derives every arena capacity from the image before execution. An attempt that runs out of capacity is discarded and retried with larger floors; nothing is dropped silently. The largest committed fixture, `configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml`, has 262,144 closed-loop TCP flows.
+
+## Quick start
+
+From the repository root, run the Scalar oracle on the smoke fixture. The last line it prints, `record=days_result`, fingerprints the complete result. Every other engine that accepts the scenario must print the same fingerprint; the [TCP corpus gate](/docs/testing#tcp-corpus-byte-identity) checks this fixture on each available backend.
+
+```bash
+cargo run --release --bin days -- --engine scalar \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
+```
+
+The [quickstart](/docs/quickstart) covers the CPU, Metal, and CUDA engines.
+
+## Legacy Days
+
+The original actor-model simulator on the Nexosim runtime is frozen in `legacy/` as the `days-legacy` crate and still runs. It is documented in its own section: [Legacy Days](/docs/legacy).
+
+## Where to go next
+
+- Run simulations: [Quickstart](/docs/quickstart) and [Examples](/docs/examples)
+- Every `days` option and output record: [`days` CLI](/docs/reference/cli/days)
+- The scenario format: [Configuration](/docs/configuration/overview)
+- The execution model and backends: [Architecture](/docs/architecture/overview)
+- Proofs and trace certificates: [Verification and research](/docs/research)

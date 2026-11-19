@@ -50,6 +50,34 @@ class FatTree48Test(unittest.TestCase):
         self.assertEqual(seconds, 1.5)
         self.assertEqual(errors, ['Packet pool is not enough!'])
 
+    def test_build_uses_maintained_cmake_project_and_records_its_sources(self):
+        helpers = Mock(GEDES=(None, audit.UPSTREAM_REVISION))
+        helpers.write_json.side_effect = lambda path, record: path.write_text(json.dumps(record))
+        repo = Path(__file__).resolve().parents[1]
+        scratch = self.output / 'scratch'
+        build = scratch / 'build'
+        build.mkdir(parents=True)
+        (build / 'GeDES').write_bytes(b'fixture')
+        binary = study._build_gedes(repo, self.output, scratch, '10.0', {'FT48_WARP_LIBDIR': '/lib/test'}, helpers)
+        self.assertEqual(binary, build / 'GeDES')
+        args = helpers.command.call_args_list[0].args[0]
+        self.assertEqual(Path(args[args.index('-S') + 1]), repo / 'simulators/gedes/GeDES_code')
+        self.assertIn('-DFT48_WARP_LIBDIR=/lib/test', args)
+        hashes = json.loads((self.output / 'build.json').read_text())['compiled_source_sha256']
+        self.assertIn('code/c++/src/components/topology.cc', hashes)
+        self.assertIn('main.cc', hashes)
+        helpers.checkout.assert_not_called()
+
+    def test_paired_fct_joins_by_flow_and_reports_observed_differences(self):
+        header = 'source_ip,dst_ip,flow_completion_time\n'
+        baseline = self.output / 'baseline.csv'
+        profiled = self.output / 'profile.csv'
+        baseline.write_text(header + '1,2,17\n2,1,31\n')
+        profiled.write_text(header + '2,1,31\n1,2,24\n')
+        self.assertEqual(study._paired_fct(baseline, profiled),
+                         {'flow_count': 2, 'different_flow_count': 1,
+                          'max_absolute_difference_ns': 7, 'all_equal': False})
+
     def test_streaming_queue_gate_rejects_duplicate_readbacks(self):
         queues = self.output / 'queues.csv'
         queues.write_text('group,index,entries\ntcp_ingress,0,0\ntcp_ingress,0,0\n')
@@ -108,6 +136,42 @@ namespace VDES {''', 1
         with self.assertRaisesRegex(ValueError, 'capture window boundaries'):
             study._read_capture_window(log, 3, 10)
 
+    def test_warp_profile_reports_paired_timing_separately_from_validated_work(self):
+        helpers = Mock(GEDES=(None, audit.UPSTREAM_REVISION))
+        warp = Mock()
+        warp.prepare.return_value = {'FT48_WARP_LIBDIR': '/lib/test'}
+        warp.capture_environment.return_value = {'FT48_WARP_OUTPUT': str(self.output / 'warp')}
+        warp.collect.return_value = {'passed': True}
+        helpers._support_module.side_effect = lambda _, name: {'gedes_experiments': audit, 'gedes_drain': drain,
+                                                              'warp_ft48': warp}[name]
+        helpers.selected_gpu.return_value = ('10.0', {'FT48_WARP_OUTPUT': 'inherited'})
+        helpers.write_json.side_effect = lambda path, record: path.write_text(json.dumps(record))
+        (self.output / 'gpu.json').write_text(json.dumps({'uuid': 'GPU-fixture', 'name': 'NVIDIA GB200'}))
+        (self.output / 'gpu-free-mib.txt').write_text('188000')
+
+        def run_case(binary, output, env, audit, drain, helpers, record, **kwargs):
+            traced = output.name == 'profile'
+            if traced:
+                Path(env['GEDES_FT48_GRAPH_DOT']).write_text('digraph fixture { A -> B }')
+            else:
+                self.assertNotIn('FT48_WARP_OUTPUT', env)
+            (output / 'flows.csv').write_text(
+                'source_ip,dst_ip,flow_completion_time\n1,2,' + ('23' if traced else '20') + '\n')
+            record.update(measurements={'rounds': 4 if traced else 3,
+                                        'completed_nodes': 1, 'completed_channel_blocks': 1},
+                          flows={'csv_sha256': str(traced), 'reported_input_sha256': 'same'},
+                          snapshot={'acked_bytes': 1460})
+
+        with patch.object(study, '_build_gedes', return_value=self.output / 'GeDES'), \
+                patch.object(study, '_run_case', side_effect=run_case):
+            study.run(self.output, self.output, helpers, warp_trace=True)
+        summary = json.loads((self.output / 'summary.json').read_text())
+        self.assertTrue(summary['passed'])
+        self.assertTrue(summary['warp_profile']['passed'])
+        self.assertFalse(summary['warp_profile']['round_counts_equal'])
+        self.assertEqual(summary['warp_profile']['paired_fct']['max_absolute_difference_ns'], 3)
+        warp.collect.assert_called_once_with(self.output, self.output, 'gedes', 4)
+
     def test_short_profile_collects_trace_before_reporting_fct_mismatch(self):
         binary = self.output / 'GeDES'
         nsys = self.output / 'nsys'
@@ -116,7 +180,6 @@ namespace VDES {''', 1
         profiler.prefix.return_value = ['nsys', 'profile']
         profiler.collect.return_value = {'passed': True}
         drain_fixture = Mock()
-        drain_fixture.build_audit.return_value = binary
         helpers = Mock(GEDES=(None, audit.UPSTREAM_REVISION))
         modules = {'gedes_experiments': audit, 'gedes_drain': drain_fixture, 'nsys_ft48': profiler}
         helpers._support_module.side_effect = lambda source, name: modules[name]
@@ -137,11 +200,12 @@ namespace VDES {''', 1
                           flows={'csv_sha256': str(profiled), 'reported_input_sha256': 'same'},
                           snapshot={'acked_bytes': 1460})
 
-        with patch.object(study, '_run_case', side_effect=run_case) as run_cases:
+        with patch.object(study, '_run_case', side_effect=run_case) as run_cases, \
+                patch.object(study, '_build_gedes', return_value=binary) as build:
             with self.assertRaisesRegex(RuntimeError, 'flows.csv_sha256'):
                 study.run(self.output, self.output, helpers, profile=True, capture_seconds=10)
         self.assertEqual(run_cases.call_count, 2)
-        self.assertIn('patch_main', drain_fixture.build_audit.call_args.kwargs)
+        self.assertIn('patch_main', build.call_args.kwargs)
         profiler.prefix.assert_called_once_with(nsys, self.output, capture_range=True)
         window = {'first_round': 0, 'end_round': 2, 'wall_ns': 10_000_000_000, 'requested_seconds': 10}
         profiler.collect.assert_called_once_with(nsys, self.output, {}, helpers, simulator='gedes',

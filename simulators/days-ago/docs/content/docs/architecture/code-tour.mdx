@@ -1,0 +1,85 @@
+---
+title: Code Tour
+description: Map shared, exact-executor, and legacy subsystems to the Rust source tree.
+---
+
+**Scope: Days AGO and Legacy Days.** The repository contains shared scenario code plus two engine implementations. Start by deciding whether a file belongs to Days AGO or the legacy Nexosim actor path.
+
+## Workspace and entrypoints
+
+- `src/lib.rs`: shared/current library root.
+- `src/bin/days.rs`: the `days` CLI, which selects the Scalar, CPU, Metal, or CUDA engine.
+- `src/scenario/`: exact scenario parsing, semantic IDs, and image lowering.
+- `src/topos/`: shared topology construction and routing.
+- `executor/`: exact scalar, CPU, Metal, and CUDA engine crate.
+- `legacy/src/lib.rs`: legacy IDs, seed state, configuration, and simulation entrypoints.
+- `legacy/src/main.rs`: the `days-legacy` CLI.
+- `validation/`: cross-engine and cross-backend validation tests.
+- `lean/`: offline protocol conformance models and proofs.
+
+## Shared topology and exact lowering
+
+- `src/topos/config.rs`: topology, switch, link, host-attachment, and routing configuration types.
+- `src/topos/build.rs`: FatTree, Torus, Dragonfly, and custom graph builders; returns `HostAttachments` and `TopologyProfile` with the graph.
+- `src/topos/rail.rs`: the Spectrum-X rail builder, its SimAI-format renderer, SimAI's Murmur3 ECMP hash, and `ServerLocality` (server membership, the delay-only NVLink formula, SimAI's `maxBdp` window).
+- `src/topos/route.rs`: shortest path, per-flow ECMP, explicit path, and semantic FatTree ECMP implementations.
+- `src/scenario/compile.rs`: exact-model validation and lowering into `SimulationImage`.
+- `src/scenario/ids.rs`: stable semantic LP, link, flow, packet, and payload ID assignment.
+- `src/scenario/workload.rs`: the typed workload IR (groups, transports, operations with host-matched `after` lists) that TOML stage groups and the AICB adapter both lower through.
+- `src/scenario/collective_shapes.rs`: SimAI's ring channels and per-message byte rules, shared by lowering and the adapter.
+- `src/workload/aicb/`: the AICB/SimAI workload adapter: trace parser, `MockNcclGroup` group formation, schedule planner, `SimAI.conf` reader, and the `[workload.aicb]` scenario table.
+
+## Days AGO executor
+
+Core representation and semantics:
+
+- `executor/src/image.rs`: immutable image descriptors and owned host/switch/flow state.
+- `executor/src/event.rs`: fixed event payloads, phases, and canonical `EventKey` ordering.
+- `executor/src/model.rs`: schedulers, admission policies, queue units, and protocol state types.
+- `executor/src/scalar.rs`: shared transition semantics, global scalar calendar, observations, and `RunResult`.
+- `executor/src/validate.rs`: image invariants and backend capability rejection.
+- `executor/src/time.rs`: checked integer-nanosecond arithmetic.
+
+Parallel execution:
+
+- `executor/src/safe_horizon.rs`: round scalar, sparse LP frontier, exclusive horizons, and canonical remote exchange.
+- `executor/src/cpu.rs`: persistent CPU workers and whole-LP ownership.
+- `executor/src/metal.rs` and `executor/src/metal_kernels.metal`: Metal planning, execution, retry, gather, and readback.
+- `executor/src/cuda.rs` and `executor/src/cuda_kernels.cu`: CUDA planning, execution, retry, gather, and readback.
+- `executor/src/device_sizing.rs`: shared arena sizing.
+- `executor/src/stage_sizing.rs`: the stage-aware (width) and window-aware bounds the planners apply to stage flows.
+- `executor/src/device_pfc.rs`: the device PFC rows, including the per-class parked bitsets of host-link PFC.
+- `executor/src/seeded_matrix.rs`: the seeded routing matrix of an imbalanced all-to-all.
+- `executor/src/device_capacity.rs`: caps, per-entity floors, retries, and `CapacityWarmStart`.
+- `executor/src/device_compaction.rs`: canonical live-record readback plans.
+- `executor/src/device_scheduler.rs`: checked device scheduler arithmetic.
+- `executor/src/planner_capacity.rs`: planner capacity context shared by device paths.
+
+Mechanism-specific exact state and traces live in `executor/src/tcp.rs`, `tcp_ledger.rs`, `dcqcn.rs`, `roce.rs`, `aqm_trace.rs`, `mechanism_trace.rs`, and `tcp_trace.rs`.
+
+The largest committed fixture, the closed 262,144-flow `configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml`, runs through the same `days` CLI as every other scenario.
+
+## Legacy Nexosim engine
+
+Assembly and runtime boundary:
+
+- `legacy/src/config.rs`: strict validation of the legacy configuration surface.
+- `legacy/src/topos/topo.rs`: actor construction, port wiring, routing/FIB installation, execution, and result collection.
+- `legacy/src/utils/exact_time.rs`: integer-nanosecond event-clock conversions.
+
+Network actors:
+
+- `legacy/src/switches/switch.rs`: `PacketSwitch` forwarding.
+- `legacy/src/schedulers/`: FIFO, strict priority, WFQ, DRR, WRR, VirtualClock, and admission policies.
+- `legacy/src/flows/`: packet-distribution, TCP, DCQCN, collective, source/sink, application-source, and wire models.
+- `legacy/src/l2/`: feature-gated link frames and PFC actors.
+- `crates/nexosim/`: vendored actor runtime, ports, mailboxes, scheduler, clock, and executors.
+
+## Logging and verification
+
+- `CsvLogger`: the legacy CSV logger, which owns `csv_logging`, periodic reports, CSV files, and trace manifest generation. Days AGO does not use it.
+- `legacy/src/utils/ui.rs`: legacy progress UI.
+- `tests/`: shared lowering and exact integration tests.
+- `executor/tests/`: executor unit and backend contract tests.
+- `legacy/tests/`: legacy configuration and behavior tests.
+- `validation/tests/`: normalized cross-engine/backend comparisons.

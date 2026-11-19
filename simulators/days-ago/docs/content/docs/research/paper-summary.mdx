@@ -1,0 +1,83 @@
+---
+title: Paper summary
+description: The research narrative behind LeanGuard trace certificates and the Days AGO multi-backend executor.
+---
+
+Two research lines share this repository: **LeanGuard**, the trace-certificate
+methodology built on the legacy engine, and the **exact executor** (Days AGO),
+whose execution model is itself proved in Lean and whose backends are held to
+byte-identity. This page summarizes both, and is careful to separate shipped
+code, committed fixtures, and external campaign evidence.
+
+## LeanGuard: trace certificates + trusted replay
+
+![LeanGuard overview: the simulator emits a per-transition trace certificate and a trusted Lean checker replays it.](/figures/leanguard-intro.svg)
+
+LeanGuard follows an "untrusted producer / trusted checker" workflow:
+
+1. **Days** emits a *per-transition* trace (one row per protocol transition),
+   including a deterministic snapshot of post-state.
+2. A **Lean 4 checker** canonicalizes the trace. Legacy protocol families
+   sort by `(time_ns, event_id)` and reject duplicates; Days AGO checkers
+   key on the full `EventKey`, and some require already-strict canonical
+   order.
+3. The checker **replays** an executable reference model and returns
+   `ACCEPT` or `REJECT` with the first counterexample row.
+
+See [/docs/verification/design](/docs/verification/design) for the practical
+guide, [/docs/research/design](/docs/research/design) for the design notes,
+and [/docs/reference/traces/schema](/docs/reference/traces/schema) for row
+conventions. The coverage-guided test-generation loop that builds on these
+checkers is summarized in
+[/docs/research/test-generation](/docs/research/test-generation).
+
+## Days AGO: proofs and byte identity
+
+The Days AGO claim is structural. Five Lean theorems about the execution
+machinery (`lean/DaysExecutor*`) license safe-horizon rounds and
+intra-round reordering. The corpus gate then checks every backend against
+them: the CPU pool and each compiled device backend must reproduce the
+global Scalar reference's complete result byte for byte (device-omitted
+diagnostics excluded) on every corpus fixture.
+
+The device arc that made this practical at scale shipped in this tree:
+planner equality across backends, persistent arenas, per-entity capacity
+derivation with refuse-or-run faults and bounded retry, ring and vector
+sizing, compact readback (only live regions return), and an opt-in capacity
+warm start that affects sizing only. The largest committed fixture runs
+**262,144 closed-loop TCP flows**
+(`configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml`).
+
+The tree also ships the TCP corpus byte-identity gate
+(`validation/tests/tcp_corpora.rs`), CUDA upload provisioning for
+unified-memory hosts, strict legacy configuration validation, and the
+TOML `csv_logging` switch for legacy runs.
+
+## Runnable benchmarks
+
+The committed E5 fixture family is the recommended runnable benchmark set:
+8,192 byte-terminated TCP flows on a k=32 fat tree, with a Reno primary
+(`q200`), a CUBIC variant, and a `q256` backup. See
+[Examples](/docs/examples#e5-wide-tcp). Measured run times are
+machine-qualified and live in the project's evidence archive, not in these
+pages.
+
+## Measured negatives, kept on the record
+
+Two device optimizations were implemented, measured in paired A/B campaigns,
+and **not merged**. They are recorded here because the method is the point:
+
+- **Pinned host staging for CUDA uploads**: exactness passed; process wall
+  time regressed materially on the discrete-GPU host. Verdict: hold.
+- **Structure-of-arrays drain layout**: all seven identity anchors byte-exact;
+  slower on the E5 and every E6 device clock in the paired A/B (one process
+  wall at parity). Verdict: the shipped layout stands.
+
+## External campaign evidence
+
+The E6 UDP/CBR fixture family is committed in this tree and runnable. Its
+multi-engine comparison campaigns (against sequential and MPI ns-3, Unison,
+GeDES, and the legacy engine) remain external campaign evidence, recorded in
+the project's evidence archive with machine-qualified results. Results
+quoted from those campaigns carry their machine and clock definitions at the
+citation site.

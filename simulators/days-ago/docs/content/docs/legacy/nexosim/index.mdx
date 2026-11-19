@@ -1,0 +1,28 @@
+---
+title: Nexosim legacy engine
+description: The actor-like discrete-event runtime used by the legacy Days simulator.
+---
+
+The legacy Days simulator is built on **Nexosim**, vendored under `crates/nexosim`. The current exact executor does not run Nexosim models; it uses the LP and fixed-event machinery described in [/docs/internals](/docs/internals).
+
+Nexosim provides the legacy engine with:
+
+- an actor-like `Model` API
+- mailboxes for delivering events and queries to models
+- typed `Output<T>` ports
+- single-threaded and multithreaded executors
+- a scheduler and monotonic simulation clock
+
+Start with [/docs/architecture/simulation-engine](/docs/architecture/simulation-engine) for the legacy topology-level view.
+
+## Code map
+
+- Crate root: `crates/nexosim/src/lib.rs`
+- Simulation lifecycle and stepping: `crates/nexosim/src/simulation.rs`
+- Bench construction: `crates/nexosim/src/simulation/sim_init.rs`
+- Ports and message delivery: `crates/nexosim/src/ports.rs`
+- Single-threaded and multithreaded executors: `crates/nexosim/src/executor.rs`
+- Time types: `crates/nexosim/src/time.rs`
+- Legacy Days assembly and execution: `legacy/src/topos/topo.rs`
+
+The vendored crate is version 1.0.0. Its `SimInit` includes three Days compatibility shims: `set_hot_worker_count`, `set_max_groups_per_step_task`, and `set_time_quantum_ns`.

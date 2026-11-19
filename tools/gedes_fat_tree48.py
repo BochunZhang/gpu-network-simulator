@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 import re
+import shutil
 from tempfile import TemporaryDirectory
 import time
 
@@ -174,7 +175,49 @@ def _work_differences(baseline, profiled):
     return differences
 
 
-def run(source, output, helpers, profile=False, capture_seconds=None):
+def _build_gedes(source, output, scratch, capability, env, helpers, patch_main=None):
+    repo_src = source / 'simulators/gedes/GeDES_code'
+    src = repo_src
+    if patch_main is not None:
+        src = scratch / 'profile-source'
+        shutil.copytree(repo_src, src)
+        main = src / 'main.cc'
+        main.write_text(patch_main(main.read_text()))
+        (output / 'main.cc-profile.txt').write_bytes(main.read_bytes())
+    build = scratch / 'build'
+    options = ['-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_ARCHITECTURES=' + capability.replace('.', '')]
+    if 'FT48_WARP_LIBDIR' in env:
+        options.append('-DFT48_WARP_LIBDIR=' + env['FT48_WARP_LIBDIR'])
+    helpers.command(['cmake', '-S', str(src), '-B', str(build), *options], output / 'configure.log', env=env)
+    helpers.command(['cmake', '--build', str(build), '--parallel', '4'], output / 'build.log', env=env)
+    binary = build / 'GeDES'
+    helpers.write_json(output / 'build.json', {
+        'source': 'simulators/gedes/GeDES_code',
+        'revision': helpers.GEDES[1],
+        'compiled_source_sha256': {p.relative_to(src).as_posix(): _file_record(p)['sha256']
+                                   for p in sorted(src.rglob('*')) if p.is_file()},
+        'binary_sha256': _file_record(binary)['sha256'],
+        'compute_capability': capability, 'build_mode': 'Release',
+    })
+    return binary
+
+
+def _paired_fct(baseline_csv, trace_csv):
+    def read_rows(path):
+        with path.open(encoding='utf-8', newline='') as stream:
+            return {(row['source_ip'], row['dst_ip']): int(row['flow_completion_time'])
+                    for row in csv.DictReader(stream)}
+
+    baseline = read_rows(baseline_csv)
+    profiled = read_rows(trace_csv)
+    if baseline.keys() != profiled.keys():
+        raise ValueError('paired GeDES runs have different flow endpoints')
+    deltas = [abs(value - profiled[pair]) for pair, value in baseline.items()]
+    return {'flow_count': len(baseline), 'different_flow_count': sum(delta != 0 for delta in deltas),
+            'max_absolute_difference_ns': max(deltas), 'all_equal': not any(deltas)}
+
+
+def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace=False):
     audit = helpers._support_module(source, 'gedes_experiments')
     drain = helpers._support_module(source, 'gedes_drain')
     summary = {'scope': 'Single-GB200 GeDES public artifact FatTree48 TCP/DCTCP workload with seeded inputs',
@@ -188,12 +231,15 @@ def run(source, output, helpers, profile=False, capture_seconds=None):
     try:
         if capture_seconds is not None and (not profile or type(capture_seconds) is not int or capture_seconds <= 0):
             raise ValueError('a positive integer GeDES capture duration requires profiling')
+        if warp_trace and profile:
+            raise ValueError('GeDES warp and Nsight captures use separate runs')
         if helpers.GEDES[1] != audit.UPSTREAM_REVISION:
             raise ValueError('unexpected GeDES source pin')
         capability, env = helpers.selected_gpu(output)
+        env = {key: value for key, value in env.items()
+               if key not in ('FT48_WARP_LIBDIR', 'FT48_WARP_OUTPUT', 'GEDES_FT48_GRAPH_DOT', CAPTURE_ENV)}
         build_options = {}
         if capture_seconds is not None:
-            env = {key: value for key, value in env.items() if key != CAPTURE_ENV}
             build_options['patch_main'] = lambda text: _instrument_capture(text, capture_seconds)
         gpu = json.loads((output / 'gpu.json').read_text())
         if 'GB200' not in gpu['name'].upper():
@@ -213,11 +259,35 @@ def run(source, output, helpers, profile=False, capture_seconds=None):
         summary['build'] = 'failed'
         with TemporaryDirectory(prefix='.gedes-fat-tree48-', dir=output) as temporary:
             build_start = time.monotonic()
-            binary = drain.build_audit(source, output, helpers, audit, Path(temporary), capability, env,
-                                       **build_options)
+            scratch = Path(temporary)
+            if warp_trace:
+                warp = helpers._support_module(source, 'warp_ft48')
+                env = warp.prepare(source, output, scratch, env, helpers)
+            binary = _build_gedes(source, output, scratch, capability, env, helpers, **build_options)
             summary['build_setup_seconds'] = time.monotonic() - build_start
             summary['build'] = 'succeeded'
             _run_case(binary, output, env, audit, drain, helpers, summary)
+            if warp_trace:
+                profile_output.mkdir()
+                run = {}
+                capture = summary['warp_profile'] = {'run': run, 'passed': False}
+                capture_env = warp.capture_environment(source, output, env, 'gedes')
+                dot = output / 'warp' / 'graph.dot'
+                dot.parent.mkdir(exist_ok=True)
+                capture_env['GEDES_FT48_GRAPH_DOT'] = str(dot)
+                _run_case(binary, profile_output, capture_env, audit, drain, helpers, run, journal_dir=output)
+                rounds = run['measurements']['rounds']
+                capture['trace'] = warp.collect(source, output, 'gedes', rounds)
+                if not dot.is_file() or not dot.stat().st_size:
+                    raise ValueError('GeDES graph dependency DOT is missing or empty')
+                capture['graph_dot'] = {'path': 'warp/graph.dot', **_file_record(dot)}
+                capture['paired_fct'] = _paired_fct(output / 'flows.csv', profile_output / 'flows.csv')
+                capture['round_counts_equal'] = rounds == summary['measurements']['rounds']
+                differences = capture['work_differences'] = _work_differences(summary, run)
+                failures = [field for field in differences if field not in ('flows.csv_sha256', 'measurements.rounds')]
+                if failures:
+                    raise RuntimeError(f'GeDES warp run has different inputs or terminal work: {", ".join(failures)}')
+                capture['passed'] = True
             if profile:
                 profile_output.mkdir()
                 prefix_options = {'capture_range': True} if capture_seconds is not None else {}
@@ -250,6 +320,8 @@ def run(source, output, helpers, profile=False, capture_seconds=None):
         raise
     finally:
         summary['raw_files'] = _raw_files(output)
+        if 'warp_profile' in summary:
+            summary['warp_profile']['raw_files'] = _raw_files(profile_output)
         if 'profile' in summary:
             summary['profile']['raw_files'] = _raw_files(profile_output)
         helpers.write_json(output / 'summary.json', summary)

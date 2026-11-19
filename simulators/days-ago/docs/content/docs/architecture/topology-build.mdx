@@ -1,0 +1,65 @@
+---
+title: Topology Build Pipeline
+description: How shared graph configuration becomes an exact image or legacy model graph.
+---
+
+**Scope: Days AGO and Legacy Days.** Both engines start with the shared topology builder, then diverge into different runtime representations.
+
+## 1. Build the shared graph
+
+`src/topos/build.rs` returns:
+
+- an undirected `petgraph::graph::UnGraph<usize, ()>` of switches
+- `HostAttachments`, which maps semantic host IDs to attachment switches
+- `TopologyProfile`, used by topology-specific routing and lowering
+
+Supported inputs are FatTree, Torus, Dragonfly, Spectrum-X (`src/topos/rail.rs`, Days AGO only), and custom `edges`/`hosts` graphs. Host IDs are not assumed to be switch IDs; all flow pairing and routing resolves them through `HostAttachments`.
+
+## 2A. Compile a Days AGO image
+
+`compile_config` in `src/scenario/compile.rs` validates the exact-model vocabulary and creates stable semantic IDs. It lowers:
+
+1. one host LP for each semantic host
+2. one switch LP for each directed egress queue
+3. queue scheduler, admission, PFC, and in-service state
+4. forward and reverse channels with rate and propagation delay bounds
+5. flow generators, TCP/DCQCN state, collective generators, packets, and initial events
+
+Exact scheduling supports FIFO, strict priority, WFQ, DRR, and WRR. The exact compiler rejects VirtualClock. Exact routing supports shortest path, `FatTreeEcmp`, and `SimAiEcmp`. `FatTreeEcmp` requires a canonical FatTree and derives a stable semantic flow hash rather than using construction order; `SimAiEcmp` requires the Spectrum-X fabric and hashes each flow's SimAI addresses and port with Murmur3, as SimAI does.
+
+Flow sets support `Random`, `SwitchOffsetHalf`, and `SameSwitchNext` pairing. Days AGO collectives are `RingAllReduce`, `AllGather`, `ReduceScatter`, `AllToAll`, and `SendRecv`, over byte-terminated TCP or RoCE queue pairs, and `[[compute]]` adds delay-only compute stages; see [Collectives](/docs/configuration/collectives). An AICB trace lowers through the same path from a `[workload.aicb]` table; see [Workloads](/docs/configuration/workloads).
+
+Callers pass the completed `SimulationImage` to `executor::validate(image, backend)`. Image invariants are backend-independent; capability checks then reject mechanisms not ported to the selected device.
+
+## 2B. Assemble Legacy Days actors
+
+The legacy CLI validates the complete TOML surface before `Topology::new` in `legacy/src/topos/topo.rs` assembles Nexosim models. It:
+
+1. configures Nexosim threading, mailbox capacity, time quantum, UI, and logger
+2. creates switches and bounded mailboxes
+3. creates one scheduler actor for every directed graph edge
+4. creates sources, sinks, collectives, and dependency connections
+5. computes routes and installs forward and reverse FIB entries
+6. initializes the simulation, injects start events, runs to the stop time, and flushes enabled logs
+
+Legacy scheduling additionally supports VirtualClock. Legacy routing supports shortest path, per-flow ECMP, explicit paths, and the shared semantic `FatTreeEcmp` policy, subject to each policy's validation rules. Legacy collective expansion supports Broadcast, Gather, a fan-in AllReduce (Gather's endpoint pattern: many sources, one sink), and RingAllReduce.
+
+## Host attachment and link stages
+
+The exact image always models host injection and delivery stages. Legacy preserves its historical direct endpoint wiring unless host attachment is enabled.
+
+`model_host_attachment = true` enables the matching legacy stages. Omitting that key while setting `link.propagation_ns` also enables them, applying propagation to host and physical links. The strict validator rejects an explicit `model_host_attachment = false` combined with `link.propagation_ns`.
+
+For a legacy physical hop without PFC:
+
+```text
+PacketSwitch -> Scheduler -> optional Wire -> PacketSwitch
+```
+
+With `link.mode = "Pfc"` and the legacy `l2_pfc` feature:
+
+```text
+PacketSwitch -> Scheduler -> PfcEgressGate -> Link -> PfcIngressPort -> PacketSwitch
+```
+
+The exact compiler lowers PFC into image state, and Scalar, CPU, Metal, and CUDA execute it.

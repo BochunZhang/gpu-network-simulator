@@ -1,0 +1,10 @@
+{
+  "title": "Components",
+  "pages": ["packet", "flows", "schedulers", "switch", "l2", "logging"],
+  "packet": "Packets & Events",
+  "switch": "Switches",
+  "schedulers": "Schedulers",
+  "flows": "Flows",
+  "l2": "PFC",
+  "logging": "Results & Traces"
+}

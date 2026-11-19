@@ -31,6 +31,22 @@
       "execution": {
         "mode": "full"
       }
+    },
+    "02": {
+      "status": "2026-11-19T14:18:41Z",
+      "name": "Days AGO FatTree48 full warp lifetime trace",
+      "kind": "days_ago_fat_tree48",
+      "params": {
+        "warp_trace": true
+      },
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Trace every warp of the full FT48 graph replays and direct gathers on one GB200. Check CTA and warp coverage at every launch and match the baseline state fingerprint and work counters.",
+      "execution": {
+        "mode": "full"
+      }
     }
   }
 }

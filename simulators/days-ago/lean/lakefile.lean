@@ -1,0 +1,60 @@
+import Lake
+open Lake DSL
+
+package leanGuard where
+
+lean_lib LeanGuard where
+
+@[default_target]
+lean_lib DaysExecutor where
+
+@[default_target]
+lean_exe dcqcn_check where
+  root := `LeanGuard.Main
+
+lean_exe pfc_check where
+  root := `LeanGuard.PfcMain
+
+lean_exe cubic_check where
+  root := `LeanGuard.CubicMain
+
+lean_exe tcp_check where
+  root := `LeanGuard.TcpMain
+
+lean_exe drr_check where
+  root := `LeanGuard.DrrMain
+
+lean_exe wfq_check where
+  root := `LeanGuard.WfqMain
+
+lean_exe sp_check where
+  root := `LeanGuard.SpMain
+
+lean_exe p10c_mechanisms_check where
+  root := `LeanGuard.P10cMain
+
+lean_exe p10c_aqm_check where
+  root := `LeanGuard.P10cAqmMain
+
+lean_exe p10c_dcqcn_check where
+  root := `LeanGuard.P10cDcqcnMain
+
+lean_exe p10c_collective_check where
+  root := `LeanGuard.P10cCollectiveMain
+
+lean_exe aqm_check where
+  root := `LeanGuard.AqmMain
+
+lean_exe aqm_dcqcn_check where
+  root := `LeanGuard.AqmDcqcnMain
+
+lean_exe p10c_roce_check where
+  root := `LeanGuard.P10cRoceMain
+
+-- Test-only: the collective checker's differential harness and cost budget (not shipped).
+lean_exe p10c_collective_diff where
+  root := `LeanGuard.P10cCollectiveDiffMain
+
+-- Test-only: the P10c AQM checker's differential harness (not shipped).
+lean_exe p10c_aqm_diff where
+  root := `LeanGuard.P10cAqmDiffMain

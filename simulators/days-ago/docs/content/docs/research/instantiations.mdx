@@ -1,0 +1,96 @@
+---
+title: Protocol instantiations
+description: The checker inventory across both engines, with trace families, replay state, and core obligations.
+---
+
+All protocol instantiations share the same acceptance semantics
+(canonicalize-and-replay) and reuse the same obligation families
+(ParamFreeze, MonotoneTime, PendingMatch, Gate, Accounting, SnapshotEq).
+What differs is the **event vocabulary**, the **checker replay state**, the
+**canonical key**, and which obligations matter most. Legacy families use
+`(time_ns, event_id)`; Days AGO families use the full `EventKey`
+`(time_ns, phase, origin_node, origin_sequence)`, and some `p10c_*`
+checkers require already-strict canonical order.
+
+See also:
+
+- [/docs/reference/traces/schema](/docs/reference/traces/schema)
+- [/docs/research/design](/docs/research/design)
+
+## The checker inventory
+
+The Lean build (`lean/lakefile.lean`) currently carries:
+
+- **Legacy-engine families** (float protocols, `(time_ns, event_id)` key):
+  DCQCN, PFC, CUBIC, DRR, WFQ, AQM/ECN.
+- **Days AGO families** (full `EventKey`): TCP (`tcp_check`), Static
+  Priority (`sp_check`), and the `p10c_*` checkers for mechanisms (rate,
+  PFC, DRR, WRR, and WFQ), AQM, DCQCN, collectives, and RoCE queue pairs.
+- **Cross-check**: `aqm_dcqcn_check` ties the legacy AQM and DCQCN
+  vocabularies together.
+
+Backend capability boundaries apply to generation, not checking. Device
+runs do not return the diagnostic planes that hold transition records, so
+every Days AGO certificate family is produced by Scalar or CPU runs. PFC,
+DCQCN, RoCE queue pairs, and collective and compute stages also run on Metal
+and CUDA, byte-identical to Scalar, as does the ECN ramp; RED and RED_ECN were
+removed from Days AGO in P16 and are refused at lowering.
+
+## Summary table (legacy families)
+
+| Protocol family | Trace file / event kinds (representative) | Checker replay state (high level) | Core obligations enforced |
+|---|---|---|---|
+| AQM / ECN marking | `aqm_events.csv`: `decision` | per-queue frozen params; per-queue accounting | ParamFreeze, SnapshotEq (decision legality), Accounting |
+| PFC | `pfc_events.csv`: `pfc_sent`, `pfc_recv`, refresh | per-port/per-priority pause state + pending-map | PendingMatch, Gate (refresh/cooldown), ParamFreeze, hysteresis |
+| WFQ scheduler | `wfq_events.csv`: `enqueue`, `schedule`, `depart` | queued packets + virtual time + pending scheduled packet | Accounting, PendingMatch, SnapshotEq (tags/time), choice rule (min finish tag) |
+| DRR scheduler | `drr_events.csv`: `enqueue`, `schedule` | per-class FIFO queues + deficit counters + RR pointer | Accounting, SnapshotEq (deficit/pointer), choice rule (deficit eligibility), ParamFreeze |
+| CUBIC microbench | `cubic_events.csv`: CC micro-events | per-endpoint CC state + frozen parameters | SnapshotEq, ParamFreeze, MonotoneTime |
+| DCQCN | `dcqcn_events.csv`: `cnp_sent`, `cnp_recv`, `timer_tick` | per-endpoint gate/rate state + pending CNP map | PendingMatch, Gate, ParamFreeze, bounds; see [the DCQCN page](/docs/research/dcqcn-certificates) |
+
+## Notes by instantiation
+
+### AQM / ECN marking (`aqm_events.csv`)
+
+One row per marking/drop decision at a queue: queue identity, packet
+identity, occupancy context, policy parameters, chosen action. Checks:
+parameters stable per queue (freeze-on-first-use); the logged action legal
+under the policy and context; any probabilistic witness validated. The
+Days AGO ECN-threshold marking has its own certificate schema
+(`p10c_aqm_check`) under the full `EventKey`.
+
+### PFC (`pfc_events.csv`)
+
+PFC frames at emission and reception, with refresh/cooldown rows. Checks:
+each `pfc_recv` matches a distinct earlier `pfc_sent`; refresh/cooldown
+gates respected; per-port parameters constant. Legacy engine only as a
+generator.
+
+### WFQ scheduler (`wfq_events.csv`)
+
+Correctness hinges on small local state and a choice rule. Checks:
+`schedule` chooses a packet with minimal finish tag; tags and virtual-time
+witnesses match the deterministic reference; scheduled packets depart
+exactly once. Days AGO computes WFQ in exact rational arithmetic, and its
+certificate family is the `wfq` mode of `p10c_mechanisms_check`: one row
+per enqueue, service start and completion, with virtual time and finish
+tags as exact rationals normalized by the link rate. The checker replays
+the same Demers-Keshav-Shenker rules as `wfq_check` (the idle resets
+included), tracks the waiting packets itself, and requires each service
+start to serve the least finish tag among the packets whose PFC priority
+is not paused. A packet's PFC class is fixed at its enqueue, and the paused
+set is joined to the run's PFC certificate.
+
+### DRR scheduler (`drr_events.csv`)
+
+Deficit counters plus a round-robin pointer. Checks: scheduled packets
+satisfy deficit eligibility at service time; deficit/pointer updates match
+the reference rule; queue contents conserved under enqueue/schedule.
+
+### CUBIC microbench (`cubic_events.csv`)
+
+Demonstrates the design generalizes to end-host congestion-control update
+rules: per-endpoint parameters frozen and consistent; the logged post-state
+snapshot matches the replayed update rule; time monotone per endpoint under
+canonical order. The exact engine's TCP (Reno and CUBIC in fixed-point
+integer arithmetic) is covered by the exact TCP certificate family under
+the full `EventKey`.

@@ -1,0 +1,44 @@
+[package]
+name = "days"
+version = "1.0.0"
+description = "Days: A Fast and Exact Discrete-Event Network Simulator on CPUs and GPUs"
+authors = ["Baochun Li <bli@ece.toronto.edu>"]
+repository = "https://github.com/iqua/days"
+readme = "README.md"
+keywords = ["network", "simulation", "framework", "time", "discrete", "events"]
+categories = ["simulation", "science"]
+license = "AGPL-3.0-only"
+edition = "2021"
+
+[workspace]
+members = ["executor", "legacy", "validation", "xtask"]
+resolver = "2"
+
+[features]
+test = ["days-executor/planner-test-hooks"]
+metal = ["days-executor/metal"]
+cuda = ["days-executor/cuda"]
+cuda-planner-test = ["test", "days-executor/cuda-planner-test"]
+metal-test-hooks = ["metal", "days-executor/metal-test-hooks"]
+cuda-test-hooks = ["cuda", "days-executor/cuda-test-hooks"]
+
+[dependencies]
+csv = "1.4"
+days-executor = { path = "executor" }
+clap = { version = "4.5", features = ["derive"] }
+log = "0.4"
+num-bigint = "0.4.8"
+petgraph = "0.8"
+rand = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+toml = "1"
+
+[patch.crates-io]
+nexosim = { path = "crates/nexosim" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

@@ -1,0 +1,23 @@
+---
+title: PFC
+description: Days AGO per-priority pause state inside switch-egress logical processes.
+---
+
+**Scope: Days AGO.** The legacy frame and PFC actor pipeline is described in [Legacy L2 and PFC](/docs/legacy/components/l2).
+
+Days AGO implements Priority-based Flow Control as state inside each switch-egress LP, not as separate link actors.
+
+## PFC state
+
+- `PfcIngressState` tracks byte occupancy, XON/XOFF thresholds, capacity, and asserted state for one monitored incoming link.
+- `PfcQueueState::paused_by_controller` records every downstream controller that currently pauses each priority.
+
+Admission increases monitored occupancy. Service selection decreases it. Crossing XOFF emits a 64-byte `PacketKind::Pfc` pause on the reverse-link channel; crossing XON emits a resume. The control packet arrives as an ordinary `RemoteArrival`, and the egress queue remains paused until every asserting controller resumes it.
+
+The mechanism is edge-triggered. Nonzero refresh and drain timers are rejected during lowering. A zero XOFF or pause-quanta entry disables that priority. PFC can coexist with lowered propagation delay because the reverse control channel carries the exact 64-byte serialization and propagation delay.
+
+## Backends
+
+Scalar, CPU, Metal, and CUDA execute PFC, and every device run produces the same complete state as Scalar.
+
+See [L2 and PFC configuration](/docs/configuration/l2) for thresholds and validation rules.

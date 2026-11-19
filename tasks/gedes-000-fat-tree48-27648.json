@@ -32,6 +32,22 @@
       "execution": {
         "mode": "full"
       }
+    },
+    "02": {
+      "status": "2026-11-19T14:18:41Z",
+      "name": "GeDES FatTree48 full warp lifetime trace",
+      "kind": "gedes_fat_tree48",
+      "params": {
+        "warp_trace": true
+      },
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Trace every warp of all 45 kernel launches per FT48 timeslot through terminal drain on one GB200. Validate coverage, matched inputs and terminal byte/queue state. Report per-flow completion-time differences separately.",
+      "execution": {
+        "mode": "full"
+      }
     }
   }
 }

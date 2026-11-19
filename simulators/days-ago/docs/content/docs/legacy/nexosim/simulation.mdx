@@ -1,0 +1,33 @@
+---
+title: Simulation lifecycle
+description: SimInit, Simulation, and stepping in the legacy Nexosim engine.
+---
+
+This lifecycle applies to the **legacy** simulator. Its `Topology::new` builds a Nexosim bench, and `Topology::run` drives the resulting `Simulation`.
+
+## Construction and execution
+
+`SimInit::with_num_threads` selects Nexosim's single-threaded executor for one worker and its multithreaded executor otherwise. Legacy topology construction then:
+
+1. creates model values and bounded mailboxes
+2. registers the models and connects their ports
+3. calls `SimInit::init` to create a `Simulation`
+4. injects the initial source events
+5. advances through the configured stop time with `step_until`
+
+The Days assembly is in `legacy/src/topos/topo.rs`; the runtime is in `crates/nexosim/src/simulation.rs` and `crates/nexosim/src/simulation/sim_init.rs`.
+
+## Key APIs
+
+- `process_event(&EventId, value)` immediately processes a registered event source without advancing simulation time.
+- `process_event_fn(handler, value, address)` is the Days compatibility helper that targets a model input function and address directly.
+- `process_query(&QueryId, value)` immediately processes a registered query and waits for its reply without advancing time.
+- `step()` advances to the next scheduled event or ticker time and processes the work at that time.
+- `step_until(deadline)` repeats that process through the deadline and leaves the clock at the requested time.
+- `run()` processes the queue until it is empty in tickless mode. With a ticker configured, it waits until the scheduler is halted.
+
+## Concurrency and ordering
+
+Nexosim can execute ready model tasks concurrently at the same simulated timestamp. Wall-clock task order is therefore not a protocol guarantee. Legacy verification compares canonicalized traces where ordering is semantically irrelevant.
+
+This is separate from exact execution. The exact scalar, CPU, Metal, and CUDA paths use their own canonical `EventKey` ordering and safe-horizon exchange protocol; see [/docs/internals](/docs/internals).

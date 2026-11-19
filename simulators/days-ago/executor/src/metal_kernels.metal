@@ -1,0 +1,9096 @@
+#include <metal_stdlib>
+using namespace metal;
+
+// P14: whether the DCQCN and PFC transitions are compiled into `days_round`. The host builds two
+// `days_round` pipelines from this one library, specialized with false and true, and dispatches
+// exactly one per run, chosen from the image (`RoundKernel::for_image`): true when the image holds
+// any DCQCN or PFC state. Every Lane B entry point is guarded by it, mirroring `MECHANISMS` in
+// `cuda_kernels.cu`. The false specialization carries no device-side stop: the host refuses it on
+// any plan holding DCQCN or PFC state (`device_mechanism::plain_round_kernel_refusal`).
+constant bool DAYS_MECHANISMS [[function_constant(0)]];
+
+constant uint EVENT_WORDS = 14;
+constant uint CHANNEL_EVENT_WORDS = 11;
+constant uint SERVICE_EVENT_WORDS = 5;
+constant uint GENERATOR_EVENT_WORDS = 10;
+constant uint REMOTE_STAGING_EVENT_WORDS = 12;
+constant uint SCATTER_COOPERATIVE_MIN_RECORDS = 3;
+constant uint NODE_WORDS = 11;
+constant uint GENERATOR_WORDS = 43;
+constant uint FLOW_WORDS = 6;
+constant uint LINK_WORDS = 4;
+constant uint META_WORDS = 4;
+constant uint QUEUE_META_WORDS = 5;
+constant uint LP_STATE_WORDS = 7;
+constant uint OBSERVATION_META_WORDS = 12;
+constant uint INBOUND_META_WORDS = 2;
+constant uint LP_STREAM_META_WORDS = 4;
+constant uint OUTBOUND_META_WORDS = 2;
+constant uint OUTBOUND_ENTRY_WORDS = 2;
+constant uint CHANNEL_BATCH_WORDS = 4;
+constant uint ACTIVE_STREAM_ENTRY_WORDS = 5;
+constant uint TCP_RECEIVER_WORDS = 7;
+// T20i ledger-ring metadata layout, mirrored word-for-word by `executor/src/tcp_ledger_ring.rs`:
+//   +0 record-arena offset  +1 capacity  +2 count
+//   +3 armed fallback-heap slot + 1 (T20g live-state contract)
+//   +4 ring head            +5 occupancy high-water mark
+constant uint TCP_LEDGER_META_WORDS = 6;
+constant uint TCP_LEDGER_RECORD_WORDS = 5;
+constant uint TCP_LEDGER_META_HEAD = 4;
+constant uint TCP_LEDGER_META_HIGH_WATER = 5;
+constant uint RATIONAL_WORDS = 10;
+constant uint BIG_LIMBS = 10;
+constant uint WIDE_LIMBS = 16;
+constant uint PRODUCT_LIMBS = 20;
+constant uint SCHEDULER_NODE_WORDS = 29;
+constant uint SCHEDULER_CLASS_WORDS = 12;
+constant ulong NONE = 0xfffffffffffffffful;
+
+constant uint C_ERROR = 0;
+constant uint C_ERROR_ARENA = 1;
+constant uint C_ERROR_NODE = 2;
+constant uint C_ERROR_CAPACITY = 3;
+constant uint C_DONE = 4;
+constant uint C_HORIZON_LO = 5;
+constant uint C_HORIZON_HI = 6;
+constant uint C_RUN_END_LO = 7;
+constant uint C_RUN_END_HI = 8;
+constant uint C_ROUNDS = 9;
+constant uint C_TRANSITIONS = 10;
+constant uint C_OUTBOX = 11;
+constant uint C_OBSERVED = 12;
+constant uint C_DEPARTURES = 13;
+constant uint C_ARRIVALS = 14;
+constant uint C_ACTIVE = 15;
+constant uint C_FRONTIER = 16;
+constant uint C_CONTINUATION = 17;
+constant uint C_RELAUNCHES = 18;
+constant uint C_ERROR_DEMAND = 19;
+constant uint C_INDIRECT_OFFSET_WORDS = 20;
+
+constant uint P_NODE_COUNT = 0;
+constant uint P_FLOW_COUNT = 1;
+constant uint P_LINK_COUNT = 2;
+constant uint P_OUTBOX_CAPACITY = 3;
+constant uint P_WORKLIST_CAPACITY = 4;
+constant uint P_OBSERVED_CAPACITY = 5;
+constant uint P_DEPARTURE_CAPACITY = 6;
+constant uint P_ARRIVAL_CAPACITY = 7;
+constant uint P_FULL_OBSERVATIONS = 8;
+constant uint P_LOOKAHEAD = 9;
+constant uint P_TRANSITION_CAPACITY = 10;
+constant uint P_STOP_TIME = 11;
+constant uint P_HAS_LOOKAHEAD = 12;
+constant uint P_ROUND_CAPACITY = 13;
+constant uint P_STREAMS_ENABLED = 14;
+constant uint P_STREAM_COUNT = 15;
+constant uint P_CHANNEL_COUNT = 16;
+constant uint P_SERVICE_STREAM_BASE = 17;
+constant uint P_GENERATOR_STREAM_BASE = 18;
+constant uint P_LP_STREAM_META_OFFSET = 19;
+constant uint P_LP_STREAM_IDS_OFFSET = 20;
+constant uint P_LP_ACTIVE_IDS_OFFSET = 21;
+constant uint P_OUTBOUND_META_OFFSET = 22;
+constant uint P_OUTBOUND_ENTRIES_OFFSET = 23;
+constant uint P_CHANNEL_BATCH_OFFSET = 24;
+constant uint P_STAGING_CHANNEL_OFFSET = 25;
+constant uint P_CHANNEL_TARGET_OFFSET = 26;
+constant uint P_STREAM_ORDER_CHECKS = 27;
+constant uint P_TCP_RECEIVER_OFFSET = 28;
+constant uint P_TCP_LEDGER_META_OFFSET = 29;
+constant uint P_ROUND_THREADS = 30;
+// T21 fix 2. Word offset, inside `stream_state`, of the per-round FEL root cache: two words per
+// LP, `{root time, validity}`. `days_horizon_sweep` evaluates `fel_root_time` once per node and
+// writes it here; O1.4's reset/count and prepare/write passes each read it instead of re-running
+// the query, which `evidence/P12/perround-upperbound.md` §1.5.2 measured at three full-width
+// evaluations per round over a read set nothing between the call sites writes.
+//
+// The region is device scratch: written and consumed inside one attempt, never decoded by the
+// readback (which reads only `stream_state`'s metadata prefix), never part of complete state.
+constant uint P_ROUND_SCRATCH_OFFSET = 31;
+constant uint ROUND_SCRATCH_CACHE_WORDS = 2;
+// P14 Lane B T4: absolute offset of the PFC region in `scheduler_state`, or NONE when the image
+// carries no PFC state. Layout in `executor/src/device_pfc.rs`.
+constant uint P_PFC_OFFSET = 32;
+// P15 lane R4: absolute offset of the RoCE receiver region in `tcp_state`, or NONE without queue-pair
+// receivers. Layout in `executor/src/device_mechanism.rs`.
+constant uint P_ROCE_OFFSET = 33;
+// P16 G1: absolute offset of the stage region in `tcp_state`, or NONE without collective or compute
+// stages. Layout in `executor/src/device_stage.rs`.
+constant uint P_STAGE_OFFSET = 34;
+// P16 G1: one stage row per flow, then the successor array (`executor/src/device_stage.rs`).
+constant uint STAGE_ROW_WORDS = 5;
+constant uint SR_FLAGS = 0;
+constant uint SR_INBOUND_RECEIVED = 1;
+constant uint SR_INBOUND_REQUIRED = 2;
+constant uint SR_LOCAL_SUCCESSORS = 3;
+constant uint SR_INBOUND_SUCCESSORS = 4;
+constant ulong SR_LOCAL_COMPLETE = 1;
+constant ulong SR_INBOUND_COMPLETE = 2;
+constant ulong SR_HAS_LOCAL = 16;
+constant ulong SR_HAS_INBOUND = 32;
+constant ulong SR_IS_STAGE = 64;
+// P16 H1: joins. A local join counts its predecessors in flags bits 32..47 (complete) and 48..63
+// (required); an inbound join sums its predecessors' advances, each predecessor of one keeping
+// its last credited frontier in the word before its inbound list; a flow whose completion was
+// credited to its local successors carries SR_LOCAL_CREDITED.
+constant ulong SR_LOCAL_JOIN = 128;
+constant ulong SR_INBOUND_JOIN = 256;
+constant ulong SR_LOCAL_CREDITED = 512;
+constant ulong SR_INBOUND_CREDIT = 1024;
+constant ulong SR_JOIN_ONE = 1ul << 32;
+constant uint PFC_ROW_HEADER_WORDS = 5;
+constant uint PFC_INGRESS_WORDS = 43;
+constant uint PI_LINK = 0;
+constant uint PI_TARGET = 1;
+constant uint PI_DELAY = 2;
+constant uint PI_CAPACITY = 3;
+constant uint PI_XOFF = 11;
+constant uint PI_XON = 19;
+constant uint PI_OCCUPANCY = 27;
+constant uint PI_ASSERTED = 35;
+constant ulong PFC_FRAME_BYTES = 64;
+
+// Test-hook-only vector offsets appended to the physical metadata buffers after planning. Each
+// entity owns its own slot, so ordinary max writes preserve the actor model and need no atomics.
+// They follow every production params word, P16's stage offset (34) included.
+#ifdef DAYS_DOMINANT_ARENA_HIGH_WATER
+constant uint P_STREAM_HIGH_WATER_OFFSET = 35;
+constant uint P_REMOTE_HIGH_WATER_OFFSET = 36;
+constant uint P_QUEUE_HIGH_WATER_OFFSET = 37;
+#define RECORD_STREAM_HIGH_WATER(params, state, entity, occupancy) \
+    (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)] = max( \
+        (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)], \
+        (ulong)(occupancy) \
+    )
+#define RECORD_REMOTE_HIGH_WATER(params, meta, entity, occupancy) \
+    (meta)[(params)[P_REMOTE_HIGH_WATER_OFFSET] + (entity)] = max( \
+        (meta)[(params)[P_REMOTE_HIGH_WATER_OFFSET] + (entity)], \
+        (ulong)(occupancy) \
+    )
+#define RECORD_QUEUE_HIGH_WATER(params, meta, entity, occupancy) \
+    (meta)[(params)[P_QUEUE_HIGH_WATER_OFFSET] + (entity)] = max( \
+        (meta)[(params)[P_QUEUE_HIGH_WATER_OFFSET] + (entity)], \
+        (ulong)(occupancy) \
+    )
+#else
+#define RECORD_STREAM_HIGH_WATER(params, state, entity, occupancy) ((void)0)
+#define RECORD_REMOTE_HIGH_WATER(params, meta, entity, occupancy) ((void)0)
+#define RECORD_QUEUE_HIGH_WATER(params, meta, entity, occupancy) ((void)0)
+#endif
+
+// P16 H4 (test hooks only): the RESUME-scan counters. `MetalBuffers::new` appends one row of
+// RESUME_SCAN_COUNT_WORDS words per LP to `scheduler_state`, after every production word, and its
+// offset as params word 38, after the high-water offsets: {RESUMEs scanned, queue pairs examined,
+// parked-bitset words read}. A host LP adds only to its own row, so the counters need no atomics.
+// Production builds compile `RECORD_RESUME_SCAN` to nothing.
+#ifdef DAYS_RESUME_SCAN_COUNT
+constant uint P_RESUME_SCAN_COUNT_OFFSET = 38;
+constant uint RESUME_SCAN_COUNT_WORDS = 3;
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) \
+    ((state)[(params)[P_RESUME_SCAN_COUNT_OFFSET] + (node) * RESUME_SCAN_COUNT_WORDS + (counter)] += \
+        (ulong)(amount))
+#else
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) ((void)0)
+#endif
+// P17 merge (test hooks only): the exchange-merge counters and active-set audit. `MetalBuffers::new`
+// appends one row of MERGE_AUDIT_WORDS words per LP to `stream_state`, after every production word,
+// then one word per flow holding the flow's source LP (the audit's generator-ownership table), and
+// the region's offset as params word 39, after the RESUME-scan offset. Each merge thread adds only to
+// its own LP's row, so the counters need no atomics. Production builds compile `RECORD_MERGE` to
+// nothing and carry no audit. Transliterated from `cuda_kernels.cu` (params word 35 there).
+#ifdef DAYS_MERGE_AUDIT
+constant uint P_MERGE_AUDIT_OFFSET = 39;
+constant uint MERGE_AUDIT_WORDS = 6;
+constant uint MA_INVOCATIONS = 0;
+constant uint MA_STREAMS_READ = 1;
+constant uint MA_APPENDED = 2;
+constant uint MA_MISMATCHES = 3;
+constant uint MA_NONEMPTY_STREAMS = 4;
+constant uint MA_STREAM_ENTRIES = 5;
+#define RECORD_MERGE(params, state, node, counter, amount) \
+    ((state)[(params)[P_MERGE_AUDIT_OFFSET] + (node) * MERGE_AUDIT_WORDS + (counter)] += \
+        (ulong)(amount))
+#else
+#define RECORD_MERGE(params, state, node, counter, amount) ((void)0)
+#endif
+
+// T21 fix 1 — the re-gridded control sweeps. `evidence/P12/aterm-fixes.md` §3.4. Transliterated
+// word for word from `cuda_kernels.cu`; see that file for the design note.
+//
+// Every phase that swept Θ(nodes + channels) from a grid of ONE threadgroup is now a full-grid
+// `_sweep` dispatch that publishes one partial per threadgroup into the tail of the round scratch
+// region, plus a width-1 combine dispatch that reduces those partials and performs the phase's
+// control writes. The barrier between the two is the DISPATCH BOUNDARY, which under
+// `MTLDispatchType::Serial` is the same ordering `days_round` already relies on to see the
+// `worklist` `days_round_prepare` wrote. Nothing here synchronizes across threadgroups inside a
+// dispatch: no atomics, no `volatile`, no device-scope fence used as one.
+constant ulong CONTROL_SWEEP_BLOCKS = 128;
+constant ulong ROUND_SCRATCH_PARTIAL_WORDS = 8;
+
+constant uint N_KIND = 0;
+constant uint N_EGRESS = 1;
+constant uint N_SEMANTIC_QUEUE_CAPACITY = 2;
+constant uint N_READY_PENDING = 3;
+constant uint N_SERVICE_VALID = 4;
+constant uint N_NEXT_ORIGIN = 5;
+constant uint N_NEXT_PAYLOAD = 6;
+constant uint N_COUNTER_0 = 7;
+constant uint N_COUNTER_1 = 8;
+constant uint N_COUNTER_2 = 9;
+
+constant uint S_KIND = 0;
+constant uint S_CLASS_COUNT = 1;
+constant uint S_CLASS_OFFSET = 2;
+constant uint S_QUEUE_TAG_OFFSET = 3;
+constant uint S_LAST_UPDATED = 4;
+constant uint S_VIRTUAL_TIME = 5;
+constant uint S_IN_SERVICE_TAG = 15;
+constant uint S_AQM_KIND = 25;
+constant uint S_AQM_RECORD = 26;
+constant uint S_AQM_CAPACITY = 27;
+constant uint S_AQM_KMIN = 28;
+constant uint AQM_RECORD_KMAX = 0;
+constant uint AQM_RECORD_PMAX_NUMERATOR = 1;
+constant uint AQM_RECORD_SPAN = 2;
+constant uint AQM_RECORD_QUEUE_KEY = 3;
+
+constant uint SC_VALUE = 0;
+constant uint SC_ACTIVE = 1;
+constant uint SC_FINISH = 2;
+
+constant uint E_TIME = 0;
+constant uint E_PHASE = 1;
+constant uint E_ORIGIN = 2;
+constant uint E_SEQUENCE = 3;
+constant uint E_TARGET = 4;
+constant uint E_KIND = 5;
+constant uint E_PAYLOAD = 6;
+constant uint PK_ID = 7;
+constant uint PK_FLOW = 8;
+constant uint PK_SIZE = 9;
+constant uint PK_KIND = 10;
+constant uint PK_META_0 = 11;
+constant uint PK_META_1 = 12;
+constant uint PK_META_2 = 13;
+constant ulong PK_ECN_FLAG = 1ul << 63;
+constant ulong PK_KIND_MASK = ~PK_ECN_FLAG;
+
+constant ulong HOST = 0;
+constant ulong SWITCH = 1;
+constant ulong PACKET_ARRIVAL = 0;
+constant ulong TX_READY = 1;
+constant ulong TX_COMPLETE = 2;
+constant ulong REMOTE_ARRIVAL = 3;
+constant ulong RETRANSMISSION_TIMEOUT = 4;
+constant ulong PACING_TIMER = 5;
+constant ulong DATA_PACKET = 0;
+constant ulong FEEDBACK_PACKET = 1;
+constant ulong TCP_DATA_PACKET = 2;
+constant ulong TCP_ACK_PACKET = 3;
+constant ulong PFC_PACKET = 4;
+constant ulong DCQCN_CNP_PACKET = 5;
+constant ulong ROCE_DATA_PACKET = 7;
+constant ulong ROCE_ACK_PACKET = 8;
+constant ulong ROCE_NACK_PACKET = 9;
+constant ulong ROCE_PACING_TIMER_PACKET = 10;
+// P16 H2: a stage notify, a same-server message (delay-only NVLink): the sender's timer token, then
+// an out-of-band frame on its host pair's lane carrying the whole chunk.
+constant ulong STAGE_NOTIFY_PACKET = 11;
+constant ulong SCHED_FIFO = 0;
+constant ulong SCHED_SP = 1;
+constant ulong SCHED_WFQ = 2;
+constant ulong SCHED_DRR = 3;
+constant ulong SCHED_WRR = 4;
+constant ulong AQM_TAILDROP = 0;
+constant ulong AQM_ECN = 1;
+
+// Generator/controller ABI. CUBIC keeps exact 10^9-nanosegment fixed point and all transition
+// arithmetic below uses the existing multi-limb integer primitives; no floating point is used.
+constant uint G_VALID = 0;
+constant uint G_OWNER = 1;
+constant uint G_PACKETS = 2;
+constant uint G_BYTES = 3;
+constant uint G_STATUS = 4;
+constant uint G_DEPARTURE = 5;
+constant uint G_PAYLOAD = 6;
+constant uint G_FEEDBACK = 8;
+constant uint G_OUTSTANDING = 9;
+constant uint G_UNACKNOWLEDGED = 10;
+constant uint G_KIND = 11;
+constant uint G_TCP_TOTAL = 12;
+constant uint G_TCP_MSS = 13;
+constant uint G_TCP_ACK_SIZE = 14;
+constant uint G_TCP_NEXT = 15;
+constant uint G_TCP_HIGHEST_ACK = 16;
+constant uint G_TCP_FLIGHT = 17;
+constant uint G_TCP_DUP_ACKS = 18;
+constant uint G_TCP_RECOVERY_HIGH = 19;
+constant uint G_TCP_LAST_ATTEMPT = 20;
+constant uint G_TCP_TIMER_GENERATION = 21;
+constant uint G_TCP_TIMER_ACTIVE = 22;
+constant uint G_TCP_TIMER_ATTEMPT = 23;
+constant uint G_TCP_TIMER_SEQUENCE = 24;
+constant uint G_TCP_TIMER_DEADLINE = 25;
+constant uint G_TCP_TIMER_STORED_GENERATION = 26;
+constant uint G_TCP_TIMER_RTO = 27;
+constant uint G_TCP_SRTT = 28;
+constant uint G_TCP_RTTVAR = 29;
+constant uint G_TCP_RTO = 30;
+constant uint G_CONTROL = 31;
+constant uint G_RATE_FIRST = 12;
+constant uint G_RATE_INTERVAL = 13;
+constant uint G_RATE_PACKET_SIZE = 14;
+constant uint G_RATE_TOTAL = 15;
+constant uint G_RATE_NUMERATOR = 16;
+constant uint G_RATE_DENOMINATOR = 17;
+constant uint G_RATE_CREDIT_LOW = 18;
+constant uint G_RATE_CREDIT_HIGH = 19;
+// DCQCN generator row (kind 3): words 12..19 keep the Rate layout above; the reaction-point
+// controller (`executor/src/dcqcn.rs`) follows. Configuration words are immutable image data the
+// transitions read; the initial rate and CNP size are not needed on device and stay host-side.
+constant ulong GENERATOR_KIND_DCQCN = 3;
+// The Mellanox-form DCQCN controller (P16), words 20..=35 of a DCQCN or RoCE generator row, as
+// `device_mechanism.rs` encodes them: configuration in 20..=28 (the fast-recovery count in the low
+// 32 bits of 28, the target clamp in bit 32), state in 29..=35 (the stage in the low 32 bits of 35,
+// then `armed`, `alpha_pending`, `decrease_pending` and `increase_armed` from bit 32).
+constant uint G_DCQCN_MIN_RATE = 20;
+constant uint G_DCQCN_MAX_RATE = 21;
+constant uint G_DCQCN_ADDITIVE_RATE = 22;
+constant uint G_DCQCN_HYPER_RATE = 23;
+constant uint G_DCQCN_G = 24;
+constant uint G_DCQCN_ALPHA_INTERVAL = 25;
+constant uint G_DCQCN_DECREASE_INTERVAL = 26;
+constant uint G_DCQCN_INCREASE_INTERVAL = 27;
+constant uint G_DCQCN_STEPS_CLAMP = 28;
+constant uint G_DCQCN_ALPHA = 29;
+constant uint G_DCQCN_CURRENT_RATE = 30;
+constant uint G_DCQCN_TARGET_RATE = 31;
+constant uint G_DCQCN_NEXT_ALPHA = 32;
+constant uint G_DCQCN_NEXT_DECREASE = 33;
+constant uint G_DCQCN_NEXT_INCREASE = 34;
+constant uint G_DCQCN_STATE = 35;
+constant ulong DCQCN_CLAMP_BIT = 1ul << 32;
+constant ulong DCQCN_ARMED_BIT = 1ul << 32;
+constant ulong DCQCN_ALPHA_PENDING_BIT = 1ul << 33;
+constant ulong DCQCN_DECREASE_PENDING_BIT = 1ul << 34;
+constant ulong DCQCN_INCREASE_ARMED_BIT = 1ul << 35;
+constant ulong DCQCN_STAGE_MASK = 0xfffffffful;
+constant ulong DCQCN_ALPHA_ONE = 1ul << 63;
+// The pacing credit scale (quanta per bit and second), shared with the RoCE pacer.
+constant ulong DCQCN_SCALE = 1000000000ul;
+// A DCQCN flow's notification-point state lives in that flow's per-flow receiver row of
+// `tcp_state` (the row TCP uses for its cumulative-ACK receiver). Validation makes a flow's
+// receiver either TCP or DCQCN, so the row is free, and DCQCN adds no words to any plane. Words
+// 4..6 stay zero: they are the TCP receive-range metadata the readback compaction reads.
+//   +0 marker: 2 = no CNP sent yet, 3 = +1 holds the last CNP time
+//   +1 last CNP time  +2 CNP interval  +3 CNP size
+constant ulong DCQCN_RECEIVER_NO_CNP = 2;
+constant ulong DCQCN_RECEIVER_LAST_CNP = 3;
+constant uint DR_LAST_CNP = 1;
+constant uint DR_CNP_INTERVAL = 2;
+constant uint DR_CNP_SIZE = 3;
+// P15 lane R4: RoCE queue pairs (`evidence/P15/device-design.md` §1). A queue-pair generator row
+// (kind 4) shares DCQCN's pacer words 12..15 and 18..19 and its controller words 20..39, so the
+// controller helpers run on it unchanged; word 6 (`G_PAYLOAD`) is the stable pacing token.
+//   16 next PSN  17 cumulative acknowledgment  36 window bytes  37 variable window
+//   38 window-parked  40 pacer armed  41 timeout deadline  42 timeout
+// The flow's receiver row holds marker 4 and, at +1, the absolute `tcp_state` offset of its
+// record in the RoCE region; words 2..6 stay zero (the readback compaction reads 4..6).
+constant ulong GENERATOR_KIND_ROCE = 4;
+// P16 G1: a compute stage is a Constant generator (kind 0) whose interval word is its duration
+// (the validator pins `interval_ns == duration_ns != 0`).
+constant ulong GENERATOR_KIND_CONSTANT = 0;
+constant uint G_COMPUTE_DURATION = 13;
+// P16 H2: a stage notify's constant generator holds its lane latency in the first-departure word
+// and its chunk in the packet-size word; `G_COMPUTE_DURATION` is its lead.
+constant uint G_NOTIFY_LANE = 12;
+constant uint G_NOTIFY_BYTES = 14;
+constant uint G_ROCE_NEXT_PSN = 16;
+constant uint G_ROCE_SND_UNA = 17;
+constant uint G_ROCE_WINDOW = 36;
+constant uint G_ROCE_VARIABLE_WINDOW = 37;
+constant uint G_ROCE_WINDOW_PARKED = 38;
+// P17 lane nocc: 0 under DCQCN, 1 without congestion control (`RoceCongestionControl`).
+constant uint G_ROCE_CONGESTION_CONTROL = 39;
+constant uint G_ROCE_PACER_ARMED = 40;
+constant uint G_ROCE_RTO_DEADLINE = 41;
+constant uint G_ROCE_RTO = 42;
+constant ulong ROCE_RECEIVER_MARKER = 4;
+constant uint RR_TOTAL = 0;
+constant uint RR_ACK_EVERY = 1;
+constant uint RR_ACK_SIZE = 2;
+constant uint RR_NACK_INTERVAL = 3;
+constant uint RR_DUPLICATE_ACK = 4;
+constant uint RR_EXPECTED = 5;
+constant uint RR_SINCE_ACK = 6;
+constant uint RR_NACK_PSN = 7;
+constant uint RR_NACK_TIME = 8;
+constant uint RR_FLAGS = 9;
+constant ulong RR_FLAG_LAST_NACK = 1;
+constant ulong ROCE_ACTION_ACK = 0;
+constant ulong ROCE_ACTION_DUPLICATE_ACK = 1;
+constant ulong ROCE_ACTION_NACK = 2;
+constant ulong ROCE_ACTION_NACK_SUPPRESSED = 3;
+constant ulong ROCE_ACTION_NONE = 4;
+
+constant uint CTL_KIND = 0;
+constant uint CTL_MSS = 1;
+constant uint CTL_CWND = 2;
+constant uint CTL_SSTHRESH = 3;
+constant uint CTL_PHASE = 4;
+constant uint CTL_DUP_ACKS = 5;
+constant uint CTL_RECOVERY_HIGH = 6;
+constant uint CTL_EXTRA_0 = 7;
+constant uint CTL_W_LAST_MAX = 8;
+constant uint CTL_EPOCH = 9;
+constant uint CTL_SRTT = 10;
+constant uint CTL_K = 11;
+
+constant ulong TCP_SLOW_START = 0;
+constant ulong TCP_CONGESTION_AVOIDANCE = 1;
+constant ulong TCP_FAST_RECOVERY = 2;
+constant ulong CUBIC_SCALE = 1000000000ul;
+constant ulong CUBIC_MAX_WINDOW = 2000000000000000ul;
+constant ulong TCP_MIN_RTO = 1000000000ul;
+constant ulong TCP_MAX_RTO = 60000000000ul;
+constant ulong TCP_RTO_GRANULARITY = 1000000ul;
+
+constant ulong ERROR_CAPACITY = 1;
+constant ulong ERROR_TRANSITION_CAPACITY = 2;
+constant ulong ERROR_SEMANTIC = 3;
+constant ulong ERROR_WFQ_ARITHMETIC = 100;
+constant ulong ARENA_FEL = 1;
+constant ulong ARENA_QUEUE = 2;
+constant ulong ARENA_OUTBOX = 3;
+constant ulong ARENA_WORKLIST = 4;
+constant ulong ARENA_OBSERVED = 5;
+constant ulong ARENA_DEPARTURES = 6;
+constant ulong ARENA_ARRIVALS = 7;
+constant ulong ARENA_CHANNEL_INBOX = 8;
+constant ulong ARENA_SERVICE_STREAM = 9;
+constant ulong ARENA_GENERATOR_STREAM = 10;
+constant ulong ARENA_TCP_RECEIVER = 11;
+constant ulong ARENA_TCP_SEGMENT_LEDGER = 12;
+constant ulong ARENA_REMOTE_STAGING = 13;
+
+constant uint L_FINISHED = 0;
+constant uint L_TRANSITIONS = 1;
+constant uint L_ERROR = 2;
+constant uint L_ERROR_ARENA = 3;
+constant uint L_ERROR_NODE = 4;
+constant uint L_ERROR_CAPACITY = 5;
+constant uint L_ERROR_DEMAND = 6;
+
+inline bool key_less(const thread ulong *left, const thread ulong *right) {
+    if (left[E_TIME] != right[E_TIME]) {
+        return left[E_TIME] < right[E_TIME];
+    }
+    if (left[E_PHASE] != right[E_PHASE]) {
+        return left[E_PHASE] < right[E_PHASE];
+    }
+    if (left[E_ORIGIN] != right[E_ORIGIN]) {
+        return left[E_ORIGIN] < right[E_ORIGIN];
+    }
+    return left[E_SEQUENCE] < right[E_SEQUENCE];
+}
+
+inline bool stored_key_less(
+    const device ulong *records,
+    ulong left_slot,
+    ulong right_slot
+) {
+    ulong left = left_slot * EVENT_WORDS;
+    ulong right = right_slot * EVENT_WORDS;
+    if (records[left + E_TIME] != records[right + E_TIME]) {
+        return records[left + E_TIME] < records[right + E_TIME];
+    }
+    if (records[left + E_PHASE] != records[right + E_PHASE]) {
+        return records[left + E_PHASE] < records[right + E_PHASE];
+    }
+    if (records[left + E_ORIGIN] != records[right + E_ORIGIN]) {
+        return records[left + E_ORIGIN] < records[right + E_ORIGIN];
+    }
+    return records[left + E_SEQUENCE] < records[right + E_SEQUENCE];
+}
+
+inline bool stored_cross_key_less(
+    const device ulong *left_records,
+    ulong left_slot,
+    const device ulong *right_records,
+    ulong right_slot
+) {
+    ulong left = left_slot * EVENT_WORDS;
+    ulong right = right_slot * EVENT_WORDS;
+    if (left_records[left + E_TIME] != right_records[right + E_TIME]) {
+        return left_records[left + E_TIME] < right_records[right + E_TIME];
+    }
+    if (left_records[left + E_PHASE] != right_records[right + E_PHASE]) {
+        return left_records[left + E_PHASE] < right_records[right + E_PHASE];
+    }
+    if (left_records[left + E_ORIGIN] != right_records[right + E_ORIGIN]) {
+        return left_records[left + E_ORIGIN] < right_records[right + E_ORIGIN];
+    }
+    return left_records[left + E_SEQUENCE] < right_records[right + E_SEQUENCE];
+}
+
+inline bool stored_word_cross_key_less(
+    const device ulong *left_records,
+    ulong left_word,
+    const device ulong *right_records,
+    ulong right_word
+) {
+    for (uint word = 0; word < 4; ++word) {
+        if (left_records[left_word + word] != right_records[right_word + word]) {
+            return left_records[left_word + word] < right_records[right_word + word];
+        }
+    }
+    return false;
+}
+
+inline bool stored_thread_key_less(
+    const device ulong *left_records,
+    ulong left_slot,
+    const thread ulong *right
+) {
+    ulong left = left_slot * EVENT_WORDS;
+    if (left_records[left + E_TIME] != right[E_TIME]) {
+        return left_records[left + E_TIME] < right[E_TIME];
+    }
+    if (left_records[left + E_PHASE] != right[E_PHASE]) {
+        return left_records[left + E_PHASE] < right[E_PHASE];
+    }
+    if (left_records[left + E_ORIGIN] != right[E_ORIGIN]) {
+        return left_records[left + E_ORIGIN] < right[E_ORIGIN];
+    }
+    return left_records[left + E_SEQUENCE] < right[E_SEQUENCE];
+}
+
+inline bool stored_word_thread_key_less(
+    const device ulong *left_records,
+    ulong left_word,
+    const thread ulong *right
+) {
+    for (uint word = 0; word < 4; ++word) {
+        if (left_records[left_word + word] != right[word]) {
+            return left_records[left_word + word] < right[word];
+        }
+    }
+    return false;
+}
+
+inline void copy_thread_to_device(
+    const thread ulong *source,
+    device ulong *target,
+    ulong slot
+) {
+    ulong offset = slot * EVENT_WORDS;
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        target[offset + word] = source[word];
+    }
+}
+
+inline void copy_device_to_thread(
+    const device ulong *source,
+    ulong slot,
+    thread ulong *target
+) {
+    ulong offset = slot * EVENT_WORDS;
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        target[word] = source[offset + word];
+    }
+}
+
+inline void copy_device_record(
+    const device ulong *source,
+    ulong source_slot,
+    device ulong *target,
+    ulong target_slot
+) {
+    ulong source_offset = source_slot * EVENT_WORDS;
+    ulong target_offset = target_slot * EVENT_WORDS;
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        target[target_offset + word] = source[source_offset + word];
+    }
+}
+
+// Stream-record offsets are word offsets. Capacities, heads, and counts remain record counts.
+// Every compact record retains the canonical four-word key verbatim at words 0..3.
+inline uint stream_record_words(ulong stream, const device ulong *params) {
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        return CHANNEL_EVENT_WORDS;
+    }
+    if (stream < params[P_GENERATOR_STREAM_BASE]) {
+        return SERVICE_EVENT_WORDS;
+    }
+    return GENERATOR_EVENT_WORDS;
+}
+
+inline ulong stream_record_offset(
+    ulong stream,
+    ulong physical,
+    const device ulong *params,
+    const device ulong *stream_state
+) {
+    return stream_state[stream * META_WORDS] +
+        physical * ulong(stream_record_words(stream, params));
+}
+
+inline void encode_stream_record(
+    const thread ulong *record,
+    ulong stream,
+    const device ulong *params,
+    device ulong *encoded
+) {
+    for (uint word = 0; word < 4; ++word) {
+        encoded[word] = record[word];
+    }
+    encoded[4] = record[E_PAYLOAD];
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        encoded[5] = record[PK_FLOW];
+        encoded[6] = record[PK_SIZE];
+        encoded[7] = record[PK_KIND];
+        encoded[8] = record[PK_META_0];
+        encoded[9] = record[PK_META_1];
+        encoded[10] = record[PK_META_2];
+    } else if (stream >= params[P_GENERATOR_STREAM_BASE]) {
+        encoded[5] = record[PK_SIZE];
+        encoded[6] = record[PK_KIND];
+        encoded[7] = record[PK_META_0];
+        encoded[8] = record[PK_META_1];
+        encoded[9] = record[PK_META_2];
+    }
+}
+
+inline void decode_stream_record(
+    const device ulong *encoded,
+    ulong stream,
+    ulong node,
+    const device ulong *params,
+    thread ulong *record
+) {
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        record[word] = 0;
+    }
+    for (uint word = 0; word < 4; ++word) {
+        record[word] = encoded[word];
+    }
+    record[E_TARGET] = node;
+    record[E_PAYLOAD] = encoded[4];
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        record[E_KIND] = REMOTE_ARRIVAL;
+        record[PK_ID] = encoded[4];
+        record[PK_FLOW] = encoded[5];
+        record[PK_SIZE] = encoded[6];
+        record[PK_KIND] = encoded[7];
+        record[PK_META_0] = encoded[8];
+        record[PK_META_1] = encoded[9];
+        record[PK_META_2] = encoded[10];
+    } else if (stream < params[P_GENERATOR_STREAM_BASE]) {
+        record[E_KIND] = record[E_PHASE] == 2
+            ? TX_READY
+            : TX_COMPLETE;
+    } else {
+        record[E_KIND] = PACKET_ARRIVAL;
+        record[PK_ID] = encoded[4];
+        record[PK_FLOW] = stream - params[P_GENERATOR_STREAM_BASE];
+        record[PK_SIZE] = encoded[5];
+        record[PK_KIND] = encoded[6];
+        record[PK_META_0] = encoded[7];
+        record[PK_META_1] = encoded[8];
+        record[PK_META_2] = encoded[9];
+    }
+}
+
+inline void encode_remote_staging_record(
+    const thread ulong *record,
+    device ulong *encoded
+) {
+    for (uint word = 0; word < 4; ++word) {
+        encoded[word] = record[word];
+    }
+    encoded[4] = record[E_TARGET];
+    encoded[5] = record[E_PAYLOAD];
+    encoded[6] = record[PK_FLOW];
+    encoded[7] = record[PK_SIZE];
+    encoded[8] = record[PK_KIND];
+    encoded[9] = record[PK_META_0];
+    encoded[10] = record[PK_META_1];
+    encoded[11] = record[PK_META_2];
+}
+
+inline void copy_staging_to_channel(
+    const device ulong *remote_staging,
+    ulong source_slot,
+    device ulong *stream_records,
+    ulong target_word
+) {
+    ulong source_word = source_slot * REMOTE_STAGING_EVENT_WORDS;
+    for (uint word = 0; word < 4; ++word) {
+        stream_records[target_word + word] = remote_staging[source_word + word];
+    }
+    for (uint word = 4; word < CHANNEL_EVENT_WORDS; ++word) {
+        stream_records[target_word + word] = remote_staging[source_word + word + 1];
+    }
+}
+
+inline void swap_records(device ulong *records, ulong left_slot, ulong right_slot) {
+    ulong left = left_slot * EVENT_WORDS;
+    ulong right = right_slot * EVENT_WORDS;
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        ulong value = records[left + word];
+        records[left + word] = records[right + word];
+        records[right + word] = value;
+    }
+}
+
+inline ulong saturating_add_ulong(ulong left, ulong right) {
+    return right > NONE - left ? NONE : left + right;
+}
+
+inline void set_capacity_error(
+    device ulong *error,
+    ulong arena,
+    ulong node,
+    ulong capacity,
+    ulong demand
+) {
+    if (error[L_ERROR] == 0) {
+        error[L_ERROR] = ERROR_CAPACITY;
+        error[L_ERROR_ARENA] = arena;
+        error[L_ERROR_NODE] = node;
+        error[L_ERROR_CAPACITY] = capacity;
+        error[L_ERROR_DEMAND] = demand;
+    }
+}
+
+inline void set_semantic_error(device ulong *error, ulong code, ulong node) {
+    if (error[L_ERROR] == 0) {
+        error[L_ERROR] = ERROR_SEMANTIC + code;
+        error[L_ERROR_NODE] = node;
+    }
+}
+
+inline void set_wfq_arithmetic_error(device ulong *error, ulong node) {
+    if (error[L_ERROR] == 0) {
+        error[L_ERROR] = ERROR_WFQ_ARITHMETIC;
+        error[L_ERROR_NODE] = node;
+    }
+}
+
+// T20g item 2 live-state contract.
+//
+// `pending_events` denotes LIVE events, so a superseded retransmission timeout is removed from the
+// fallback heap at the transition that supersedes it. Interior removal needs the record's position,
+// which the per-flow TCP ledger metadata word +3 carries as `absolute record slot + 1`; zero means
+// the flow owns no heap record. Every heap movement below repairs that word, and the repair is
+// conditioned on the moved record already being the flow's recorded owner, so legacy-import residue
+// carrying the same flow can never steal ownership.
+inline ulong tcp_timer_slot_word(ulong flow, const device ulong *params) {
+    return params[P_TCP_LEDGER_META_OFFSET] + flow * TCP_LEDGER_META_WORDS + 3;
+}
+
+inline ulong heap_timer_owner(
+    const device ulong *params,
+    const device ulong *tcp_state,
+    const device ulong *records,
+    ulong slot
+) {
+    ulong record = slot * EVENT_WORDS;
+    if (records[record + E_KIND] != RETRANSMISSION_TIMEOUT) {
+        return NONE;
+    }
+    ulong flow = records[record + PK_FLOW];
+    if (flow >= params[P_FLOW_COUNT]) {
+        return NONE;
+    }
+    if (tcp_state[tcp_timer_slot_word(flow, params)] != slot + 1) {
+        return NONE;
+    }
+    return flow;
+}
+
+inline void heap_swap(
+    const device ulong *params,
+    device ulong *tcp_state,
+    device ulong *records,
+    ulong left_slot,
+    ulong right_slot
+) {
+    ulong left_owner = heap_timer_owner(params, tcp_state, records, left_slot);
+    ulong right_owner = heap_timer_owner(params, tcp_state, records, right_slot);
+    swap_records(records, left_slot, right_slot);
+    if (left_owner != NONE) {
+        tcp_state[tcp_timer_slot_word(left_owner, params)] = right_slot + 1;
+    }
+    if (right_owner != NONE) {
+        tcp_state[tcp_timer_slot_word(right_owner, params)] = left_slot + 1;
+    }
+}
+
+inline void heap_move(
+    const device ulong *params,
+    device ulong *tcp_state,
+    device ulong *records,
+    ulong source_slot,
+    ulong target_slot
+) {
+    ulong owner = heap_timer_owner(params, tcp_state, records, source_slot);
+    copy_device_record(records, source_slot, records, target_slot);
+    if (owner != NONE) {
+        tcp_state[tcp_timer_slot_word(owner, params)] = target_slot + 1;
+    }
+}
+
+inline bool heap_push(
+    ulong node,
+    const thread ulong *record,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *meta,
+    device ulong *records,
+    device ulong *tcp_state
+) {
+    ulong base = node * META_WORDS;
+    ulong offset = meta[base];
+    ulong capacity = meta[base + 1];
+    ulong count = meta[base + 3];
+    if (count >= capacity) {
+        set_capacity_error(error, ARENA_FEL, node, capacity, count + 1);
+        return false;
+    }
+    ulong child = count;
+    // A kernel-side timeout push is always the arming transition's new live timer, so it claims
+    // the flow's slot before the sift-up starts repairing positions. The slot must be empty first:
+    // firing clears it and an eager disarm clears it, so a live slot here is a removal the
+    // live-state contract required and some transition did not perform.
+    bool arming_timer =
+        record[E_KIND] == RETRANSMISSION_TIMEOUT && record[PK_FLOW] < params[P_FLOW_COUNT];
+    ulong slot_word = 0;
+    if (arming_timer) {
+        slot_word = tcp_timer_slot_word(record[PK_FLOW], params);
+        if (tcp_state[slot_word] != 0) {
+            set_semantic_error(error, 61, node);
+            return false;
+        }
+    }
+    copy_thread_to_device(record, records, offset + child);
+    meta[base + 3] = count + 1;
+    if (arming_timer) {
+        tcp_state[slot_word] = offset + child + 1;
+    }
+    while (child != 0) {
+        ulong parent = (child - 1) / 2;
+        if (!stored_key_less(records, offset + child, offset + parent)) {
+            break;
+        }
+        heap_swap(params, tcp_state, records, offset + child, offset + parent);
+        child = parent;
+    }
+    return true;
+}
+
+inline bool heap_pop(
+    ulong node,
+    const device ulong *params,
+    device ulong *meta,
+    device ulong *records,
+    device ulong *tcp_state,
+    thread ulong *record,
+    thread ulong &timer_owner
+) {
+    ulong base = node * META_WORDS;
+    ulong offset = meta[base];
+    ulong count = meta[base + 3];
+    timer_owner = NONE;
+    if (count == 0) {
+        return false;
+    }
+    // Ownership is resolved before the restructure: sifting can move a different live timer into
+    // the vacated root, and the caller must classify the record it actually received.
+    timer_owner = heap_timer_owner(params, tcp_state, records, offset);
+    if (timer_owner != NONE) {
+        tcp_state[tcp_timer_slot_word(timer_owner, params)] = 0;
+    }
+    copy_device_to_thread(records, offset, record);
+    count -= 1;
+    meta[base + 3] = count;
+    if (count == 0) {
+        return true;
+    }
+    heap_move(params, tcp_state, records, offset + count, offset);
+    ulong parent = 0;
+    while (true) {
+        ulong left = parent * 2 + 1;
+        if (left >= count) {
+            break;
+        }
+        ulong right = left + 1;
+        ulong child = left;
+        if (right < count && stored_key_less(records, offset + right, offset + left)) {
+            child = right;
+        }
+        if (!stored_key_less(records, offset + child, offset + parent)) {
+            break;
+        }
+        heap_swap(params, tcp_state, records, offset + child, offset + parent);
+        parent = child;
+    }
+    return true;
+}
+
+inline bool heap_root_time(
+    ulong node,
+    const device ulong *meta,
+    const device ulong *records,
+    thread ulong &time
+) {
+    ulong base = node * META_WORDS;
+    if (meta[base + 3] == 0) {
+        return false;
+    }
+    time = records[meta[base] * EVENT_WORDS + E_TIME];
+    return true;
+}
+
+inline ulong stream_arena(ulong stream, const device ulong *params) {
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        return ARENA_CHANNEL_INBOX;
+    }
+    if (stream < params[P_GENERATOR_STREAM_BASE]) {
+        return ARENA_SERVICE_STREAM;
+    }
+    return ARENA_GENERATOR_STREAM;
+}
+
+inline void active_update_stream_key(
+    ulong node,
+    ulong active_index,
+    ulong stream,
+    ulong physical,
+    const device ulong *params,
+    device ulong *stream_state,
+    const device ulong *stream_records
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong entry =
+        stream_state[meta + 2] +
+        active_index * ACTIVE_STREAM_ENTRY_WORDS;
+    ulong record = stream_record_offset(stream, physical, params, stream_state);
+    for (uint word = 0; word < 4; ++word) {
+        stream_state[entry + 1 + word] = stream_records[record + word];
+    }
+}
+
+inline bool active_add(
+    ulong node,
+    ulong stream,
+    const thread ulong *record,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *stream_state
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong offset = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    ulong capacity = stream_state[meta + 1] + 1;
+    if (count >= capacity) {
+        set_semantic_error(error, 38, node);
+        return false;
+    }
+    ulong entry = offset + count * ACTIVE_STREAM_ENTRY_WORDS;
+    stream_state[entry] = stream;
+    for (uint word = 0; word < 4; ++word) {
+        stream_state[entry + 1 + word] = record[word];
+    }
+    stream_state[meta + 3] = count + 1;
+    return true;
+}
+
+inline void active_update_key(
+    ulong node,
+    ulong active_index,
+    const device ulong *params,
+    device ulong *stream_state,
+    const device ulong *records,
+    ulong slot
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong entry =
+        stream_state[meta + 2] +
+        active_index * ACTIVE_STREAM_ENTRY_WORDS;
+    ulong record = slot * EVENT_WORDS;
+    for (uint word = 0; word < 4; ++word) {
+        stream_state[entry + 1 + word] = records[record + word];
+    }
+}
+
+inline ulong active_find(
+    ulong node,
+    ulong stream,
+    const device ulong *params,
+    const device ulong *stream_state
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong offset = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    for (ulong index = 0; index < count; ++index) {
+        if (stream_state[offset + index * ACTIVE_STREAM_ENTRY_WORDS] == stream) {
+            return index;
+        }
+    }
+    return NONE;
+}
+
+inline bool active_refresh_source(
+    ulong node,
+    ulong stream,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *stream_state,
+    const device ulong *records,
+    ulong slot
+) {
+    ulong index = active_find(node, stream, params, stream_state);
+    if (index == NONE) {
+        set_semantic_error(error, 43, node);
+        return false;
+    }
+    active_update_key(
+        node,
+        index,
+        params,
+        stream_state,
+        records,
+        slot
+    );
+    return true;
+}
+
+inline void active_remove(
+    ulong node,
+    ulong active_index,
+    const device ulong *params,
+    device ulong *stream_state
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong offset = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    if (active_index + 1 < count) {
+        ulong target = offset + active_index * ACTIVE_STREAM_ENTRY_WORDS;
+        ulong source = offset + (count - 1) * ACTIVE_STREAM_ENTRY_WORDS;
+        for (uint word = 0; word < ACTIVE_STREAM_ENTRY_WORDS; ++word) {
+            stream_state[target + word] = stream_state[source + word];
+        }
+    }
+    stream_state[meta + 3] = count - 1;
+}
+
+// Removes one flow's live retransmission-timeout record from `node`'s fallback heap.
+//
+// The per-flow slot word makes this O(log n): validate the identity at the recorded slot, fill the
+// hole with the last record, and repair in whichever direction the fill violates. Semantic code 61
+// reports a slot that does not carry the flow's armed timer, which the live-state contract forbids.
+//
+// Forced inline, as CUDA's `__forceinline__` is. With plain `inline`, the queue-pair ACK/NACK
+// driver's call site (the third) slowed the mechanisms pipeline on DCQCN images that never reach it.
+[[gnu::always_inline]] inline bool heap_remove_timer(
+    ulong node,
+    ulong flow,
+    ulong attempt,
+    ulong deadline,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *meta,
+    device ulong *records,
+    device ulong *stream_state,
+    device ulong *tcp_state
+) {
+    ulong slot_word = tcp_timer_slot_word(flow, params);
+    ulong stored = tcp_state[slot_word];
+    ulong base = node * META_WORDS;
+    ulong offset = meta[base];
+    ulong count = meta[base + 3];
+    if (stored == 0 || stored - 1 < offset || stored - 1 >= offset + count) {
+        set_semantic_error(error, 61, node);
+        return false;
+    }
+    ulong slot = stored - 1;
+    ulong record = slot * EVENT_WORDS;
+    if (records[record + E_KIND] != RETRANSMISSION_TIMEOUT ||
+        records[record + E_TARGET] != node ||
+        records[record + PK_FLOW] != flow ||
+        records[record + E_PAYLOAD] != attempt ||
+        records[record + E_TIME] != deadline) {
+        set_semantic_error(error, 61, node);
+        return false;
+    }
+    tcp_state[slot_word] = 0;
+    ulong index = slot - offset;
+    ulong last = count - 1;
+    count = last;
+    meta[base + 3] = count;
+    if (index != last) {
+        heap_move(params, tcp_state, records, offset + last, offset + index);
+        ulong child = index;
+        while (child != 0) {
+            ulong parent = (child - 1) / 2;
+            if (!stored_key_less(records, offset + child, offset + parent)) {
+                break;
+            }
+            heap_swap(params, tcp_state, records, offset + child, offset + parent);
+            child = parent;
+        }
+        if (child == index) {
+            ulong parent = index;
+            while (true) {
+                ulong left = parent * 2 + 1;
+                if (left >= count) {
+                    break;
+                }
+                ulong right = left + 1;
+                ulong pick = left;
+                if (right < count &&
+                    stored_key_less(records, offset + right, offset + left)) {
+                    pick = right;
+                }
+                if (!stored_key_less(records, offset + pick, offset + parent)) {
+                    break;
+                }
+                heap_swap(params, tcp_state, records, offset + pick, offset + parent);
+                parent = pick;
+            }
+        }
+    }
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return true;
+    }
+    if (count == 0) {
+        ulong active_index = active_find(node, NONE, params, stream_state);
+        if (active_index == NONE) {
+            set_semantic_error(error, 43, node);
+            return false;
+        }
+        active_remove(node, active_index, params, stream_state);
+        return true;
+    }
+    return active_refresh_source(
+        node,
+        NONE,
+        params,
+        error,
+        stream_state,
+        records,
+        offset
+    );
+}
+
+inline bool stream_push(
+    ulong node,
+    ulong stream,
+    const thread ulong *record,
+    bool activate,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *stream_state,
+    device ulong *stream_records
+) {
+    ulong base = stream * META_WORDS;
+    ulong offset = stream_state[base];
+    ulong capacity = stream_state[base + 1];
+    ulong head = stream_state[base + 2];
+    ulong count = stream_state[base + 3];
+    if (count >= capacity) {
+        set_capacity_error(
+            error,
+            stream_arena(stream, params),
+            node,
+            capacity,
+            count + 1
+        );
+        return false;
+    }
+    if (params[P_STREAM_ORDER_CHECKS] != 0 && count != 0) {
+        ulong tail = (head + count - 1) % max(capacity, 1ul);
+        ulong tail_word = offset + tail * ulong(stream_record_words(stream, params));
+        if (!stored_word_thread_key_less(stream_records, tail_word, record)) {
+            set_semantic_error(error, 39, node);
+            return false;
+        }
+    }
+    ulong physical = (head + count) % max(capacity, 1ul);
+    encode_stream_record(
+        record,
+        stream,
+        params,
+        stream_records + offset + physical * ulong(stream_record_words(stream, params))
+    );
+    stream_state[base + 3] = count + 1;
+    RECORD_STREAM_HIGH_WATER(params, stream_state, stream, count + 1);
+    return count != 0 || !activate ||
+        active_add(node, stream, record, params, error, stream_state);
+}
+
+inline bool fallback_push(
+    ulong node,
+    const thread ulong *record,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *stream_state,
+    device ulong *tcp_state
+) {
+    bool was_empty = fel_meta[node * META_WORDS + 3] == 0;
+    if (!heap_push(node, record, error, params, fel_meta, fel_records, tcp_state)) {
+        return false;
+    }
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return true;
+    }
+    if (was_empty) {
+        return active_add(
+            node,
+            NONE,
+            record,
+            params,
+            error,
+            stream_state
+        );
+    }
+    return active_refresh_source(
+        node,
+        NONE,
+        params,
+        error,
+        stream_state,
+        fel_records,
+        fel_meta[node * META_WORDS]
+    );
+}
+
+inline bool classified_push(
+    ulong node,
+    const thread ulong *record,
+    const device ulong *params,
+    device ulong *error,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return heap_push(node, record, error, params, fel_meta, fel_records, tcp_state);
+    }
+    ulong kind = record[E_KIND];
+    if (kind == PACKET_ARRIVAL && record[PK_FLOW] < params[P_FLOW_COUNT]) {
+        return stream_push(
+            node,
+            params[P_GENERATOR_STREAM_BASE] + record[PK_FLOW],
+            record,
+            true,
+            params,
+            error,
+            stream_state,
+            stream_records
+        );
+    }
+    if (kind == TX_READY || kind == TX_COMPLETE) {
+        return stream_push(
+            node,
+            params[P_SERVICE_STREAM_BASE] + node,
+            record,
+            true,
+            params,
+            error,
+            stream_state,
+            stream_records
+        );
+    }
+    return fallback_push(
+        node,
+        record,
+        params,
+        error,
+        fel_meta,
+        fel_records,
+        stream_state,
+        tcp_state
+    );
+}
+
+inline bool active_key_less(
+    const device ulong *stream_state,
+    ulong left,
+    ulong right
+) {
+    for (uint word = 1; word < ACTIVE_STREAM_ENTRY_WORDS; ++word) {
+        if (stream_state[left + word] != stream_state[right + word]) {
+            return stream_state[left + word] < stream_state[right + word];
+        }
+    }
+    return false;
+}
+
+inline bool fel_peek(
+    ulong node,
+    const device ulong *params,
+    const device ulong *fel_meta,
+    const device ulong *fel_records,
+    const device ulong *stream_state,
+    const device ulong *stream_records,
+    thread ulong *record,
+    thread ulong &selected_active,
+    thread ulong &selected_stream
+) {
+    if (params[P_STREAMS_ENABLED] == 0) {
+        ulong base = node * META_WORDS;
+        if (fel_meta[base + 3] == 0) {
+            return false;
+        }
+        copy_device_to_thread(fel_records, fel_meta[base], record);
+        selected_active = NONE;
+        selected_stream = NONE;
+        return true;
+    }
+    ulong lp_meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong active_offset = stream_state[lp_meta + 2];
+    ulong active_count = stream_state[lp_meta + 3];
+    if (active_count == 0) {
+        return false;
+    }
+    ulong selected_entry = active_offset;
+    selected_active = 0;
+    for (ulong index = 1; index < active_count; ++index) {
+        ulong candidate =
+            active_offset + index * ACTIVE_STREAM_ENTRY_WORDS;
+        if (active_key_less(stream_state, candidate, selected_entry)) {
+            selected_entry = candidate;
+            selected_active = index;
+        }
+    }
+    selected_stream = stream_state[selected_entry];
+    if (selected_stream == NONE) {
+        ulong heap_base = node * META_WORDS;
+        if (fel_meta[heap_base + 3] == 0) {
+            return false;
+        }
+        copy_device_to_thread(fel_records, fel_meta[heap_base], record);
+    } else {
+        ulong base = selected_stream * META_WORDS;
+        if (stream_state[base + 3] == 0) {
+            return false;
+        }
+        ulong capacity = stream_state[base + 1];
+        ulong physical = stream_state[base + 2] % max(capacity, 1ul);
+        decode_stream_record(
+            stream_records + stream_record_offset(
+                selected_stream,
+                physical,
+                params,
+                stream_state
+            ),
+            selected_stream,
+            node,
+            params,
+            record
+        );
+    }
+    return true;
+}
+
+inline bool fel_root_time(
+    ulong node,
+    const device ulong *params,
+    const device ulong *fel_meta,
+    const device ulong *fel_records,
+    const device ulong *stream_state,
+    const device ulong *stream_records,
+    thread ulong &time
+) {
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return heap_root_time(node, fel_meta, fel_records, time);
+    }
+    ulong record[EVENT_WORDS];
+    ulong selected_active;
+    ulong selected_stream;
+    if (!fel_peek(
+        node,
+        params,
+        fel_meta,
+        fel_records,
+        stream_state,
+        stream_records,
+        record,
+        selected_active,
+        selected_stream
+    )) {
+        return false;
+    }
+    time = record[E_TIME];
+    return true;
+}
+
+inline bool fel_pop_selected(
+    ulong node,
+    ulong selected_active,
+    ulong selected_stream,
+    const device ulong *params,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state,
+    thread ulong *record,
+    thread ulong &timer_owner
+) {
+    timer_owner = NONE;
+    if (params[P_STREAMS_ENABLED] == 0 || selected_active == NONE) {
+        return heap_pop(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state,
+            record,
+            timer_owner
+        );
+    }
+    if (selected_stream == NONE) {
+        if (!heap_pop(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state,
+            record,
+            timer_owner
+        )) {
+            return false;
+        }
+        if (fel_meta[node * META_WORDS + 3] == 0) {
+            active_remove(node, selected_active, params, stream_state);
+        } else {
+            active_update_key(
+                node,
+                selected_active,
+                params,
+                stream_state,
+                fel_records,
+                fel_meta[node * META_WORDS]
+            );
+        }
+        return true;
+    }
+    ulong base = selected_stream * META_WORDS;
+    ulong capacity = stream_state[base + 1];
+    ulong head = stream_state[base + 2];
+    ulong count = stream_state[base + 3] - 1;
+    stream_state[base + 2] = (head + 1) % max(capacity, 1ul);
+    stream_state[base + 3] = count;
+    if (count == 0) {
+        active_remove(node, selected_active, params, stream_state);
+    } else {
+        ulong physical = stream_state[base + 2] % max(capacity, 1ul);
+        active_update_stream_key(
+            node,
+            selected_active,
+            selected_stream,
+            physical,
+            params,
+            stream_state,
+            stream_records
+        );
+    }
+    return true;
+}
+
+inline bool fel_pop(
+    ulong node,
+    const device ulong *params,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state,
+    thread ulong *record,
+    thread ulong &timer_owner
+) {
+    timer_owner = NONE;
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return heap_pop(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state,
+            record,
+            timer_owner
+        );
+    }
+    ulong selected_active;
+    ulong selected_stream;
+    if (!fel_peek(
+        node,
+        params,
+        fel_meta,
+        fel_records,
+        stream_state,
+        stream_records,
+        record,
+        selected_active,
+        selected_stream
+    )) {
+        return false;
+    }
+    return fel_pop_selected(
+        node,
+        selected_active,
+        selected_stream,
+        params,
+        fel_meta,
+        fel_records,
+        stream_state,
+        stream_records,
+        tcp_state,
+        record,
+        timer_owner
+    );
+}
+
+inline bool before_horizon(ulong time, const device ulong *control) {
+    return control[C_HORIZON_HI] != 0 || time < control[C_HORIZON_LO];
+}
+
+inline bool queue_push(
+    ulong node,
+    const thread ulong *record,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *meta,
+    device ulong *records
+) {
+    ulong base = node * QUEUE_META_WORDS;
+    ulong offset = meta[base];
+    ulong capacity = meta[base + 1];
+    ulong head = meta[base + 2];
+    ulong count = meta[base + 3];
+    if (count >= capacity) {
+        set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
+        return false;
+    }
+    ulong physical = (head + count) % max(capacity, 1ul);
+    copy_thread_to_device(record, records, offset + physical);
+    meta[base + 3] = count + 1;
+    RECORD_QUEUE_HIGH_WATER(params, meta, node, count + 1);
+    return true;
+}
+
+inline bool source_queue_key_less_or_equal(
+    const device ulong *records,
+    ulong left_slot,
+    const thread ulong *right
+) {
+    ulong left = left_slot * EVENT_WORDS;
+    if (records[left + E_PHASE] != right[E_PHASE]) {
+        return records[left + E_PHASE] < right[E_PHASE];
+    }
+    if (records[left + E_TIME] != right[E_TIME]) {
+        return records[left + E_TIME] < right[E_TIME];
+    }
+    if (records[left + PK_FLOW] != right[PK_FLOW]) {
+        return records[left + PK_FLOW] < right[PK_FLOW];
+    }
+    return records[left + PK_ID] <= right[PK_ID];
+}
+
+inline bool source_queue_insert(
+    ulong node,
+    const thread ulong *record,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *meta,
+    device ulong *records
+) {
+    ulong base = node * QUEUE_META_WORDS;
+    ulong offset = meta[base];
+    ulong capacity = meta[base + 1];
+    ulong head = meta[base + 2];
+    ulong count = meta[base + 3];
+    if (count >= capacity) {
+        set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
+        return false;
+    }
+    ulong insertion = count;
+    while (insertion != 0) {
+        ulong previous = insertion - 1;
+        ulong previous_slot = offset + (head + previous) % max(capacity, 1ul);
+        if (source_queue_key_less_or_equal(records, previous_slot, record)) {
+            break;
+        }
+        ulong destination = offset + (head + insertion) % max(capacity, 1ul);
+        copy_device_record(records, previous_slot, records, destination);
+        insertion = previous;
+    }
+    copy_thread_to_device(
+        record,
+        records,
+        offset + (head + insertion) % max(capacity, 1ul)
+    );
+    meta[base + 3] = count + 1;
+    RECORD_QUEUE_HIGH_WATER(params, meta, node, count + 1);
+    return true;
+}
+
+inline bool queue_pop(
+    ulong node,
+    device ulong *meta,
+    const device ulong *records,
+    thread ulong *record,
+    thread ulong &physical
+) {
+    ulong base = node * QUEUE_META_WORDS;
+    ulong offset = meta[base];
+    ulong capacity = meta[base + 1];
+    ulong head = meta[base + 2];
+    ulong count = meta[base + 3];
+    if (count == 0) {
+        return false;
+    }
+    physical = head;
+    copy_device_to_thread(records, offset + physical, record);
+    meta[base + 2] = (head + 1) % max(capacity, 1ul);
+    meta[base + 3] = count - 1;
+    return true;
+}
+
+inline bool queue_remove_at(
+    ulong node,
+    ulong logical,
+    device ulong *meta,
+    device ulong *records,
+    thread ulong *record,
+    thread ulong &physical
+) {
+    ulong base = node * QUEUE_META_WORDS;
+    ulong offset = meta[base];
+    ulong capacity = meta[base + 1];
+    ulong head = meta[base + 2];
+    ulong count = meta[base + 3];
+    if (logical >= count) {
+        return false;
+    }
+    if (logical == 0) {
+        return queue_pop(node, meta, records, record, physical);
+    }
+    physical = (head + logical) % max(capacity, 1ul);
+    copy_device_to_thread(records, offset + physical, record);
+    for (ulong cursor = logical; cursor + 1 < count; ++cursor) {
+        ulong source = offset + (head + cursor + 1) % max(capacity, 1ul);
+        ulong target = offset + (head + cursor) % max(capacity, 1ul);
+        copy_device_record(records, source, records, target);
+    }
+    meta[base + 3] = count - 1;
+    return true;
+}
+
+inline bool queue_front(
+    ulong node,
+    const device ulong *meta,
+    const device ulong *records,
+    thread ulong *record
+) {
+    ulong base = node * QUEUE_META_WORDS;
+    if (meta[base + 3] == 0) {
+        return false;
+    }
+    copy_device_to_thread(records, meta[base] + meta[base + 2], record);
+    return true;
+}
+
+inline ulong event_phase(ulong kind) {
+    if (kind == TX_COMPLETE || kind == RETRANSMISSION_TIMEOUT || kind == PACING_TIMER) {
+        return 1;
+    }
+    if (kind == TX_READY) {
+        return 2;
+    }
+    return 0;
+}
+
+inline void add_summary(
+    device ulong *summary,
+    ulong node,
+    uint counter,
+    ulong value
+) {
+    ulong offset = node * 24 + counter * 2;
+    ulong previous = summary[offset];
+    ulong next = previous + value;
+    summary[offset] = next;
+    if (next < previous) {
+        summary[offset + 1] += 1;
+    }
+}
+
+inline bool append_observed(
+    ulong node,
+    const thread ulong *packet,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *observation_meta,
+    device ulong *observed
+) {
+    if (params[P_FULL_OBSERVATIONS] == 0) {
+        return true;
+    }
+    ulong meta = node * OBSERVATION_META_WORDS;
+    ulong index = observation_meta[meta + 3];
+    ulong capacity = observation_meta[meta + 1];
+    if (index >= capacity) {
+        set_capacity_error(error, ARENA_OBSERVED, node, capacity, index + 1);
+        return false;
+    }
+    ulong offset = (observation_meta[meta] + index) * 7;
+    for (uint word = 0; word < 7; ++word) {
+        observed[offset + word] = packet[PK_ID + word];
+    }
+    observation_meta[meta + 3] = index + 1;
+    return true;
+}
+
+inline bool record_sourced(
+    ulong node,
+    const thread ulong *packet,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed
+) {
+    add_summary(summary, node, 0, 1);
+    add_summary(summary, node, 1, packet[PK_SIZE]);
+    return append_observed(
+        node,
+        packet,
+        error,
+        params,
+        observation_meta,
+        observed
+    );
+}
+
+inline bool record_departure(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *departures
+) {
+    add_summary(summary, node, 2, 1);
+    add_summary(summary, node, 3, event[PK_SIZE]);
+    if (!append_observed(
+        node,
+        event,
+        error,
+        params,
+        observation_meta,
+        observed
+    )) {
+        return false;
+    }
+    if (params[P_FULL_OBSERVATIONS] == 0) {
+        return true;
+    }
+    ulong meta = node * OBSERVATION_META_WORDS + META_WORDS;
+    ulong index = observation_meta[meta + 3];
+    ulong capacity = observation_meta[meta + 1];
+    if (index >= capacity) {
+        set_capacity_error(error, ARENA_DEPARTURES, node, capacity, index + 1);
+        return false;
+    }
+    ulong offset = (observation_meta[meta] + index) * 12;
+    departures[offset] = event[E_TIME];
+    departures[offset + 1] = event[E_PHASE];
+    departures[offset + 2] = event[E_ORIGIN];
+    departures[offset + 3] = event[E_SEQUENCE];
+    departures[offset + 4] = event[PK_ID];
+    departures[offset + 5] = event[E_TIME];
+    departures[offset + 6] = event[PK_FLOW];
+    departures[offset + 7] = event[PK_SIZE];
+    departures[offset + 8] = event[PK_KIND];
+    departures[offset + 9] = event[PK_META_0];
+    departures[offset + 10] = event[PK_META_1];
+    departures[offset + 11] = event[PK_META_2];
+    observation_meta[meta + 3] = index + 1;
+    return true;
+}
+
+inline bool record_arrival(
+    ulong node,
+    const thread ulong *event,
+    ulong disposition,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *arrivals
+) {
+    uint counter = 4;
+    if (disposition == 1) {
+        counter = 8;
+    } else if (disposition == 2) {
+        counter = 6;
+    } else if (disposition == 3) {
+        counter = 10;
+    }
+    add_summary(summary, node, counter, 1);
+    add_summary(summary, node, counter + 1, event[PK_SIZE]);
+    if (!append_observed(
+        node,
+        event,
+        error,
+        params,
+        observation_meta,
+        observed
+    )) {
+        return false;
+    }
+    if (params[P_FULL_OBSERVATIONS] == 0) {
+        return true;
+    }
+    ulong meta = node * OBSERVATION_META_WORDS + 2 * META_WORDS;
+    ulong index = observation_meta[meta + 3];
+    ulong capacity = observation_meta[meta + 1];
+    if (index >= capacity) {
+        set_capacity_error(error, ARENA_ARRIVALS, node, capacity, index + 1);
+        return false;
+    }
+    ulong offset = (observation_meta[meta] + index) * 13;
+    arrivals[offset] = event[E_TIME];
+    arrivals[offset + 1] = event[E_PHASE];
+    arrivals[offset + 2] = event[E_ORIGIN];
+    arrivals[offset + 3] = event[E_SEQUENCE];
+    arrivals[offset + 4] = event[PK_ID];
+    arrivals[offset + 5] = event[E_TIME];
+    arrivals[offset + 6] = disposition;
+    arrivals[offset + 7] = event[PK_FLOW];
+    arrivals[offset + 8] = event[PK_SIZE];
+    arrivals[offset + 9] = event[PK_KIND];
+    arrivals[offset + 10] = event[PK_META_0];
+    arrivals[offset + 11] = event[PK_META_1];
+    arrivals[offset + 12] = event[PK_META_2];
+    observation_meta[meta + 3] = index + 1;
+    return true;
+}
+
+inline bool append_remote(
+    ulong node,
+    const thread ulong *record,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state
+) {
+    ulong base = node * META_WORDS;
+    ulong offset = remote_meta[base];
+    ulong capacity = remote_meta[base + 1];
+    ulong index = remote_meta[base + 3];
+    if (index >= capacity) {
+        set_capacity_error(error, ARENA_REMOTE_STAGING, node, capacity, index + 1);
+        return false;
+    }
+    if (params[P_STREAMS_ENABLED] != 0) {
+        encode_remote_staging_record(
+            record,
+            remote_staging + (offset + index) * REMOTE_STAGING_EVENT_WORDS
+        );
+    } else {
+        copy_thread_to_device(record, remote_staging, offset + index);
+    }
+    remote_meta[base + 3] = index + 1;
+    RECORD_REMOTE_HIGH_WATER(params, remote_meta, node, index + 1);
+    if (params[P_STREAMS_ENABLED] != 0) {
+        ulong outbound_meta =
+            params[P_OUTBOUND_META_OFFSET] + node * OUTBOUND_META_WORDS;
+        ulong entry = stream_state[outbound_meta];
+        ulong entry_count = stream_state[outbound_meta + 1];
+        ulong channel = NONE;
+        if (entry_count == 1) {
+            if (
+                params[P_STREAM_ORDER_CHECKS] == 0 ||
+                stream_state[entry] == record[E_TARGET]
+            ) {
+                channel = stream_state[entry + 1];
+            }
+        } else {
+            ulong low = 0;
+            ulong high = entry_count;
+            while (low < high) {
+                ulong middle = low + (high - low) / 2;
+                ulong current = entry + middle * OUTBOUND_ENTRY_WORDS;
+                ulong target = stream_state[current];
+                if (target < record[E_TARGET]) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            if (low < entry_count) {
+                ulong current = entry + low * OUTBOUND_ENTRY_WORDS;
+                if (stream_state[current] == record[E_TARGET]) {
+                    channel = stream_state[current + 1];
+                }
+            }
+        }
+        if (channel == NONE) {
+            set_semantic_error(error, 40, node);
+            return false;
+        }
+        ulong batch =
+            params[P_CHANNEL_BATCH_OFFSET] + channel * CHANNEL_BATCH_WORDS;
+        ulong batch_count = stream_state[batch];
+        if (params[P_STREAM_ORDER_CHECKS] != 0 && batch_count != 0) {
+            ulong previous_slot = stream_state[batch + 2];
+            if (!stored_word_cross_key_less(
+                remote_staging,
+                previous_slot * REMOTE_STAGING_EVENT_WORDS,
+                remote_staging,
+                (offset + index) * REMOTE_STAGING_EVENT_WORDS
+            )) {
+                set_semantic_error(error, 41, node);
+                return false;
+            }
+        } else {
+            stream_state[batch + 1] = offset + index;
+        }
+        stream_state[batch] = batch_count + 1;
+        stream_state[batch + 2] = offset + index;
+        stream_state[params[P_STAGING_CHANNEL_OFFSET] + offset + index] =
+            channel;
+        return true;
+    }
+    ulong insertion = index;
+    while (
+        insertion != 0 &&
+        stored_key_less(
+            remote_staging,
+            offset + insertion,
+            offset + insertion - 1
+        )
+    ) {
+        swap_records(
+            remote_staging,
+            offset + insertion,
+            offset + insertion - 1
+        );
+        insertion -= 1;
+    }
+    return true;
+}
+
+inline bool emit_child(
+    ulong node,
+    const thread ulong *parent,
+    ulong target,
+    ulong kind,
+    ulong time,
+    const thread ulong *packet,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong sequence = node_state[node_base + N_NEXT_ORIGIN];
+    if (sequence == NONE) {
+        set_semantic_error(error, 1, node);
+        return false;
+    }
+    node_state[node_base + N_NEXT_ORIGIN] = sequence + 1;
+    ulong child[EVENT_WORDS];
+    child[E_TIME] = time;
+    child[E_PHASE] = event_phase(kind);
+    child[E_ORIGIN] = node;
+    child[E_SEQUENCE] = sequence;
+    child[E_TARGET] = target;
+    child[E_KIND] = kind;
+    child[E_PAYLOAD] = packet[PK_ID];
+    child[PK_ID] = packet[PK_ID];
+    child[PK_FLOW] = packet[PK_FLOW];
+    child[PK_SIZE] = packet[PK_SIZE];
+    child[PK_KIND] = packet[PK_KIND];
+    child[PK_META_0] = packet[PK_META_0];
+    child[PK_META_1] = packet[PK_META_1];
+    child[PK_META_2] = packet[PK_META_2];
+    if (!key_less(parent, child)) {
+        set_semantic_error(error, 2, node);
+        return false;
+    }
+    if (target == node) {
+        return classified_push(
+            node,
+            child,
+            params,
+            error,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            tcp_state
+        );
+    }
+    return append_remote(
+        node,
+        child,
+        error,
+        params,
+        remote_meta,
+        remote_staging,
+        stream_state
+    );
+}
+
+inline bool checked_add(ulong left, ulong right, thread ulong &result) {
+    result = left + right;
+    return result >= left;
+}
+
+inline bool u128_add(
+    ulong left_low,
+    ulong left_high,
+    ulong right_low,
+    ulong right_high,
+    thread ulong &result_low,
+    thread ulong &result_high
+) {
+    result_low = left_low + right_low;
+    ulong carry = result_low < left_low ? 1ul : 0ul;
+    result_high = left_high + right_high;
+    if (result_high < left_high || result_high > NONE - carry) {
+        return false;
+    }
+    result_high += carry;
+    return true;
+}
+
+inline bool u128_mul_u64(
+    ulong left_low,
+    ulong left_high,
+    ulong right,
+    thread ulong &result_low,
+    thread ulong &result_high
+) {
+    if (left_high != 0 && mulhi(left_high, right) != 0) {
+        return false;
+    }
+    result_low = left_low * right;
+    ulong low_high = mulhi(left_low, right);
+    ulong high_low = left_high * right;
+    if (low_high > NONE - high_low) {
+        return false;
+    }
+    result_high = low_high + high_low;
+    return true;
+}
+
+inline bool u128_mul(
+    ulong left_low,
+    ulong left_high,
+    ulong right_low,
+    ulong right_high,
+    thread ulong &result_low,
+    thread ulong &result_high
+) {
+    if ((left_high != 0 && right_high != 0) ||
+        mulhi(left_low, right_high) != 0 || mulhi(left_high, right_low) != 0) {
+        return false;
+    }
+    result_low = left_low * right_low;
+    ulong high = mulhi(left_low, right_low);
+    ulong cross = left_low * right_high;
+    if (high > NONE - cross) {
+        return false;
+    }
+    high += cross;
+    cross = left_high * right_low;
+    if (high > NONE - cross) {
+        return false;
+    }
+    result_high = high + cross;
+    return true;
+}
+
+inline bool u128_from_mul_u64(
+    ulong left,
+    ulong right,
+    thread ulong &result_low,
+    thread ulong &result_high
+) {
+    result_low = left * right;
+    result_high = mulhi(left, right);
+    return true;
+}
+
+inline bool u128_at_least(
+    ulong left_low,
+    ulong left_high,
+    ulong right_low,
+    ulong right_high
+) {
+    return left_high > right_high || (left_high == right_high && left_low >= right_low);
+}
+
+inline void u128_sub(
+    ulong left_low,
+    ulong left_high,
+    ulong right_low,
+    ulong right_high,
+    thread ulong &result_low,
+    thread ulong &result_high
+) {
+    result_low = left_low - right_low;
+    result_high = left_high - right_high - (left_low < right_low ? 1ul : 0ul);
+}
+
+inline void big_clear(thread uint *value, uint limbs) {
+    for (uint limb = 0; limb < limbs; ++limb) {
+        value[limb] = 0;
+    }
+}
+
+inline bool big_is_zero(const thread uint *value, uint limbs) {
+    for (uint limb = 0; limb < limbs; ++limb) {
+        if (value[limb] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline void big_copy(
+    const thread uint *source,
+    thread uint *target,
+    uint limbs
+) {
+    for (uint limb = 0; limb < limbs; ++limb) {
+        target[limb] = source[limb];
+    }
+}
+
+inline void big_load(
+    const device ulong *source,
+    ulong offset,
+    thread uint *target
+) {
+    for (uint word = 0; word < 5; ++word) {
+        ulong packed = source[offset + word];
+        target[word * 2] = uint(packed);
+        target[word * 2 + 1] = uint(packed >> 32);
+    }
+}
+
+inline void big_store(
+    const thread uint *source,
+    device ulong *target,
+    ulong offset
+) {
+    for (uint word = 0; word < 5; ++word) {
+        target[offset + word] =
+            ulong(source[word * 2]) | (ulong(source[word * 2 + 1]) << 32);
+    }
+}
+
+inline int big_compare(
+    const thread uint *left,
+    const thread uint *right,
+    uint limbs
+) {
+    for (int limb = int(limbs) - 1; limb >= 0; --limb) {
+        if (left[limb] != right[limb]) {
+            return left[limb] < right[limb] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+inline ulong big_remainder_u64(
+    const thread uint *value,
+    uint limbs,
+    ulong divisor
+) {
+    ulong remainder = 0;
+    for (int bit = int(limbs * 32) - 1; bit >= 0; --bit) {
+        bool carry = (remainder >> 63) != 0;
+        ulong shifted =
+            (remainder << 1) |
+            ulong((value[uint(bit) / 32] >> (uint(bit) % 32)) & 1u);
+        if (carry || shifted >= divisor) {
+            shifted -= divisor;
+        }
+        remainder = shifted;
+    }
+    return remainder;
+}
+
+inline ulong big_div_u64(
+    const thread uint *value,
+    uint limbs,
+    ulong divisor,
+    thread uint *quotient
+) {
+    big_clear(quotient, limbs);
+    ulong remainder = 0;
+    for (int bit = int(limbs * 32) - 1; bit >= 0; --bit) {
+        bool carry = (remainder >> 63) != 0;
+        ulong shifted =
+            (remainder << 1) |
+            ulong((value[uint(bit) / 32] >> (uint(bit) % 32)) & 1u);
+        if (carry || shifted >= divisor) {
+            shifted -= divisor;
+            quotient[uint(bit) / 32] |= 1u << (uint(bit) % 32);
+        }
+        remainder = shifted;
+    }
+    return remainder;
+}
+
+inline uint big_div_u32(
+    const thread uint *value,
+    uint limbs,
+    uint divisor,
+    thread uint *quotient
+) {
+    ulong remainder = 0;
+    for (int limb = int(limbs) - 1; limb >= 0; --limb) {
+        ulong current = (remainder << 32) | ulong(value[uint(limb)]);
+        quotient[uint(limb)] = uint(current / ulong(divisor));
+        remainder = current % ulong(divisor);
+    }
+    return uint(remainder);
+}
+
+inline ulong gcd_u64(ulong left, ulong right) {
+    while (right != 0) {
+        ulong remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    return left;
+}
+
+inline void big_multiply(
+    const thread uint *left,
+    uint left_limbs,
+    const thread uint *right,
+    uint right_limbs,
+    thread uint *product,
+    uint product_limbs
+) {
+    big_clear(product, product_limbs);
+    for (uint left_limb = 0; left_limb < left_limbs; ++left_limb) {
+        ulong carry = 0;
+        for (uint right_limb = 0; right_limb < right_limbs; ++right_limb) {
+            uint output = left_limb + right_limb;
+            ulong current =
+                ulong(left[left_limb]) * ulong(right[right_limb]) +
+                ulong(product[output]) + carry;
+            product[output] = uint(current);
+            carry = current >> 32;
+        }
+        product[left_limb + right_limbs] = uint(carry);
+    }
+}
+
+inline bool big_add(
+    thread uint *target,
+    const thread uint *addend,
+    uint limbs
+) {
+    ulong carry = 0;
+    for (uint limb = 0; limb < limbs; ++limb) {
+        ulong sum = ulong(target[limb]) + ulong(addend[limb]) + carry;
+        target[limb] = uint(sum);
+        carry = sum >> 32;
+    }
+    return carry == 0;
+}
+
+inline void u64_limbs(ulong value, thread uint *limbs) {
+    limbs[0] = uint(value);
+    limbs[1] = uint(value >> 32);
+}
+
+inline void multiply_u64(ulong left, ulong right, thread uint *product) {
+    uint left_limbs[2];
+    uint right_limbs[2];
+    u64_limbs(left, left_limbs);
+    u64_limbs(right, right_limbs);
+    big_multiply(left_limbs, 2, right_limbs, 2, product, 4);
+}
+
+inline ulong saturating_add_u64(ulong left, ulong right) {
+    ulong result = left + right;
+    return result < left ? NONE : result;
+}
+
+inline ulong saturating_mul_u64(ulong left, ulong right) {
+    return left != 0 && right > NONE / left ? NONE : left * right;
+}
+
+inline ulong quotient_u64_saturating(const thread uint *quotient, uint limbs) {
+    for (uint limb = 2; limb < limbs; ++limb) {
+        if (quotient[limb] != 0) {
+            return NONE;
+        }
+    }
+    return ulong(quotient[0]) | (ulong(quotient[1]) << 32);
+}
+
+inline ulong mul_div_u64(ulong value, ulong numerator, ulong denominator) {
+    uint product[4];
+    uint quotient[4];
+    multiply_u64(value, numerator, product);
+    big_div_u64(product, 4, max(denominator, 1ul), quotient);
+    return quotient_u64_saturating(quotient, 4);
+}
+
+inline ulong weighted_div_u64(ulong value, ulong multiplier, ulong addend, ulong denominator) {
+    uint value_limbs[2];
+    uint multiplier_limbs[2];
+    uint product[4];
+    u64_limbs(value, value_limbs);
+    u64_limbs(multiplier, multiplier_limbs);
+    big_multiply(value_limbs, 2, multiplier_limbs, 2, product, 4);
+    ulong sum = ulong(product[0]) + ulong(uint(addend));
+    product[0] = uint(sum);
+    ulong carry = sum >> 32;
+    sum = ulong(product[1]) + ulong(uint(addend >> 32)) + carry;
+    product[1] = uint(sum);
+    carry = sum >> 32;
+    for (uint limb = 2; limb < 4 && carry != 0; ++limb) {
+        sum = ulong(product[limb]) + carry;
+        product[limb] = uint(sum);
+        carry = sum >> 32;
+    }
+    uint quotient[4];
+    big_div_u64(product, 4, max(denominator, 1ul), quotient);
+    return quotient_u64_saturating(quotient, 4);
+}
+
+inline void cube_u64(ulong value, thread uint *cube) {
+    uint square[4];
+    uint value_limbs[2];
+    multiply_u64(value, value, square);
+    u64_limbs(value, value_limbs);
+    big_multiply(square, 4, value_limbs, 2, cube, 6);
+}
+
+inline ulong cubic_k_ns(ulong w_max_scaled) {
+    if (w_max_scaled == 0) {
+        return 0;
+    }
+    // Wmax <= 2e15: the exact K radicand needs at most 111 bits. Candidate cubes need 192 bits.
+    // Six 32-bit limbs therefore cover both without overflow (the inherited 320-bit machinery
+    // leaves substantial headroom).
+    uint first[4];
+    multiply_u64(w_max_scaled, 3, first);
+    uint scale_limbs[2];
+    u64_limbs(1000000000000000000ul, scale_limbs);
+    uint product[6];
+    big_multiply(first, 4, scale_limbs, 2, product, 6);
+    uint radicand[6];
+    big_div_u64(product, 6, 4, radicand);
+
+    ulong low = 0;
+    ulong high = NONE;
+    for (uint iteration = 0; iteration < 64; ++iteration) {
+        ulong middle = low + (high - low) / 2;
+        uint candidate[6];
+        cube_u64(middle, candidate);
+        if (big_compare(candidate, radicand, 6) <= 0) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
+inline ulong cubic_magnitude(ulong distance) {
+    // d^3 is 192 bits and the numerator 2*d^3 is 193 bits. Seven limbs cover the exact value;
+    // division then saturates only when the scalar BigUint quotient exceeds u64.
+    uint cube[6];
+    cube_u64(distance, cube);
+    uint doubled[7];
+    big_clear(doubled, 7);
+    uint carry = 0;
+    for (uint limb = 0; limb < 6; ++limb) {
+        uint next = cube[limb] >> 31;
+        doubled[limb] = (cube[limb] << 1) | carry;
+        carry = next;
+    }
+    doubled[6] = carry;
+    // Split 5e18 into exact integral divisions. For non-negative integers,
+    // nested floor divisions equal division by the product. Keeping each divisor
+    // within 32 bits avoids a Metal compiler miscompile observed for larger
+    // divisors in large CUBIC congestion-avoidance corpora.
+    uint divided_by_five[7];
+    uint divided_by_first_billion[7];
+    uint quotient[7];
+    big_div_u32(doubled, 7, 5, divided_by_five);
+    big_div_u32(divided_by_five, 7, 1000000000, divided_by_first_billion);
+    big_div_u32(divided_by_first_billion, 7, 1000000000, quotient);
+    return quotient_u64_saturating(quotient, 7);
+}
+
+inline ulong cubic_window_scaled(ulong w_max_scaled, ulong k_ns, ulong elapsed_ns) {
+    bool negative = elapsed_ns < k_ns;
+    ulong distance = negative ? k_ns - elapsed_ns : elapsed_ns - k_ns;
+    ulong magnitude = cubic_magnitude(distance);
+    if (negative) {
+        return max(w_max_scaled > magnitude ? w_max_scaled - magnitude : 0, CUBIC_SCALE);
+    }
+    return min(
+        max(saturating_add_u64(w_max_scaled, magnitude), CUBIC_SCALE),
+        CUBIC_MAX_WINDOW
+    );
+}
+
+inline ulong tcp_friendly_window_scaled(
+    ulong w_max_scaled,
+    ulong elapsed_ns,
+    ulong rtt_ns
+) {
+    ulong base = mul_div_u64(w_max_scaled, 7, 10);
+    uint coefficient[2];
+    uint elapsed[2];
+    uint numerator[4];
+    u64_limbs(CUBIC_SCALE * 9, coefficient);
+    u64_limbs(elapsed_ns, elapsed);
+    big_multiply(coefficient, 2, elapsed, 2, numerator, 4);
+    uint by_seventeen[4];
+    uint quotient[4];
+    big_div_u64(numerator, 4, 17, by_seventeen);
+    big_div_u64(by_seventeen, 4, max(rtt_ns, 1ul), quotient);
+    ulong growth = quotient_u64_saturating(quotient, 4);
+    return min(
+        max(saturating_add_u64(base, growth), CUBIC_SCALE),
+        CUBIC_MAX_WINDOW
+    );
+}
+
+inline ulong cubic_ack_step(ulong cwnd, ulong target) {
+    ulong distance = target >= cwnd ? target - cwnd : cwnd - target;
+    ulong delta = mul_div_u64(distance, CUBIC_SCALE, max(cwnd, CUBIC_SCALE));
+    return target >= cwnd
+        ? saturating_add_u64(cwnd, delta)
+        : (cwnd > delta ? cwnd - delta : 0);
+}
+
+inline ulong controller_cwnd_bytes(const thread ulong *control) {
+    return control[CTL_KIND] == 0
+        ? control[CTL_CWND]
+        : mul_div_u64(control[CTL_CWND], max(control[CTL_MSS], 1ul), CUBIC_SCALE);
+}
+
+inline void controller_recovery_exit(thread ulong *control) {
+    if (control[CTL_KIND] == 0) {
+        control[CTL_CWND] = max(control[CTL_SSTHRESH], control[CTL_MSS]);
+        control[CTL_EXTRA_0] = 0;
+    } else {
+        control[CTL_CWND] = min(max(control[CTL_SSTHRESH], CUBIC_SCALE), CUBIC_MAX_WINDOW);
+    }
+    control[CTL_PHASE] = TCP_CONGESTION_AVOIDANCE;
+    control[CTL_DUP_ACKS] = 0;
+    control[CTL_RECOVERY_HIGH] = 0;
+}
+
+inline void controller_fast_retransmit(
+    thread ulong *control,
+    ulong flight,
+    ulong now_ns
+) {
+    if (control[CTL_KIND] == 0) {
+        ulong minimum = saturating_mul_u64(control[CTL_MSS], 2);
+        control[CTL_SSTHRESH] = max(flight / 2, minimum);
+        control[CTL_CWND] = saturating_add_u64(
+            control[CTL_SSTHRESH], saturating_mul_u64(control[CTL_MSS], 3)
+        );
+        control[CTL_EXTRA_0] = 0;
+    } else {
+        ulong previous_max = control[CTL_W_LAST_MAX];
+        ulong current = control[CTL_CWND];
+        control[CTL_W_LAST_MAX] = current;
+        control[CTL_EXTRA_0] = previous_max > 0 && current < previous_max
+            ? mul_div_u64(current, 17, 20)
+            : current;
+        ulong flight_scaled = min(
+            mul_div_u64(flight, CUBIC_SCALE, max(control[CTL_MSS], 1ul)),
+            CUBIC_MAX_WINDOW
+        );
+        ulong reduced = max(mul_div_u64(flight_scaled, 7, 10), CUBIC_SCALE);
+        control[CTL_SSTHRESH] = max(reduced, 2 * CUBIC_SCALE);
+        control[CTL_CWND] = min(reduced, CUBIC_MAX_WINDOW);
+        control[CTL_EPOCH] = now_ns;
+        control[CTL_K] = cubic_k_ns(control[CTL_EXTRA_0]);
+    }
+    control[CTL_PHASE] = TCP_FAST_RECOVERY;
+}
+
+inline bool controller_duplicate_ack(thread ulong *control, ulong flight, ulong now_ns) {
+    control[CTL_DUP_ACKS] = saturating_add_u64(control[CTL_DUP_ACKS], 1);
+    if (control[CTL_DUP_ACKS] == 3) {
+        controller_fast_retransmit(control, flight, now_ns);
+        return true;
+    }
+    if (control[CTL_DUP_ACKS] > 3 && control[CTL_PHASE] == TCP_FAST_RECOVERY) {
+        control[CTL_CWND] = control[CTL_KIND] == 0
+            ? saturating_add_u64(control[CTL_CWND], control[CTL_MSS])
+            : min(saturating_add_u64(control[CTL_CWND], CUBIC_SCALE), CUBIC_MAX_WINDOW);
+    }
+    return false;
+}
+
+inline void controller_new_ack(
+    thread ulong *control,
+    ulong acknowledged_bytes,
+    ulong now_ns,
+    ulong rtt_sample,
+    ulong acknowledgment
+) {
+    control[CTL_DUP_ACKS] = 0;
+    if (control[CTL_KIND] == 0) {
+        if (control[CTL_PHASE] == TCP_SLOW_START) {
+            control[CTL_CWND] = saturating_add_u64(
+                control[CTL_CWND], min(control[CTL_MSS], acknowledged_bytes)
+            );
+            if (control[CTL_CWND] >= control[CTL_SSTHRESH]) {
+                control[CTL_CWND] = control[CTL_SSTHRESH];
+                control[CTL_PHASE] = TCP_CONGESTION_AVOIDANCE;
+                control[CTL_EXTRA_0] = 0;
+            }
+        } else if (control[CTL_PHASE] == TCP_CONGESTION_AVOIDANCE) {
+            control[CTL_EXTRA_0] = saturating_add_u64(control[CTL_EXTRA_0], acknowledged_bytes);
+            while (control[CTL_EXTRA_0] >= max(control[CTL_CWND], 1ul)) {
+                control[CTL_EXTRA_0] -= max(control[CTL_CWND], 1ul);
+                control[CTL_CWND] = saturating_add_u64(control[CTL_CWND], control[CTL_MSS]);
+            }
+        } else if (
+            control[CTL_RECOVERY_HIGH] != 0 &&
+            acknowledgment >= control[CTL_RECOVERY_HIGH]
+        ) {
+            controller_recovery_exit(control);
+        } else {
+            control[CTL_CWND] = saturating_add_u64(control[CTL_SSTHRESH], control[CTL_MSS]);
+        }
+        return;
+    }
+
+    ulong sample = max(rtt_sample, 1ul);
+    control[CTL_SRTT] = control[CTL_SRTT] == 0
+        ? sample
+        : weighted_div_u64(control[CTL_SRTT], 7, sample, 8);
+    if (control[CTL_PHASE] == TCP_SLOW_START) {
+        ulong mss = max(control[CTL_MSS], 1ul);
+        ulong segments = acknowledged_bytes / mss + ulong(acknowledged_bytes % mss != 0);
+        control[CTL_CWND] = min(
+            saturating_add_u64(control[CTL_CWND], saturating_mul_u64(segments, CUBIC_SCALE)),
+            CUBIC_MAX_WINDOW
+        );
+        if (control[CTL_CWND] >= control[CTL_SSTHRESH]) {
+            control[CTL_PHASE] = TCP_CONGESTION_AVOIDANCE;
+            control[CTL_EPOCH] = now_ns;
+            if (control[CTL_EXTRA_0] == 0) {
+                control[CTL_EXTRA_0] = control[CTL_CWND];
+                control[CTL_K] = 0;
+            }
+        }
+    } else if (control[CTL_PHASE] == TCP_CONGESTION_AVOIDANCE) {
+        if (control[CTL_EPOCH] == NONE) {
+            control[CTL_EPOCH] = now_ns;
+            if (control[CTL_EXTRA_0] == 0) {
+                control[CTL_EXTRA_0] = control[CTL_CWND];
+                control[CTL_K] = 0;
+            } else {
+                control[CTL_K] = cubic_k_ns(control[CTL_EXTRA_0]);
+            }
+        }
+        ulong elapsed = now_ns >= control[CTL_EPOCH] ? now_ns - control[CTL_EPOCH] : 0;
+        ulong cubic_now = cubic_window_scaled(control[CTL_EXTRA_0], control[CTL_K], elapsed);
+        ulong friendly = tcp_friendly_window_scaled(
+            control[CTL_EXTRA_0], elapsed, max(control[CTL_SRTT], 1ul)
+        );
+        if (cubic_now < friendly) {
+            control[CTL_CWND] = min(friendly, CUBIC_MAX_WINDOW);
+        } else {
+            ulong target = cubic_window_scaled(
+                control[CTL_EXTRA_0],
+                control[CTL_K],
+                saturating_add_u64(elapsed, max(control[CTL_SRTT], 1ul))
+            );
+            control[CTL_CWND] = min(
+                max(cubic_ack_step(control[CTL_CWND], target), CUBIC_SCALE),
+                CUBIC_MAX_WINDOW
+            );
+        }
+    } else if (
+        control[CTL_RECOVERY_HIGH] != 0 &&
+        acknowledgment >= control[CTL_RECOVERY_HIGH]
+    ) {
+        controller_recovery_exit(control);
+    }
+}
+
+inline void controller_timeout(thread ulong *control, ulong flight) {
+    if (control[CTL_KIND] == 0) {
+        control[CTL_SSTHRESH] = max(flight / 2, saturating_mul_u64(control[CTL_MSS], 2));
+        control[CTL_CWND] = control[CTL_MSS];
+        control[CTL_EXTRA_0] = 0;
+    } else {
+        ulong flight_scaled = min(
+            mul_div_u64(flight, CUBIC_SCALE, max(control[CTL_MSS], 1ul)),
+            CUBIC_MAX_WINDOW
+        );
+        control[CTL_SSTHRESH] = min(
+            max(mul_div_u64(flight_scaled, 7, 10), 2 * CUBIC_SCALE),
+            CUBIC_MAX_WINDOW
+        );
+        control[CTL_CWND] = CUBIC_SCALE;
+        control[CTL_EXTRA_0] = 0;
+        control[CTL_W_LAST_MAX] = 0;
+        control[CTL_EPOCH] = NONE;
+        control[CTL_K] = 0;
+    }
+    control[CTL_PHASE] = TCP_SLOW_START;
+    control[CTL_DUP_ACKS] = 0;
+    control[CTL_RECOVERY_HIGH] = 0;
+}
+
+inline ulong update_rto(thread ulong &srtt, thread ulong &rtt_var, ulong sample) {
+    sample = max(sample, 1ul);
+    if (srtt == 0) {
+        srtt = sample;
+        rtt_var = sample / 2;
+    } else {
+        ulong deviation = srtt > sample ? srtt - sample : sample - srtt;
+        rtt_var = weighted_div_u64(rtt_var, 3, deviation, 4);
+        srtt = weighted_div_u64(srtt, 7, sample, 8);
+    }
+    ulong variance = max(saturating_mul_u64(rtt_var, 4), TCP_RTO_GRANULARITY);
+    return min(max(saturating_add_u64(srtt, variance), TCP_MIN_RTO), TCP_MAX_RTO);
+}
+
+inline bool rational_compare(
+    const thread uint *left_num,
+    const thread uint *left_den,
+    const thread uint *right_num,
+    const thread uint *right_den,
+    thread int &ordering
+) {
+    if (big_is_zero(left_den, BIG_LIMBS) || big_is_zero(right_den, BIG_LIMBS)) {
+        return false;
+    }
+    uint left_product[PRODUCT_LIMBS];
+    uint right_product[PRODUCT_LIMBS];
+    big_multiply(
+        left_num,
+        BIG_LIMBS,
+        right_den,
+        BIG_LIMBS,
+        left_product,
+        PRODUCT_LIMBS
+    );
+    big_multiply(
+        right_num,
+        BIG_LIMBS,
+        left_den,
+        BIG_LIMBS,
+        right_product,
+        PRODUCT_LIMBS
+    );
+    ordering = big_compare(left_product, right_product, PRODUCT_LIMBS);
+    return true;
+}
+
+inline void rational_load(
+    const device ulong *state,
+    ulong offset,
+    thread uint *numerator,
+    thread uint *denominator
+) {
+    big_load(state, offset, numerator);
+    big_load(state, offset + 5, denominator);
+}
+
+inline void rational_store(
+    const thread uint *numerator,
+    const thread uint *denominator,
+    device ulong *state,
+    ulong offset
+) {
+    big_store(numerator, state, offset);
+    big_store(denominator, state, offset + 5);
+}
+
+inline void rational_zero(device ulong *state, ulong offset) {
+    for (uint word = 0; word < RATIONAL_WORDS; ++word) {
+        state[offset + word] = 0;
+    }
+    state[offset + 5] = 1;
+}
+
+inline void rational_copy(
+    device ulong *state,
+    ulong source,
+    ulong target
+) {
+    for (uint word = 0; word < RATIONAL_WORDS; ++word) {
+        state[target + word] = state[source + word];
+    }
+}
+
+inline bool rational_add_small(
+    const thread uint *input_num,
+    const thread uint *input_den,
+    const thread uint *small_num_input,
+    ulong small_den_input,
+    thread uint *output_num,
+    thread uint *output_den
+) {
+    if (small_den_input == 0 || big_is_zero(input_den, BIG_LIMBS)) {
+        return false;
+    }
+    uint small_num[4];
+    big_copy(small_num_input, small_num, 4);
+    ulong small_den = small_den_input;
+    ulong small_gcd = gcd_u64(big_remainder_u64(small_num, 4, small_den), small_den);
+    if (small_gcd > 1) {
+        uint reduced[4];
+        if (big_div_u64(small_num, 4, small_gcd, reduced) != 0) {
+            return false;
+        }
+        big_copy(reduced, small_num, 4);
+        small_den /= small_gcd;
+    }
+
+    ulong denominator_gcd =
+        gcd_u64(big_remainder_u64(input_den, BIG_LIMBS, small_den), small_den);
+    uint denominator_base[BIG_LIMBS];
+    if (
+        big_div_u64(
+            input_den,
+            BIG_LIMBS,
+            denominator_gcd,
+            denominator_base
+        ) != 0
+    ) {
+        return false;
+    }
+    ulong left_scale = small_den / denominator_gcd;
+    uint left_scale_limbs[2];
+    u64_limbs(left_scale, left_scale_limbs);
+    uint numerator[WIDE_LIMBS];
+    big_multiply(
+        input_num,
+        BIG_LIMBS,
+        left_scale_limbs,
+        2,
+        numerator,
+        WIDE_LIMBS
+    );
+    uint right[WIDE_LIMBS];
+    big_multiply(
+        denominator_base,
+        BIG_LIMBS,
+        small_num,
+        4,
+        right,
+        WIDE_LIMBS
+    );
+    if (!big_add(numerator, right, WIDE_LIMBS)) {
+        return false;
+    }
+
+    ulong result_gcd =
+        gcd_u64(big_remainder_u64(numerator, WIDE_LIMBS, denominator_gcd), denominator_gcd);
+    uint reduced_num[WIDE_LIMBS];
+    if (big_div_u64(numerator, WIDE_LIMBS, result_gcd, reduced_num) != 0) {
+        return false;
+    }
+    ulong right_scale = small_den / result_gcd;
+    uint right_scale_limbs[2];
+    u64_limbs(right_scale, right_scale_limbs);
+    uint reduced_den[WIDE_LIMBS];
+    big_multiply(
+        denominator_base,
+        BIG_LIMBS,
+        right_scale_limbs,
+        2,
+        reduced_den,
+        WIDE_LIMBS
+    );
+    for (uint limb = BIG_LIMBS; limb < WIDE_LIMBS; ++limb) {
+        if (reduced_num[limb] != 0 || reduced_den[limb] != 0) {
+            return false;
+        }
+    }
+    if (big_is_zero(reduced_den, BIG_LIMBS)) {
+        return false;
+    }
+    big_copy(reduced_num, output_num, BIG_LIMBS);
+    big_copy(reduced_den, output_den, BIG_LIMBS);
+    return true;
+}
+
+inline bool serialization_ns(
+    ulong bytes,
+    ulong rate,
+    thread ulong &result
+) {
+    if (rate == 0) {
+        return false;
+    }
+    ulong scale = 8000000000ul;
+    ulong high = mulhi(bytes, scale);
+    ulong low = bytes * scale;
+    ulong quotient = 0;
+    ulong remainder = 0;
+    if (high == 0) {
+        quotient = low / rate;
+        remainder = low % rate;
+    } else {
+        if (high >= rate) {
+            return false;
+        }
+        remainder = high;
+        for (int bit = 63; bit >= 0; --bit) {
+            bool carry = (remainder >> 63) != 0;
+            ulong shifted = (remainder << 1) | ((low >> uint(bit)) & 1ul);
+            if (carry || shifted >= rate) {
+                shifted -= rate;
+                quotient |= 1ul << uint(bit);
+            }
+            remainder = shifted;
+        }
+    }
+    if (remainder != 0) {
+        if (quotient == NONE) {
+            return false;
+        }
+        quotient += 1;
+    }
+    result = quotient;
+    return true;
+}
+
+inline bool scheduler_active_weight_sum(
+    ulong node_base,
+    const device ulong *scheduler_state,
+    thread ulong &weight_sum
+) {
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    weight_sum = 0;
+    for (ulong class_index = 0; class_index < class_count; ++class_index) {
+        ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+        if (scheduler_state[class_base + SC_ACTIVE] == 0) {
+            continue;
+        }
+        ulong weight = scheduler_state[class_base + SC_VALUE];
+        if (weight_sum > NONE - weight) {
+            return false;
+        }
+        weight_sum += weight;
+    }
+    return true;
+}
+
+// P14 Lane B T4: a nonzero `paused_mask` hides the packets of paused PFC priorities, so DRR and WRR
+// select over exactly the scalar eligible-packet list. Zero leaves every packet eligible.
+// Scalar `FlowDescriptor::packet_priority` (P15): the flow's class word holds the data class in bits
+// 0..8 and the feedback class's difference in bits 8..16; a CNP, RoCE ACK or RoCE NACK takes the
+// feedback class. The word equals the data class when the two agree. One overload per address
+// space of the packet record.
+inline ulong pfc_class_of(ulong word, ulong kind_word) {
+    ulong kind = kind_word & PK_KIND_MASK;
+    if (kind == DCQCN_CNP_PACKET || kind == ROCE_ACK_PACKET || kind == ROCE_NACK_PACKET) {
+        word ^= word >> 8;
+    }
+    return word & 0xfful;
+}
+
+inline ulong pfc_packet_priority(
+    const device ulong *packet,
+    const device ulong *params,
+    const device ulong *scheduler_state
+) {
+    return pfc_class_of(
+        scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + packet[PK_FLOW]],
+        packet[PK_KIND]);
+}
+
+inline ulong pfc_packet_priority(
+    const thread ulong *packet,
+    const device ulong *params,
+    const device ulong *scheduler_state
+) {
+    return pfc_class_of(
+        scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + packet[PK_FLOW]],
+        packet[PK_KIND]);
+}
+
+// A flow's data class (the class a queue pair's pacer pauses on).
+inline ulong pfc_flow_data_class(
+    ulong flow,
+    const device ulong *params,
+    const device ulong *scheduler_state
+) {
+    return scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + flow] & 0xfful;
+}
+
+// P16 H4 (ruling G9): the first word of class `priority`'s parked bitset in a host PFC row whose
+// queue-pair list `[Q, flow_0 .. flow_{Q-1}]` starts at `list`. The eight classes' bitsets follow
+// the list, class-major, `ceil(Q / 64)` words each (`executor/src/device_pfc.rs`).
+inline ulong pfc_parked_bitset(ulong list, ulong pairs, ulong priority) {
+    return list + 1 + pairs + priority * ((pairs + 63) / 64);
+}
+
+// P16 H4: sets the parked bit of a queue pair a paused tick parked, in its data class's bitset at
+// its host's PFC row `pfc_row`. The pair's slot in the row's list is bits 16.. of its class word.
+inline void pfc_mark_parked(
+    ulong pfc_row,
+    ulong flow,
+    const device ulong *params,
+    device ulong *scheduler_state
+) {
+    ulong word = scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + flow];
+    ulong slot = word >> 16;
+    ulong list = scheduler_state[pfc_row + 4];
+    ulong bitset = pfc_parked_bitset(list, scheduler_state[list], word & 0xfful);
+    scheduler_state[bitset + slot / 64] |= 1ul << (slot % 64);
+}
+
+inline bool scheduler_first_packet_for_class(
+    ulong node,
+    ulong class_count,
+    ulong class_index,
+    const device ulong *queue_meta,
+    const device ulong *queue_records,
+    const device ulong *params,
+    const device ulong *scheduler_state,
+    ulong paused_mask,
+    thread ulong &position,
+    thread ulong &size
+) {
+    ulong meta_base = node * QUEUE_META_WORDS;
+    ulong offset = queue_meta[meta_base];
+    ulong capacity = queue_meta[meta_base + 1];
+    ulong head = queue_meta[meta_base + 2];
+    ulong count = queue_meta[meta_base + 3];
+    for (ulong logical = 0; logical < count; ++logical) {
+        ulong physical = (head + logical) % max(capacity, 1ul);
+        ulong record_base = (offset + physical) * EVENT_WORDS;
+        if (DAYS_MECHANISMS && paused_mask != 0 &&
+            ((paused_mask >> pfc_packet_priority(
+                queue_records + record_base, params, scheduler_state)) & 1ul) != 0) {
+            continue;
+        }
+        if (queue_records[record_base + PK_FLOW] % class_count == class_index) {
+            position = logical;
+            size = queue_records[record_base + PK_SIZE];
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool drr_select_position(
+    ulong node,
+    device ulong *error,
+    const device ulong *queue_meta,
+    const device ulong *queue_records,
+    device ulong *scheduler_state,
+    const device ulong *params,
+    ulong paused_mask,
+    thread ulong &position
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    ulong current = scheduler_state[node_base + S_LAST_UPDATED];
+    if (class_count == 0 || current >= class_count) {
+        set_semantic_error(error, 33, node);
+        return false;
+    }
+
+    // First finish the scalar cursor's current, possibly partial, scan. No deficit is added
+    // until that scan wraps from the last class back to class zero.
+    for (ulong class_index = current; class_index < class_count; ++class_index) {
+        ulong size = 0;
+        ulong candidate = 0;
+        ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+        ulong deficit = scheduler_state[class_base + SC_ACTIVE];
+        if (
+            scheduler_first_packet_for_class(
+                node,
+                class_count,
+                class_index,
+                queue_meta,
+                queue_records,
+                params,
+                scheduler_state,
+                paused_mask,
+                candidate,
+                size
+            ) &&
+            deficit > 0 &&
+            size <= deficit
+        ) {
+            scheduler_state[class_base + SC_ACTIVE] = deficit - size;
+            scheduler_state[node_base + S_LAST_UPDATED] = class_index;
+            position = candidate;
+            return true;
+        }
+    }
+
+    // After the first wrap, every nonempty class gains its quantum once per complete scan.
+    // Compute the first selectable round directly; this is exact even when it is u64::MAX.
+    ulong selected_class = NONE;
+    ulong selected_position = 0;
+    ulong selected_size = 0;
+    ulong minimum_rounds = NONE;
+    for (ulong class_index = 0; class_index < class_count; ++class_index) {
+        ulong candidate = 0;
+        ulong size = 0;
+        if (!scheduler_first_packet_for_class(
+            node,
+            class_count,
+            class_index,
+            queue_meta,
+            queue_records,
+            params,
+            scheduler_state,
+            paused_mask,
+            candidate,
+            size
+        )) {
+            continue;
+        }
+        ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+        ulong quantum = scheduler_state[class_base + SC_VALUE];
+        ulong deficit = scheduler_state[class_base + SC_ACTIVE];
+        if (quantum == 0) {
+            set_semantic_error(error, 33, node);
+            return false;
+        }
+        ulong rounds = 1;
+        if (size > deficit) {
+            ulong needed = size - deficit;
+            rounds = needed / quantum;
+            if (needed % quantum != 0) {
+                rounds += 1;
+            }
+        }
+        if (selected_class == NONE || rounds < minimum_rounds) {
+            selected_class = class_index;
+            selected_position = candidate;
+            selected_size = size;
+            minimum_rounds = rounds;
+        }
+    }
+    if (selected_class == NONE) {
+        set_semantic_error(error, 33, node);
+        return false;
+    }
+
+    for (ulong class_index = 0; class_index < class_count; ++class_index) {
+        ulong ignored_position = 0;
+        ulong ignored_size = 0;
+        ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+        if (!scheduler_first_packet_for_class(
+            node,
+            class_count,
+            class_index,
+            queue_meta,
+            queue_records,
+            params,
+            scheduler_state,
+            paused_mask,
+            ignored_position,
+            ignored_size
+        )) {
+            scheduler_state[class_base + SC_ACTIVE] = 0;
+            continue;
+        }
+        ulong quantum = scheduler_state[class_base + SC_VALUE];
+        ulong deficit = scheduler_state[class_base + SC_ACTIVE];
+        if (quantum == 0 || minimum_rounds > (NONE - deficit) / quantum) {
+            set_semantic_error(error, 33, node);
+            return false;
+        }
+        scheduler_state[class_base + SC_ACTIVE] = deficit + minimum_rounds * quantum;
+    }
+    ulong selected_base = class_offset + selected_class * SCHEDULER_CLASS_WORDS;
+    ulong selected_deficit = scheduler_state[selected_base + SC_ACTIVE];
+    if (selected_size > selected_deficit) {
+        set_semantic_error(error, 33, node);
+        return false;
+    }
+    scheduler_state[selected_base + SC_ACTIVE] = selected_deficit - selected_size;
+    scheduler_state[node_base + S_LAST_UPDATED] = selected_class;
+    position = selected_position;
+    return true;
+}
+
+inline bool wrr_select_position(
+    ulong node,
+    device ulong *error,
+    const device ulong *queue_meta,
+    const device ulong *queue_records,
+    device ulong *scheduler_state,
+    const device ulong *params,
+    ulong paused_mask,
+    thread ulong &position
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    ulong current = scheduler_state[node_base + S_LAST_UPDATED];
+    if (class_count == 0 || current >= class_count) {
+        set_semantic_error(error, 34, node);
+        return false;
+    }
+    // One scan may reset exhausted nonempty classes; a second scan must then select one.
+    for (uint pass = 0; pass < 2; ++pass) {
+        for (ulong scanned = 0; scanned < class_count; ++scanned) {
+            ulong class_base = class_offset + current * SCHEDULER_CLASS_WORDS;
+            ulong weight = scheduler_state[class_base + SC_VALUE];
+            ulong sent = scheduler_state[class_base + SC_ACTIVE];
+            if (weight == 0 || sent > weight) {
+                set_semantic_error(error, 34, node);
+                return false;
+            }
+            ulong candidate = 0;
+            ulong ignored_size = 0;
+            if (
+                sent < weight &&
+                scheduler_first_packet_for_class(
+                    node,
+                    class_count,
+                    current,
+                    queue_meta,
+                    queue_records,
+                    params,
+                    scheduler_state,
+                    paused_mask,
+                    candidate,
+                    ignored_size
+                )
+            ) {
+                scheduler_state[class_base + SC_ACTIVE] = sent + 1;
+                scheduler_state[node_base + S_LAST_UPDATED] = current;
+                position = candidate;
+                return true;
+            }
+            scheduler_state[class_base + SC_ACTIVE] = 0;
+            current = (current + 1) % class_count;
+            scheduler_state[node_base + S_LAST_UPDATED] = current;
+        }
+    }
+    set_semantic_error(error, 34, node);
+    return false;
+}
+
+// `splitmix::mix`: SplitMix64's output function (the ECN ramp's draw, `ecn_ramp.rs`).
+inline ulong splitmix64(ulong value) {
+    value += 0x9e3779b97f4a7c15ul;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ul;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebul;
+    return value ^ (value >> 31);
+}
+
+inline bool switch_admission_action(
+    ulong node,
+    const thread ulong *packet,
+    ulong taildrop_capacity,
+    device ulong *error,
+    const device ulong *queue_meta,
+    const device ulong *scheduler_state,
+    thread ulong &action
+) {
+    ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+    ulong policy = scheduler_state[scheduler_base + S_AQM_KIND];
+    ulong meta_base = node * QUEUE_META_WORDS;
+    ulong waiting = queue_meta[meta_base + 3];
+    ulong queued_bytes = queue_meta[meta_base + 4];
+    if (queued_bytes > NONE - packet[PK_SIZE]) {
+        action = 2;
+        return true;
+    }
+    if (policy == AQM_TAILDROP) {
+        action = taildrop_capacity != 0 && waiting >= taildrop_capacity ? 2 : 0;
+        return true;
+    }
+    // P16 ecnramp (ruling 1a): the ECN ramp, step included, is a mechanism, guarded like every
+    // other one. The plain build admits by TailDrop alone (the host selects the mechanisms build
+    // for any ECN queue, `MECHANISM_ECN`); any other policy word is malformed.
+    if (DAYS_MECHANISMS && policy == AQM_ECN) {
+        // `ecn_ramp_decision`: tail drop past the byte capacity; no draw for a packet that is not
+        // ECN-capable data; no mark below kmin; a mark at or above kmax; in between a mark iff
+        // mulhi(u, span) < pmax_num * (d - kmin), u = mix(queue_key ^ payload).
+        ulong post_bytes = queued_bytes + packet[PK_SIZE];
+        ulong capacity = scheduler_state[scheduler_base + S_AQM_CAPACITY];
+        ulong kmin = scheduler_state[scheduler_base + S_AQM_KMIN];
+        ulong record = scheduler_state[scheduler_base + S_AQM_RECORD];
+        if (post_bytes > capacity) {
+            action = 2;
+            return true;
+        }
+        ulong kind = packet[PK_KIND] & PK_KIND_MASK;
+        if ((kind != DATA_PACKET && kind != TCP_DATA_PACKET && kind != ROCE_DATA_PACKET) ||
+            post_bytes < kmin) {
+            action = 0;
+            return true;
+        }
+        ulong kmax = scheduler_state[record + AQM_RECORD_KMAX];
+        if (post_bytes >= kmax) {
+            action = 1;
+            return true;
+        }
+        ulong draw = splitmix64(scheduler_state[record + AQM_RECORD_QUEUE_KEY] ^ packet[PK_ID]);
+        ulong bound = scheduler_state[record + AQM_RECORD_PMAX_NUMERATOR] * (post_bytes - kmin);
+        action = mulhi(draw, scheduler_state[record + AQM_RECORD_SPAN]) < bound ? 1 : 0;
+        return true;
+    }
+    set_semantic_error(error, 58, node);
+    return false;
+}
+
+inline void local_rational_zero(thread uint *numerator, thread uint *denominator) {
+    big_clear(numerator, BIG_LIMBS);
+    big_clear(denominator, BIG_LIMBS);
+    denominator[0] = 1;
+}
+
+inline bool wfq_advanced_virtual_time(
+    ulong node,
+    ulong time,
+    ulong rate,
+    device ulong *error,
+    device ulong *scheduler_state,
+    thread uint *numerator,
+    thread uint *denominator
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong last_updated = scheduler_state[node_base + S_LAST_UPDATED];
+    if (time < last_updated) {
+        set_semantic_error(error, 26, node);
+        return false;
+    }
+    rational_load(
+        scheduler_state,
+        node_base + S_VIRTUAL_TIME,
+        numerator,
+        denominator
+    );
+    ulong elapsed = time - last_updated;
+    if (elapsed == 0) {
+        return true;
+    }
+    ulong weight_sum;
+    if (
+        !scheduler_active_weight_sum(node_base, scheduler_state, weight_sum) ||
+        weight_sum == 0 ||
+        weight_sum > NONE / 1000000000ul
+    ) {
+        set_wfq_arithmetic_error(error, node);
+        return false;
+    }
+    uint increment[4];
+    multiply_u64(elapsed, rate, increment);
+    uint result_num[BIG_LIMBS];
+    uint result_den[BIG_LIMBS];
+    if (
+        !rational_add_small(
+            numerator,
+            denominator,
+            increment,
+            weight_sum * 1000000000ul,
+            result_num,
+            result_den
+        )
+    ) {
+        set_wfq_arithmetic_error(error, node);
+        return false;
+    }
+    big_copy(result_num, numerator, BIG_LIMBS);
+    big_copy(result_den, denominator, BIG_LIMBS);
+    return true;
+}
+
+inline bool sp_queue_insert(
+    ulong node,
+    const thread ulong *record,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    const device ulong *scheduler_state
+) {
+    ulong meta_base = node * QUEUE_META_WORDS;
+    ulong offset = queue_meta[meta_base];
+    ulong capacity = queue_meta[meta_base + 1];
+    ulong head = queue_meta[meta_base + 2];
+    ulong count = queue_meta[meta_base + 3];
+    if (count >= capacity) {
+        set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
+        return false;
+    }
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    if (class_count == 0) {
+        set_semantic_error(error, 27, node);
+        return false;
+    }
+    ulong incoming_class = record[PK_FLOW] % class_count;
+    ulong incoming_priority =
+        scheduler_state[
+            class_offset + incoming_class * SCHEDULER_CLASS_WORDS + SC_VALUE
+        ];
+    ulong insertion = count;
+    for (ulong logical = 0; logical < count; ++logical) {
+        ulong physical = (head + logical) % max(capacity, 1ul);
+        ulong record_base = (offset + physical) * EVENT_WORDS;
+        ulong queued_class = queue_records[record_base + PK_FLOW] % class_count;
+        ulong queued_priority =
+            scheduler_state[
+                class_offset + queued_class * SCHEDULER_CLASS_WORDS + SC_VALUE
+            ];
+        if (queued_priority < incoming_priority) {
+            insertion = logical;
+            break;
+        }
+    }
+    for (ulong logical = count; logical > insertion; --logical) {
+        ulong source = offset + (head + logical - 1) % max(capacity, 1ul);
+        ulong target = offset + (head + logical) % max(capacity, 1ul);
+        copy_device_record(queue_records, source, queue_records, target);
+    }
+    copy_thread_to_device(
+        record,
+        queue_records,
+        offset + (head + insertion) % max(capacity, 1ul)
+    );
+    queue_meta[meta_base + 3] = count + 1;
+    RECORD_QUEUE_HIGH_WATER(params, queue_meta, node, count + 1);
+    return true;
+}
+
+inline bool wfq_queue_insert(
+    ulong node,
+    const thread ulong *record,
+    const thread uint *finish_num,
+    const thread uint *finish_den,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *scheduler_state
+) {
+    ulong meta_base = node * QUEUE_META_WORDS;
+    ulong offset = queue_meta[meta_base];
+    ulong capacity = queue_meta[meta_base + 1];
+    ulong head = queue_meta[meta_base + 2];
+    ulong count = queue_meta[meta_base + 3];
+    if (count >= capacity) {
+        set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
+        return false;
+    }
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong tag_offset = scheduler_state[node_base + S_QUEUE_TAG_OFFSET];
+    ulong insertion = count;
+    for (ulong logical = 0; logical < count; ++logical) {
+        ulong physical = (head + logical) % max(capacity, 1ul);
+        uint queued_num[BIG_LIMBS];
+        uint queued_den[BIG_LIMBS];
+        rational_load(
+            scheduler_state,
+            tag_offset + physical * RATIONAL_WORDS,
+            queued_num,
+            queued_den
+        );
+        int ordering;
+        if (!rational_compare(queued_num, queued_den, finish_num, finish_den, ordering)) {
+            set_wfq_arithmetic_error(error, node);
+            return false;
+        }
+        if (ordering > 0) {
+            insertion = logical;
+            break;
+        }
+    }
+    for (ulong logical = count; logical > insertion; --logical) {
+        ulong source_physical = (head + logical - 1) % max(capacity, 1ul);
+        ulong target_physical = (head + logical) % max(capacity, 1ul);
+        copy_device_record(
+            queue_records,
+            offset + source_physical,
+            queue_records,
+            offset + target_physical
+        );
+        rational_copy(
+            scheduler_state,
+            tag_offset + source_physical * RATIONAL_WORDS,
+            tag_offset + target_physical * RATIONAL_WORDS
+        );
+    }
+    ulong destination = (head + insertion) % max(capacity, 1ul);
+    copy_thread_to_device(record, queue_records, offset + destination);
+    rational_store(
+        finish_num,
+        finish_den,
+        scheduler_state,
+        tag_offset + destination * RATIONAL_WORDS
+    );
+    queue_meta[meta_base + 3] = count + 1;
+    RECORD_QUEUE_HIGH_WATER(params, queue_meta, node, count + 1);
+    return true;
+}
+
+inline bool wfq_enqueue(
+    ulong node,
+    const thread ulong *record,
+    ulong rate,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *scheduler_state
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    if (class_count == 0 || record[E_TIME] < scheduler_state[node_base + S_LAST_UPDATED]) {
+        set_semantic_error(error, 28, node);
+        return false;
+    }
+    ulong class_index = record[PK_FLOW] % class_count;
+    ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+    ulong weight = scheduler_state[class_base + SC_VALUE];
+    ulong active = scheduler_state[class_base + SC_ACTIVE];
+    if (weight == 0 || active == NONE) {
+        set_semantic_error(error, 29, node);
+        return false;
+    }
+
+    ulong active_weight_sum;
+    if (!scheduler_active_weight_sum(node_base, scheduler_state, active_weight_sum)) {
+        set_wfq_arithmetic_error(error, node);
+        return false;
+    }
+    bool idle = active_weight_sum == 0;
+    uint virtual_num[BIG_LIMBS];
+    uint virtual_den[BIG_LIMBS];
+    if (idle) {
+        local_rational_zero(virtual_num, virtual_den);
+    } else if (
+        !wfq_advanced_virtual_time(
+            node,
+            record[E_TIME],
+            rate,
+            error,
+            scheduler_state,
+            virtual_num,
+            virtual_den
+        )
+    ) {
+        return false;
+    }
+
+    uint start_num[BIG_LIMBS];
+    uint start_den[BIG_LIMBS];
+    if (idle) {
+        local_rational_zero(start_num, start_den);
+    } else {
+        uint class_num[BIG_LIMBS];
+        uint class_den[BIG_LIMBS];
+        rational_load(
+            scheduler_state,
+            class_base + SC_FINISH,
+            class_num,
+            class_den
+        );
+        int ordering;
+        if (!rational_compare(virtual_num, virtual_den, class_num, class_den, ordering)) {
+            set_wfq_arithmetic_error(error, node);
+            return false;
+        }
+        if (ordering >= 0) {
+            big_copy(virtual_num, start_num, BIG_LIMBS);
+            big_copy(virtual_den, start_den, BIG_LIMBS);
+        } else {
+            big_copy(class_num, start_num, BIG_LIMBS);
+            big_copy(class_den, start_den, BIG_LIMBS);
+        }
+    }
+
+    uint service[4];
+    multiply_u64(record[PK_SIZE], 8, service);
+    uint finish_num[BIG_LIMBS];
+    uint finish_den[BIG_LIMBS];
+    if (
+        !rational_add_small(
+            start_num,
+            start_den,
+            service,
+            weight,
+            finish_num,
+            finish_den
+        )
+    ) {
+        set_wfq_arithmetic_error(error, node);
+        return false;
+    }
+    if (
+        !wfq_queue_insert(
+            node,
+            record,
+            finish_num,
+            finish_den,
+            error,
+            params,
+            queue_meta,
+            queue_records,
+            scheduler_state
+        )
+    ) {
+        return false;
+    }
+
+    if (idle) {
+        rational_zero(scheduler_state, node_base + S_VIRTUAL_TIME);
+        for (ulong reset_class = 0; reset_class < class_count; ++reset_class) {
+            rational_zero(
+                scheduler_state,
+                class_offset + reset_class * SCHEDULER_CLASS_WORDS + SC_FINISH
+            );
+        }
+    } else {
+        rational_store(
+            virtual_num,
+            virtual_den,
+            scheduler_state,
+            node_base + S_VIRTUAL_TIME
+        );
+    }
+    rational_store(
+        finish_num,
+        finish_den,
+        scheduler_state,
+        class_base + SC_FINISH
+    );
+    scheduler_state[class_base + SC_ACTIVE] = active + 1;
+    scheduler_state[node_base + S_LAST_UPDATED] = record[E_TIME];
+    return true;
+}
+
+inline bool wfq_complete(
+    ulong node,
+    const thread ulong *record,
+    ulong rate,
+    device ulong *error,
+    device ulong *scheduler_state
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    if (class_count == 0) {
+        set_semantic_error(error, 30, node);
+        return false;
+    }
+    ulong class_index = record[PK_FLOW] % class_count;
+    ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+    ulong active = scheduler_state[class_base + SC_ACTIVE];
+    if (active == 0) {
+        set_semantic_error(error, 31, node);
+        return false;
+    }
+    uint virtual_num[BIG_LIMBS];
+    uint virtual_den[BIG_LIMBS];
+    if (
+        !wfq_advanced_virtual_time(
+            node,
+            record[E_TIME],
+            rate,
+            error,
+            scheduler_state,
+            virtual_num,
+            virtual_den
+        )
+    ) {
+        return false;
+    }
+
+    scheduler_state[class_base + SC_ACTIVE] = active - 1;
+    bool any_active = false;
+    for (ulong other = 0; other < class_count; ++other) {
+        ulong other_base = class_offset + other * SCHEDULER_CLASS_WORDS;
+        any_active = any_active || scheduler_state[other_base + SC_ACTIVE] != 0;
+    }
+    rational_zero(scheduler_state, node_base + S_IN_SERVICE_TAG);
+    if (any_active) {
+        rational_store(
+            virtual_num,
+            virtual_den,
+            scheduler_state,
+            node_base + S_VIRTUAL_TIME
+        );
+    } else {
+        rational_zero(scheduler_state, node_base + S_VIRTUAL_TIME);
+        rational_zero(scheduler_state, class_base + SC_FINISH);
+    }
+    scheduler_state[node_base + S_LAST_UPDATED] = record[E_TIME];
+    return true;
+}
+
+inline bool flow_route(
+    const thread ulong *packet,
+    const device ulong *flows,
+    thread ulong &offset,
+    thread ulong &length,
+    thread ulong &terminal
+) {
+    ulong flow_base = packet[PK_FLOW] * FLOW_WORDS;
+    ulong kind = packet[PK_KIND] & PK_KIND_MASK;
+    if (kind == DATA_PACKET || kind == TCP_DATA_PACKET) {
+        offset = flows[flow_base + 2];
+        length = flows[flow_base + 3];
+        terminal = flows[flow_base + 1];
+    } else {
+        offset = flows[flow_base + 4];
+        length = flows[flow_base + 5];
+        terminal = flows[flow_base];
+    }
+    return true;
+}
+
+inline bool packet_egress(
+    ulong node,
+    const thread ulong *packet,
+    const device ulong *flows,
+    const device ulong *routes,
+    const device ulong *links,
+    thread ulong &egress
+) {
+    ulong offset;
+    ulong length;
+    ulong terminal;
+    flow_route(packet, flows, offset, length, terminal);
+    for (ulong index = 0; index < length; ++index) {
+        ulong link = routes[offset + index];
+        if (links[link * LINK_WORDS] == node) {
+            egress = link;
+            return true;
+        }
+    }
+    if (terminal == node) {
+        egress = NONE;
+        return true;
+    }
+    return false;
+}
+
+inline bool packet_remote_target(
+    const thread ulong *packet,
+    ulong egress,
+    const device ulong *flows,
+    const device ulong *routes,
+    const device ulong *links,
+    thread ulong &target
+) {
+    ulong offset;
+    ulong length;
+    ulong terminal;
+    flow_route(packet, flows, offset, length, terminal);
+    for (ulong index = 0; index < length; ++index) {
+        if (routes[offset + index] == egress) {
+            if (index + 1 < length) {
+                ulong next = routes[offset + index + 1];
+                target = links[next * LINK_WORDS];
+            } else {
+                target = terminal;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// P15: the mechanisms build's copies, where RoCE data (kind 7) also rides the forward route. The
+// plain build keeps the originals above unchanged, as the CUDA kernel does.
+inline bool flow_route_mechanisms(
+    const thread ulong *packet,
+    const device ulong *flows,
+    thread ulong &offset,
+    thread ulong &length,
+    thread ulong &terminal
+) {
+    ulong flow_base = packet[PK_FLOW] * FLOW_WORDS;
+    ulong kind = packet[PK_KIND] & PK_KIND_MASK;
+    if (kind == DATA_PACKET || kind == TCP_DATA_PACKET || kind == ROCE_DATA_PACKET) {
+        offset = flows[flow_base + 2];
+        length = flows[flow_base + 3];
+        terminal = flows[flow_base + 1];
+    } else {
+        offset = flows[flow_base + 4];
+        length = flows[flow_base + 5];
+        terminal = flows[flow_base];
+    }
+    return true;
+}
+
+inline bool packet_egress_mechanisms(
+    ulong node,
+    const thread ulong *packet,
+    const device ulong *flows,
+    const device ulong *routes,
+    const device ulong *links,
+    thread ulong &egress
+) {
+    ulong offset;
+    ulong length;
+    ulong terminal;
+    flow_route_mechanisms(packet, flows, offset, length, terminal);
+    for (ulong index = 0; index < length; ++index) {
+        ulong link = routes[offset + index];
+        if (links[link * LINK_WORDS] == node) {
+            egress = link;
+            return true;
+        }
+    }
+    if (terminal == node) {
+        egress = NONE;
+        return true;
+    }
+    return false;
+}
+
+inline bool packet_remote_target_mechanisms(
+    const thread ulong *packet,
+    ulong egress,
+    const device ulong *flows,
+    const device ulong *routes,
+    const device ulong *links,
+    thread ulong &target
+) {
+    ulong offset;
+    ulong length;
+    ulong terminal;
+    flow_route_mechanisms(packet, flows, offset, length, terminal);
+    for (ulong index = 0; index < length; ++index) {
+        if (routes[offset + index] == egress) {
+            if (index + 1 < length) {
+                ulong next = routes[offset + index + 1];
+                target = links[next * LINK_WORDS];
+            } else {
+                target = terminal;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+inline void packet_clear(thread ulong *packet) {
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        packet[word] = 0;
+    }
+}
+
+inline bool allocate_tcp_payload(
+    ulong node,
+    device ulong *node_state,
+    const device ulong *params,
+    thread ulong &payload
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong sequence = node_state[node_base + N_NEXT_PAYLOAD];
+    if (sequence == NONE || sequence > (NONE - node) / params[P_NODE_COUNT]) {
+        return false;
+    }
+    payload = sequence * params[P_NODE_COUNT] + node;
+    node_state[node_base + N_NEXT_PAYLOAD] = sequence + 1;
+    return true;
+}
+
+inline void tcp_record_copy(const thread ulong *packet, device ulong *target) {
+    target[0] = packet[PK_ID];
+    target[1] = packet[PK_SIZE];
+    target[2] = packet[PK_META_0];
+    target[3] = packet[PK_META_1];
+    target[4] = packet[PK_META_2];
+}
+
+// Absolute word index of logical ledger record `logical`. Logical order — the canonical order the
+// readback decodes and the frozen hashes cover — is unchanged by the ring; only the physical slot
+// moves. `head + logical <= 2 * capacity - 1` at every call site, so one conditional subtraction
+// is a complete modulo.
+inline ulong tcp_ledger_slot(
+    ulong offset,
+    ulong capacity,
+    ulong head,
+    ulong logical
+) {
+    ulong span = capacity == 0 ? 1 : capacity;
+    ulong physical = head + logical;
+    if (physical >= span) {
+        physical -= span;
+    }
+    return offset + physical * TCP_LEDGER_RECORD_WORDS;
+}
+
+// First logical index whose sequence is >= `sequence`, by binary search over the ring window.
+//
+// Equivalent to the pre-ring linear scan: the ledger is strictly ascending in sequence and
+// duplicate-free, because inserts replace on an exact sequence match and a partial cumulative ACK
+// re-keys the head record to an acknowledgement that stays below the next record's start.
+inline ulong tcp_ledger_lower_bound(
+    ulong offset,
+    ulong capacity,
+    ulong head,
+    ulong count,
+    ulong sequence,
+    const device ulong *tcp_state
+) {
+    ulong low = 0;
+    ulong high = count;
+    while (low < high) {
+        ulong mid = low + (high - low) / 2;
+        if (tcp_state[tcp_ledger_slot(offset, capacity, head, mid) + 2] < sequence) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+inline bool tcp_ledger_find(
+    ulong flow,
+    ulong sequence,
+    const device ulong *params,
+    const device ulong *tcp_state,
+    thread ulong &record
+) {
+    ulong meta = params[P_TCP_LEDGER_META_OFFSET] + flow * TCP_LEDGER_META_WORDS;
+    ulong offset = tcp_state[meta];
+    ulong capacity = tcp_state[meta + 1];
+    ulong count = tcp_state[meta + 2];
+    ulong head = tcp_state[meta + TCP_LEDGER_META_HEAD];
+    ulong index = tcp_ledger_lower_bound(offset, capacity, head, count, sequence, tcp_state);
+    if (index < count) {
+        ulong candidate = tcp_ledger_slot(offset, capacity, head, index);
+        if (tcp_state[candidate + 2] == sequence) {
+            record = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool tcp_ledger_insert(
+    ulong flow,
+    const thread ulong *packet,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *tcp_state
+) {
+    ulong meta = params[P_TCP_LEDGER_META_OFFSET] + flow * TCP_LEDGER_META_WORDS;
+    ulong offset = tcp_state[meta];
+    ulong capacity = tcp_state[meta + 1];
+    ulong count = tcp_state[meta + 2];
+    ulong head = tcp_state[meta + TCP_LEDGER_META_HEAD];
+    ulong sequence = packet[PK_META_0];
+    ulong insertion = tcp_ledger_lower_bound(offset, capacity, head, count, sequence, tcp_state);
+    if (insertion < count) {
+        ulong existing = tcp_ledger_slot(offset, capacity, head, insertion);
+        if (tcp_state[existing + 2] == sequence) {
+            if (tcp_state[existing + 1] != packet[PK_SIZE]) {
+                set_semantic_error(error, 40, NONE);
+                return false;
+            }
+            // Mutation site R1: in-place replace. Count, head and high-water are unchanged.
+            tcp_record_copy(packet, tcp_state + existing);
+            return true;
+        }
+    }
+    if (count >= capacity) {
+        set_capacity_error(error, ARENA_TCP_SEGMENT_LEDGER, flow, capacity, count + 1);
+        return false;
+    }
+    ulong target;
+    if (insertion == count) {
+        // Mutation site R2: monotone append, O(1). This is the frontier's hot path.
+        target = tcp_ledger_slot(offset, capacity, head, count);
+    } else if (insertion == 0) {
+        // Mutation site R3: prefix insert retreats the head, O(1).
+        ulong retreated = (head == 0 ? capacity : head) - 1;
+        tcp_state[meta + TCP_LEDGER_META_HEAD] = retreated;
+        target = offset + retreated * TCP_LEDGER_RECORD_WORDS;
+    } else {
+        // Mutation site R4: interior insert still shifts, but inside the ring window.
+        for (ulong index = count; index > insertion; --index) {
+            ulong destination = tcp_ledger_slot(offset, capacity, head, index);
+            ulong source = tcp_ledger_slot(offset, capacity, head, index - 1);
+            for (uint word = 0; word < TCP_LEDGER_RECORD_WORDS; ++word) {
+                tcp_state[destination + word] = tcp_state[source + word];
+            }
+        }
+        target = tcp_ledger_slot(offset, capacity, head, insertion);
+    }
+    tcp_record_copy(packet, tcp_state + target);
+    // Mutation site R5: the only site that raises `count`, hence the only site that can raise the
+    // high-water word. High-water is a max over a deterministic execution, so it is pure state.
+    ulong grown = count + 1;
+    tcp_state[meta + 2] = grown;
+    if (grown > tcp_state[meta + TCP_LEDGER_META_HIGH_WATER]) {
+        tcp_state[meta + TCP_LEDGER_META_HIGH_WATER] = grown;
+    }
+    return true;
+}
+
+inline bool tcp_ledger_acknowledge(
+    ulong flow,
+    ulong acknowledgment,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *tcp_state
+) {
+    ulong meta = params[P_TCP_LEDGER_META_OFFSET] + flow * TCP_LEDGER_META_WORDS;
+    ulong offset = tcp_state[meta];
+    ulong capacity = tcp_state[meta + 1];
+    ulong count = tcp_state[meta + 2];
+    ulong head = tcp_state[meta + TCP_LEDGER_META_HEAD];
+    ulong keep = 0;
+    while (keep < count) {
+        ulong record = tcp_ledger_slot(offset, capacity, head, keep);
+        ulong sequence = tcp_state[record + 2];
+        ulong size = tcp_state[record + 1];
+        if (sequence > NONE - size) {
+            set_semantic_error(error, 42, NONE);
+            return false;
+        }
+        if (sequence + size > acknowledgment) {
+            break;
+        }
+        keep += 1;
+    }
+    if (keep < count) {
+        ulong first = tcp_ledger_slot(offset, capacity, head, keep);
+        ulong sequence = tcp_state[first + 2];
+        if (sequence < acknowledgment) {
+            ulong acknowledged = acknowledgment - sequence;
+            if (acknowledged < tcp_state[first + 1]) {
+                // Mutation site R6: partial cumulative ACK re-keys the head record in place.
+                tcp_state[first + 1] -= acknowledged;
+                tcp_state[first + 2] = acknowledgment;
+            } else {
+                keep += 1;
+            }
+        }
+    }
+    // Mutation site R7: prefix removal advances the head. The O(n) compaction this replaces was
+    // the whole reason the ring conversion was folded into T20i.
+    ulong span = capacity == 0 ? 1 : capacity;
+    ulong advanced = head + keep;
+    if (advanced >= span) {
+        advanced -= span;
+    }
+    tcp_state[meta + TCP_LEDGER_META_HEAD] = advanced;
+    tcp_state[meta + 2] = count - keep;
+    return true;
+}
+
+inline bool tcp_receive_range(
+    ulong flow,
+    ulong start,
+    ulong end,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *tcp_state
+) {
+    ulong row = params[P_TCP_RECEIVER_OFFSET] + flow * TCP_RECEIVER_WORDS;
+    ulong next = tcp_state[row + 3];
+    if (end <= start || end <= next) {
+        return true;
+    }
+    ulong offset = tcp_state[row + 4];
+    ulong capacity = tcp_state[row + 5];
+    ulong count = tcp_state[row + 6];
+    if (count >= capacity) {
+        set_capacity_error(error, ARENA_TCP_RECEIVER, flow, capacity, count + 1);
+        return false;
+    }
+    ulong insertion = count;
+    while (insertion != 0) {
+        ulong previous = insertion - 1;
+        ulong previous_start = tcp_state[offset + previous * 2];
+        ulong previous_end = tcp_state[offset + previous * 2 + 1];
+        if (previous_start < start || (previous_start == start && previous_end <= end)) {
+            break;
+        }
+        tcp_state[offset + insertion * 2] = previous_start;
+        tcp_state[offset + insertion * 2 + 1] = previous_end;
+        insertion = previous;
+    }
+    tcp_state[offset + insertion * 2] = start;
+    tcp_state[offset + insertion * 2 + 1] = end;
+    count += 1;
+
+    ulong merged = 0;
+    for (ulong index = 0; index < count; ++index) {
+        ulong range_start = tcp_state[offset + index * 2];
+        ulong range_end = tcp_state[offset + index * 2 + 1];
+        if (merged != 0 && range_start <= tcp_state[offset + (merged - 1) * 2 + 1]) {
+            tcp_state[offset + (merged - 1) * 2 + 1] =
+                max(tcp_state[offset + (merged - 1) * 2 + 1], range_end);
+        } else {
+            tcp_state[offset + merged * 2] = range_start;
+            tcp_state[offset + merged * 2 + 1] = range_end;
+            merged += 1;
+        }
+    }
+    ulong kept = 0;
+    for (ulong index = 0; index < merged; ++index) {
+        ulong range_start = tcp_state[offset + index * 2];
+        ulong range_end = tcp_state[offset + index * 2 + 1];
+        if (range_start <= next) {
+            next = max(next, range_end);
+        } else {
+            tcp_state[offset + kept * 2] = range_start;
+            tcp_state[offset + kept * 2 + 1] = range_end;
+            kept += 1;
+        }
+    }
+    tcp_state[row + 3] = next;
+    tcp_state[row + 6] = kept;
+    return true;
+}
+
+inline bool tcp_enqueue_attempt(
+    ulong node,
+    ulong flow,
+    ulong sequence,
+    ulong size_bytes,
+    ulong now_ns,
+    bool retransmission,
+    const thread ulong *parent,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *tcp_state
+) {
+    ulong payload;
+    if (!allocate_tcp_payload(node, node_state, params, payload)) {
+        set_semantic_error(error, 44, node);
+        return false;
+    }
+    ulong packet[EVENT_WORDS];
+    packet_clear(packet);
+    packet[E_TIME] = parent[E_TIME];
+    packet[E_PHASE] = 1;
+    packet[PK_ID] = payload;
+    packet[PK_FLOW] = flow;
+    packet[PK_SIZE] = size_bytes;
+    packet[PK_KIND] = TCP_DATA_PACKET;
+    packet[PK_META_0] = sequence;
+    packet[PK_META_1] = now_ns;
+    packet[PK_META_2] = ulong(retransmission);
+    if (
+        !tcp_ledger_insert(flow, packet, error, params, tcp_state) ||
+        !source_queue_insert(node, packet, error, params, queue_meta, queue_records) ||
+        !record_sourced(node, packet, error, params, summary, observation_meta, observed)
+    ) {
+        return false;
+    }
+    ulong generator = flow * GENERATOR_WORDS;
+    generators[generator + G_TCP_LAST_ATTEMPT] = payload;
+    if (!retransmission) {
+        if (
+            generators[generator + G_PACKETS] == NONE ||
+            generators[generator + G_BYTES] > NONE - size_bytes
+        ) {
+            set_semantic_error(error, 45, node);
+            return false;
+        }
+        generators[generator + G_PACKETS] += 1;
+        generators[generator + G_BYTES] += size_bytes;
+    }
+    ulong node_base = node * NODE_WORDS;
+    if (node_state[node_base + N_COUNTER_0] == NONE) {
+        set_semantic_error(error, 46, node);
+        return false;
+    }
+    node_state[node_base + N_COUNTER_0] += 1;
+    return true;
+}
+
+inline bool prepare_tcp_attempts(
+    ulong node,
+    ulong flow,
+    const thread ulong *parent,
+    bool retransmit,
+    ulong retransmit_sequence,
+    bool fill_window,
+    bool preserve_scheduled_send,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *tcp_state
+) {
+    ulong generator = flow * GENERATOR_WORDS;
+    if (retransmit && retransmit_sequence < generators[generator + G_TCP_TOTAL]) {
+        ulong record;
+        if (!tcp_ledger_find(flow, retransmit_sequence, params, tcp_state, record)) {
+            set_semantic_error(error, 47, node);
+            return false;
+        }
+        ulong size = tcp_state[record + 1];
+        if (!tcp_enqueue_attempt(
+            node,
+            flow,
+            retransmit_sequence,
+            size,
+            parent[E_TIME],
+            true,
+            parent,
+            error,
+            params,
+            node_state,
+            generators,
+            queue_meta,
+            queue_records,
+            summary,
+            observation_meta,
+            observed,
+            tcp_state
+        )) {
+            return false;
+        }
+    }
+
+    if (fill_window) {
+        while (true) {
+            ulong control[12];
+            for (uint word = 0; word < 12; ++word) {
+                control[word] = generators[generator + G_CONTROL + word];
+            }
+            ulong cwnd = controller_cwnd_bytes(control);
+            ulong flight = generators[generator + G_TCP_FLIGHT];
+            ulong allowance = cwnd > flight ? cwnd - flight : 0;
+            ulong sequence = generators[generator + G_TCP_NEXT];
+            ulong total = generators[generator + G_TCP_TOTAL];
+            if (allowance == 0 || sequence >= total) {
+                break;
+            }
+            ulong size = min(min(generators[generator + G_TCP_MSS], total - sequence), allowance);
+            if (size == 0 || sequence > NONE - size || flight > NONE - size) {
+                set_semantic_error(error, 48, node);
+                return false;
+            }
+            generators[generator + G_TCP_NEXT] = sequence + size;
+            generators[generator + G_TCP_FLIGHT] = flight + size;
+            if (!tcp_enqueue_attempt(
+                node,
+                flow,
+                sequence,
+                size,
+                parent[E_TIME],
+                false,
+                parent,
+                error,
+                params,
+                node_state,
+                generators,
+                queue_meta,
+                queue_records,
+                summary,
+                observation_meta,
+                observed,
+                tcp_state
+            )) {
+                return false;
+            }
+        }
+    }
+
+    generators[generator + G_OUTSTANDING] = generators[generator + G_TCP_FLIGHT];
+    generators[generator + G_UNACKNOWLEDGED] = generators[generator + G_TCP_FLIGHT];
+    if (!preserve_scheduled_send) {
+        generators[generator + G_STATUS] =
+            generators[generator + G_TCP_HIGHEST_ACK] >= generators[generator + G_TCP_TOTAL]
+                ? 2
+                : 1;
+    }
+
+    bool install_timer =
+        !preserve_scheduled_send &&
+        generators[generator + G_TCP_TIMER_ACTIVE] == 0 &&
+        generators[generator + G_TCP_FLIGHT] != 0;
+    if (install_timer) {
+        if (generators[generator + G_TCP_TIMER_GENERATION] == NONE) {
+            set_semantic_error(error, 49, node);
+            return false;
+        }
+        ulong deadline;
+        if (!checked_add(parent[E_TIME], generators[generator + G_TCP_RTO], deadline)) {
+            set_semantic_error(error, 50, node);
+            return false;
+        }
+        generators[generator + G_TCP_TIMER_GENERATION] += 1;
+        generators[generator + G_TCP_TIMER_ACTIVE] = 1;
+        generators[generator + G_TCP_TIMER_ATTEMPT] =
+            generators[generator + G_TCP_LAST_ATTEMPT];
+        generators[generator + G_TCP_TIMER_SEQUENCE] =
+            generators[generator + G_TCP_HIGHEST_ACK];
+        generators[generator + G_TCP_TIMER_DEADLINE] = deadline;
+        generators[generator + G_TCP_TIMER_STORED_GENERATION] =
+            generators[generator + G_TCP_TIMER_GENERATION];
+        generators[generator + G_TCP_TIMER_RTO] = generators[generator + G_TCP_RTO];
+        ulong timer_packet[EVENT_WORDS];
+        packet_clear(timer_packet);
+        timer_packet[PK_ID] = generators[generator + G_TCP_LAST_ATTEMPT];
+        timer_packet[PK_FLOW] = flow;
+        timer_packet[PK_KIND] = TCP_DATA_PACKET;
+        if (!emit_child(
+            node,
+            parent,
+            node,
+            RETRANSMISSION_TIMEOUT,
+            deadline,
+            timer_packet,
+            error,
+            params,
+            node_state,
+            fel_meta,
+            fel_records,
+            remote_meta,
+            remote_staging,
+            stream_state,
+            stream_records,
+            tcp_state
+        )) {
+            return false;
+        }
+    }
+
+    ulong node_base = node * NODE_WORDS;
+    if (
+        queue_meta[node * QUEUE_META_WORDS + 3] != 0 &&
+        node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0
+    ) {
+        ulong ready[EVENT_WORDS];
+        if (!queue_front(node, queue_meta, queue_records, ready)) {
+            set_semantic_error(error, 51, node);
+            return false;
+        }
+        node_state[node_base + N_READY_PENDING] = 1;
+        return emit_child(
+            node,
+            parent,
+            node,
+            TX_READY,
+            parent[E_TIME],
+            ready,
+            error,
+            params,
+            node_state,
+            fel_meta,
+            fel_records,
+            remote_meta,
+            remote_staging,
+            stream_state,
+            stream_records,
+            tcp_state
+        );
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// DCQCN: the Mellanox-form reaction point (P16) and the notification point. Transliterated from
+// `executor/src/dcqcn.rs` (`DcqcnController`) and the scalar drivers `host_dcqcn_{data,cnp}_arrival`
+// and `host_dcqcn_pacing_timer`, word for word with `cuda_kernels.cu`. The controller has no timer
+// event: `dcqcn_materialize` applies the due rate-increase and rate-decrease instants before an
+// exclusive bound, alpha ticks are applied where alpha is read, and an instant at NONE never fires.
+// Alpha is Q63; every step is u64 arithmetic with one 64x64 high product (`mulhi`).
+// ---------------------------------------------------------------------------------------------
+
+// floor(a * b / 2^63) for a, b <= 2^63.
+inline ulong dcqcn_mul_shr63(ulong a, ulong b) {
+    return (mulhi(a, b) << 1) | ((a * b) >> 63);
+}
+
+inline ulong dcqcn_increase_due(const device ulong *row) {
+    return (row[G_DCQCN_STATE] & DCQCN_INCREASE_ARMED_BIT) != 0 ? row[G_DCQCN_NEXT_INCREASE] : NONE;
+}
+
+inline ulong dcqcn_decrease_due(const device ulong *row) {
+    return (row[G_DCQCN_STATE] & DCQCN_DECREASE_PENDING_BIT) != 0 ? row[G_DCQCN_NEXT_DECREASE] : NONE;
+}
+
+// `DcqcnController::due_ns`.
+inline ulong dcqcn_due(const device ulong *row) {
+    return min(dcqcn_increase_due(row), dcqcn_decrease_due(row));
+}
+
+// `alpha_through`: every alpha tick with time <= `time`.
+inline void dcqcn_alpha_through(device ulong *row, ulong time) {
+    ulong next = row[G_DCQCN_NEXT_ALPHA];
+    if (next > time || next == NONE) {
+        return;
+    }
+    ulong interval = row[G_DCQCN_ALPHA_INTERVAL];
+    ulong ticks = (time - next) / interval + 1;
+    ulong g = row[G_DCQCN_G];
+    ulong retained = DCQCN_ALPHA_ONE - g;
+    ulong state = row[G_DCQCN_STATE];
+    ulong alpha = dcqcn_mul_shr63(retained, row[G_DCQCN_ALPHA]);
+    if ((state & DCQCN_ALPHA_PENDING_BIT) != 0) {
+        alpha += g;
+    }
+    row[G_DCQCN_STATE] = state & ~DCQCN_ALPHA_PENDING_BIT;
+    for (ulong remaining = ticks - 1; remaining != 0 && alpha != 0; --remaining) {
+        alpha = dcqcn_mul_shr63(retained, alpha);
+    }
+    row[G_DCQCN_ALPHA] = alpha;
+    // next + ticks * interval, saturating at NONE.
+    ulong span = ticks * interval;
+    row[G_DCQCN_NEXT_ALPHA] = mulhi(ticks, interval) != 0 || span > NONE - next ? NONE : next + span;
+}
+
+// `decrease_check` at an instant where a decrease is pending.
+inline void dcqcn_decrease_check(device ulong *row, ulong time) {
+    row[G_DCQCN_NEXT_DECREASE] = saturating_add_u64(time, row[G_DCQCN_DECREASE_INTERVAL]);
+    ulong state = row[G_DCQCN_STATE];
+    ulong current = row[G_DCQCN_CURRENT_RATE];
+    if ((row[G_DCQCN_STEPS_CLAMP] & DCQCN_CLAMP_BIT) != 0 || (state & DCQCN_STAGE_MASK) != 0) {
+        row[G_DCQCN_TARGET_RATE] = current;
+    }
+    ulong alpha = row[G_DCQCN_ALPHA];
+    // R - ceil(R * alpha / 2^64) = floor(R * (1 - alpha / 2)).
+    ulong reduction = mulhi(current, alpha) + ((current * alpha) != 0 ? 1ul : 0ul);
+    row[G_DCQCN_CURRENT_RATE] = max(current - reduction, row[G_DCQCN_MIN_RATE]);
+    row[G_DCQCN_STATE] = (state & ~(DCQCN_STAGE_MASK | DCQCN_DECREASE_PENDING_BIT)) |
+        DCQCN_INCREASE_ARMED_BIT;
+    row[G_DCQCN_NEXT_INCREASE] = saturating_add_u64(time, row[G_DCQCN_INCREASE_INTERVAL]);
+}
+
+// `increase_fire`.
+inline void dcqcn_increase_fire(device ulong *row, ulong time) {
+    row[G_DCQCN_NEXT_INCREASE] = saturating_add_u64(time, row[G_DCQCN_INCREASE_INTERVAL]);
+    ulong state = row[G_DCQCN_STATE];
+    ulong stage = state & DCQCN_STAGE_MASK;
+    ulong steps = row[G_DCQCN_STEPS_CLAMP] & DCQCN_STAGE_MASK;
+    if (stage >= steps) {
+        ulong step = stage == steps ? row[G_DCQCN_ADDITIVE_RATE] : row[G_DCQCN_HYPER_RATE];
+        row[G_DCQCN_TARGET_RATE] =
+            min(saturating_add_u64(row[G_DCQCN_TARGET_RATE], step), row[G_DCQCN_MAX_RATE]);
+    }
+    row[G_DCQCN_CURRENT_RATE] = (row[G_DCQCN_CURRENT_RATE] >> 1) + (row[G_DCQCN_TARGET_RATE] >> 1);
+    if (stage <= steps) {
+        row[G_DCQCN_STATE] = state + 1;
+    }
+}
+
+// `DcqcnController::materialize`: every rate-increase and rate-decrease instant before `bound`,
+// increase first at equal time, with the alpha ticks each cut reads.
+inline void dcqcn_materialize(device ulong *row, ulong bound) {
+    while (true) {
+        ulong increase = dcqcn_increase_due(row);
+        ulong decrease = dcqcn_decrease_due(row);
+        if (min(increase, decrease) >= bound) {
+            return;
+        }
+        if (increase <= decrease) {
+            dcqcn_increase_fire(row, increase);
+        } else {
+            dcqcn_alpha_through(row, decrease);
+            dcqcn_decrease_check(row, decrease);
+        }
+    }
+}
+
+// The first instant of the decrease grid at or after `time`.
+inline ulong dcqcn_first_decrease_at_or_after(const device ulong *row, ulong time) {
+    ulong anchor = row[G_DCQCN_NEXT_DECREASE];
+    if (anchor >= time || anchor == NONE) {
+        return anchor;
+    }
+    ulong interval = row[G_DCQCN_DECREASE_INTERVAL];
+    ulong span = time - anchor;
+    ulong steps = span / interval + (span % interval != 0 ? 1ul : 0ul);
+    ulong offset = steps * interval;
+    return mulhi(steps, interval) != 0 || offset > NONE - anchor ? NONE : anchor + offset;
+}
+
+// `DcqcnController::on_feedback`: a CNP, or an ACK or NACK carrying the ECN echo, at `now`.
+inline void dcqcn_on_feedback(device ulong *row, ulong now) {
+    ulong state = row[G_DCQCN_STATE];
+    if ((state & DCQCN_ARMED_BIT) == 0) {
+        row[G_DCQCN_ALPHA] = DCQCN_ALPHA_ONE;
+        row[G_DCQCN_STATE] = (state & ~DCQCN_ALPHA_PENDING_BIT) | DCQCN_ARMED_BIT |
+            DCQCN_DECREASE_PENDING_BIT;
+        row[G_DCQCN_NEXT_ALPHA] = saturating_add_u64(now, row[G_DCQCN_ALPHA_INTERVAL]);
+        row[G_DCQCN_NEXT_DECREASE] =
+            saturating_add_u64(saturating_add_u64(now, row[G_DCQCN_DECREASE_INTERVAL]), 1);
+        return;
+    }
+    dcqcn_materialize(row, now);
+    if (now != 0) {
+        dcqcn_alpha_through(row, now - 1);
+    }
+    state = row[G_DCQCN_STATE] | DCQCN_ALPHA_PENDING_BIT;
+    if ((state & DCQCN_DECREASE_PENDING_BIT) == 0) {
+        state |= DCQCN_DECREASE_PENDING_BIT;
+        row[G_DCQCN_NEXT_DECREASE] = dcqcn_first_decrease_at_or_after(row, now);
+    }
+    row[G_DCQCN_STATE] = state;
+}
+
+// `DcqcnController::settle`: the freeze at the transition that completes the flow.
+inline void dcqcn_settle(device ulong *row, ulong bound) {
+    if ((row[G_DCQCN_STATE] & DCQCN_ARMED_BIT) == 0) {
+        return;
+    }
+    dcqcn_materialize(row, bound);
+    if (bound != 0) {
+        dcqcn_alpha_through(row, bound - 1);
+    }
+    row[G_DCQCN_NEXT_DECREASE] = dcqcn_first_decrease_at_or_after(row, bound);
+}
+
+// A transition's due instants (`scalar::dcqcn_materialize`): one comparison when nothing is due.
+inline void dcqcn_materialize_if_due(device ulong *row, bool frozen, ulong bound) {
+    if (!frozen && dcqcn_due(row) < bound) {
+        dcqcn_materialize(row, bound);
+    }
+}
+
+// `host_dcqcn_pacing_timer`: the T25 rate tick paced at the controller's current rate. The
+// controller's due instants at or before the tick apply first (bound now + 1), and the tick that
+// finishes or stops the flow freezes the controller (P16 rulings D2 and D11).
+inline bool dcqcn_pacing_timer(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    ulong status = row[G_STATUS];
+    if ((status != 0 && status != 1) || row[G_PAYLOAD] != event[E_PAYLOAD] ||
+        row[G_DEPARTURE] != event[E_TIME]) {
+        return true;
+    }
+    ulong bound = saturating_add_u64(event[E_TIME], 1);
+    dcqcn_materialize_if_due(row, false, bound);
+    ulong scale_low;
+    ulong scale_high;
+    ulong tick_low;
+    ulong tick_high;
+    ulong cost_low;
+    ulong cost_high;
+    u128_from_mul_u64(row[G_RATE_DENOMINATOR], 1000000000ul, scale_low, scale_high);
+    u128_from_mul_u64(row[G_DCQCN_CURRENT_RATE], row[G_RATE_INTERVAL], tick_low, tick_high);
+    if (!u128_mul(event[PK_SIZE] << 3, event[PK_SIZE] >> 61, scale_low, scale_high,
+            cost_low, cost_high)) {
+        set_semantic_error(error, 62, node);
+        return false;
+    }
+    ulong credit_low;
+    ulong credit_high;
+    if (!u128_add(row[G_RATE_CREDIT_LOW], row[G_RATE_CREDIT_HIGH], tick_low, tick_high,
+            credit_low, credit_high)) {
+        set_semantic_error(error, 62, node);
+        return false;
+    }
+    bool emitted = u128_at_least(credit_low, credit_high, cost_low, cost_high);
+    if (emitted) {
+        u128_sub(credit_low, credit_high, cost_low, cost_high, credit_low, credit_high);
+        if (row[G_PACKETS] == NONE || row[G_BYTES] > NONE - event[PK_SIZE] ||
+            node_state[node_base + N_COUNTER_0] == NONE) {
+            set_semantic_error(error, 62, node);
+            return false;
+        }
+        row[G_PACKETS] += 1;
+        row[G_BYTES] += event[PK_SIZE];
+        node_state[node_base + N_COUNTER_0] += 1;
+    }
+    row[G_RATE_CREDIT_LOW] = credit_low;
+    row[G_RATE_CREDIT_HIGH] = credit_high;
+    row[G_RATE_NUMERATOR] = row[G_DCQCN_CURRENT_RATE];
+
+    bool finished = row[G_BYTES] >= row[G_RATE_TOTAL];
+    ulong candidate = 0;
+    if (!finished && !checked_add(event[E_TIME], row[G_RATE_INTERVAL], candidate)) {
+        set_semantic_error(error, 62, node);
+        return false;
+    }
+    if (!finished && candidate <= params[P_STOP_TIME]) {
+        ulong payload = event[PK_ID];
+        ulong size = event[PK_SIZE];
+        if (emitted) {
+            if (!allocate_tcp_payload(node, node_state, params, payload)) {
+                set_semantic_error(error, 62, node);
+                return false;
+            }
+            size = min(row[G_RATE_PACKET_SIZE], row[G_RATE_TOTAL] - row[G_BYTES]);
+        }
+        ulong next_tick_low;
+        ulong next_tick_high;
+        u128_from_mul_u64(
+            row[G_DCQCN_CURRENT_RATE], row[G_RATE_INTERVAL], next_tick_low, next_tick_high);
+        ulong next_cost_low;
+        ulong next_cost_high;
+        if (!u128_mul(size << 3, size >> 61, scale_low, scale_high,
+                next_cost_low, next_cost_high)) {
+            set_semantic_error(error, 62, node);
+            return false;
+        }
+        ulong next_credit_low;
+        ulong next_credit_high;
+        bool next_scheduled = u128_add(
+                credit_low, credit_high, next_tick_low, next_tick_high,
+                next_credit_low, next_credit_high) &&
+            u128_at_least(next_credit_low, next_credit_high, next_cost_low, next_cost_high);
+        row[G_STATUS] = next_scheduled ? 0 : 1;
+        row[G_DEPARTURE] = candidate;
+        row[G_PAYLOAD] = payload;
+        ulong next_packet[EVENT_WORDS];
+        packet_clear(next_packet);
+        next_packet[PK_ID] = payload;
+        next_packet[PK_FLOW] = flow;
+        next_packet[PK_SIZE] = size;
+        next_packet[PK_KIND] = DATA_PACKET;
+        if (!emit_child(
+                node, event, node, PACING_TIMER, candidate, next_packet, error, params,
+                node_state, fel_meta, fel_records, remote_meta, remote_staging,
+                stream_state, stream_records, tcp_state)) {
+            return false;
+        }
+    } else {
+        row[G_STATUS] = finished ? 2 : 3;
+        if (!finished) {
+            row[G_DEPARTURE] = candidate;
+        }
+        dcqcn_settle(row, bound);
+    }
+    if (!emitted) {
+        return true;
+    }
+    ulong sourced_packet[EVENT_WORDS];
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        sourced_packet[word] = event[word];
+    }
+    sourced_packet[E_PHASE] = 1;
+    if (!source_queue_insert(node, sourced_packet, error, params, queue_meta, queue_records) ||
+        !record_sourced(node, event, error, params, summary, observation_meta, observed)) {
+        return false;
+    }
+    if (node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0) {
+        node_state[node_base + N_READY_PENDING] = 1;
+        return emit_child(
+            node, event, node, TX_READY, event[E_TIME], event, error, params,
+            node_state, fel_meta, fel_records, remote_meta, remote_staging,
+            stream_state, stream_records, tcp_state);
+    }
+    return true;
+}
+
+// `host_dcqcn_cnp_arrival`: a feedback of the Mellanox-form controller, ignored once the flow has
+// finished or stopped (its controller is frozen, P16 ruling D11).
+inline bool dcqcn_cnp_arrival(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *generators,
+    const device ulong *flows,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *arrivals
+) {
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    if (flow >= params[P_FLOW_COUNT] || flows[flow * FLOW_WORDS] != node ||
+        row[G_VALID] == 0 || row[G_OWNER] != node || row[G_FEEDBACK] == NONE) {
+        set_semantic_error(error, 66, node);
+        return false;
+    }
+    row[G_FEEDBACK] += 1;
+    if (row[G_KIND] != GENERATOR_KIND_DCQCN) {
+        set_semantic_error(error, 67, node);
+        return false;
+    }
+    if (row[G_STATUS] == 0 || row[G_STATUS] == 1) {
+        dcqcn_on_feedback(row, event[E_TIME]);
+        row[G_RATE_NUMERATOR] = row[G_DCQCN_CURRENT_RATE];
+    }
+    return record_arrival(
+        node, event, 3, error, params, summary, observation_meta, observed, arrivals);
+}
+
+// `host_dcqcn_data_arrival`: delivery at the notification point, which sources one CNP for a CE
+// packet once the per-flow CNP interval has elapsed. The CNP is ordinary reverse-route feedback.
+inline bool dcqcn_data_arrival(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *arrivals,
+    device ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    device ulong *receiver = tcp_state + params[P_TCP_RECEIVER_OFFSET] +
+        event[PK_FLOW] * TCP_RECEIVER_WORDS;
+    if (node_state[node_base + N_COUNTER_2] == NONE) {
+        set_semantic_error(error, 68, node);
+        return false;
+    }
+    node_state[node_base + N_COUNTER_2] += 1;
+    ulong earliest;
+    bool interval_open = receiver[0] == DCQCN_RECEIVER_NO_CNP ||
+        (checked_add(receiver[DR_LAST_CNP], receiver[DR_CNP_INTERVAL], earliest) &&
+            event[E_TIME] >= earliest);
+    if ((event[PK_KIND] & PK_ECN_FLAG) == 0 || !interval_open) {
+        return record_arrival(
+            node, event, 2, error, params, summary, observation_meta, observed, arrivals);
+    }
+    ulong payload;
+    if (!allocate_tcp_payload(node, node_state, params, payload) ||
+        node_state[node_base + N_COUNTER_0] == NONE) {
+        set_semantic_error(error, 69, node);
+        return false;
+    }
+    node_state[node_base + N_COUNTER_0] += 1;
+    receiver[0] = DCQCN_RECEIVER_LAST_CNP;
+    receiver[DR_LAST_CNP] = event[E_TIME];
+    bool schedule_ready = node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0;
+    if (schedule_ready) {
+        node_state[node_base + N_READY_PENDING] = 1;
+    }
+    if (!record_arrival(
+            node, event, 2, error, params, summary, observation_meta, observed, arrivals)) {
+        return false;
+    }
+    ulong cnp[EVENT_WORDS];
+    packet_clear(cnp);
+    cnp[E_TIME] = event[E_TIME];
+    cnp[E_PHASE] = 1;
+    cnp[PK_ID] = payload;
+    cnp[PK_FLOW] = event[PK_FLOW];
+    cnp[PK_SIZE] = receiver[DR_CNP_SIZE];
+    cnp[PK_KIND] = DCQCN_CNP_PACKET;
+    cnp[PK_META_0] = event[PK_ID];
+    if (!source_queue_insert(node, cnp, error, params, queue_meta, queue_records) ||
+        !record_sourced(node, cnp, error, params, summary, observation_meta, observed)) {
+        return false;
+    }
+    if (!schedule_ready) {
+        return true;
+    }
+    return emit_child(
+        node, event, node, TX_READY, event[E_TIME], cnp, error, params, node_state,
+        fel_meta, fel_records, remote_meta, remote_staging, stream_state, stream_records,
+        tcp_state);
+}
+
+// ---------------------------------------------------------------------------------------------
+// PFC per-priority link pause (P14 Lane B T4). Transliterated from the scalar switch paths:
+// `switch_pfc_remote_arrival`, the PFC arms of `switch_remote_arrival` (overflow drop, XOFF),
+// `switch_tx_ready` (first-unpaused selection, XON on dequeue), `switch_tx_complete` and
+// `emit_pfc_frame`. Semantics are the T25 ones: edge-triggered XOFF/XON, no timed pause.
+//
+// Every PFC word of an LP's queue row is owned by that LP: the pause bitsets are written only by
+// the controlled upstream LP on frame arrival, and each ingress record only by the downstream LP
+// that monitors it. The flow-priority table is immutable image data.
+// ---------------------------------------------------------------------------------------------
+
+// The LP's PFC queue row, or NONE when the image or this queue carries no PFC state.
+inline ulong pfc_queue_row(
+    ulong node,
+    const device ulong *params,
+    const device ulong *scheduler_state
+) {
+    ulong region = params[P_PFC_OFFSET];
+    return region == NONE ? NONE : scheduler_state[region + node];
+}
+
+
+// Scalar `PfcQueueState::is_paused`: some controller still asserts pause for the priority.
+inline bool pfc_priority_paused(
+    ulong row,
+    ulong priority,
+    const device ulong *scheduler_state
+) {
+    ulong words = scheduler_state[row + 2];
+    ulong base = scheduler_state[row + 3] + priority * words;
+    for (ulong word = 0; word < words; ++word) {
+        if (scheduler_state[base + word] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline ulong pfc_paused_mask(ulong row, const device ulong *scheduler_state) {
+    ulong mask = 0;
+    for (ulong priority = 0; priority < 8; ++priority) {
+        if (pfc_priority_paused(row, priority, scheduler_state)) {
+            mask |= 1ul << priority;
+        }
+    }
+    return mask;
+}
+
+// Logical position of the first queued packet whose priority is not paused, or NONE.
+inline ulong pfc_first_eligible(
+    ulong node,
+    ulong paused_mask,
+    const device ulong *queue_meta,
+    const device ulong *queue_records,
+    const device ulong *params,
+    const device ulong *scheduler_state
+) {
+    ulong meta_base = node * QUEUE_META_WORDS;
+    ulong offset = queue_meta[meta_base];
+    ulong capacity = queue_meta[meta_base + 1];
+    ulong head = queue_meta[meta_base + 2];
+    ulong count = queue_meta[meta_base + 3];
+    for (ulong logical = 0; logical < count; ++logical) {
+        ulong record_base = (offset + (head + logical) % max(capacity, 1ul)) * EVENT_WORDS;
+        ulong priority =
+            pfc_packet_priority(queue_records + record_base, params, scheduler_state);
+        if (((paused_mask >> priority) & 1ul) == 0) {
+            return logical;
+        }
+    }
+    return NONE;
+}
+
+inline void pfc_copy_queue_record(
+    ulong node,
+    ulong logical,
+    const device ulong *queue_meta,
+    const device ulong *queue_records,
+    thread ulong *record
+) {
+    ulong meta_base = node * QUEUE_META_WORDS;
+    ulong physical = (queue_meta[meta_base + 2] + logical) % max(queue_meta[meta_base + 1], 1ul);
+    copy_device_to_thread(queue_records, queue_meta[meta_base] + physical, record);
+}
+
+// Scalar `packet_incoming_link_at`: the route hop that delivers the packet to this LP.
+inline ulong packet_incoming_link(
+    ulong node,
+    const thread ulong *packet,
+    const device ulong *flows,
+    const device ulong *routes,
+    const device ulong *links
+) {
+    ulong offset;
+    ulong length;
+    ulong terminal;
+    flow_route_mechanisms(packet, flows, offset, length, terminal);
+    for (ulong index = 0; index < length; ++index) {
+        ulong target = index + 1 < length
+            ? links[routes[offset + index + 1] * LINK_WORDS] : terminal;
+        if (target == node) {
+            return routes[offset + index];
+        }
+    }
+    return NONE;
+}
+
+// The row's ingress monitor for `link` when it controls `priority`, or NONE. A zero XOFF disables
+// the priority, which the scalar monitor treats exactly as no monitor.
+inline ulong pfc_enabled_ingress(
+    ulong row,
+    ulong link,
+    ulong priority,
+    const device ulong *scheduler_state
+) {
+    ulong count = scheduler_state[row + 1];
+    ulong base = scheduler_state[row + 4];
+    for (ulong index = 0; index < count; ++index) {
+        ulong ingress = base + index * PFC_INGRESS_WORDS;
+        if (scheduler_state[ingress + PI_LINK] == link) {
+            return scheduler_state[ingress + PI_XOFF + priority] == 0 ? NONE : ingress;
+        }
+    }
+    return NONE;
+}
+
+// `emit_pfc_frame`: a 64-byte control payload whose identity is the emitting LP's next origin
+// sequence, delivered on the ingress monitor's reverse control lane after its exact delay.
+inline bool emit_pfc_frame(
+    ulong node,
+    const thread ulong *parent,
+    ulong ingress,
+    ulong flow,
+    ulong priority,
+    ulong pause,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    const device ulong *scheduler_state,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong sequence = node_state[node * NODE_WORDS + N_NEXT_ORIGIN];
+    ulong time;
+    if (sequence == NONE || sequence > (NONE - node) / params[P_NODE_COUNT] ||
+        !checked_add(parent[E_TIME], scheduler_state[ingress + PI_DELAY], time)) {
+        set_semantic_error(error, 76, node);
+        return false;
+    }
+    ulong frame[EVENT_WORDS];
+    packet_clear(frame);
+    frame[PK_ID] = sequence * params[P_NODE_COUNT] + node;
+    frame[PK_FLOW] = flow;
+    frame[PK_SIZE] = PFC_FRAME_BYTES;
+    frame[PK_KIND] = PFC_PACKET;
+    frame[PK_META_0] = scheduler_state[ingress + PI_LINK];
+    frame[PK_META_1] = priority;
+    frame[PK_META_2] = pause;
+    return emit_child(
+        node, parent, scheduler_state[ingress + PI_TARGET], REMOTE_ARRIVAL, time, frame, error,
+        params, node_state, fel_meta, fel_records, remote_meta, remote_staging, stream_state,
+        stream_records, tcp_state);
+}
+
+// ---------------------------------------------------------------------------------------------
+// RoCE queue pairs (P15 lane R4; P16: the Mellanox-form controller and the ECN echo). Transliterated
+// from the scalar drivers `host_roce_pacing_timer`, `host_roce_feedback_arrival`,
+// `host_roce_timeout`, `host_roce_data_arrival` and the RESUME restart, and the pure rules of
+// `executor/src/roce.rs` (`settled_status`, `restart_time_ns`, `receive`). Every queue-pair word is
+// owned by one LP: the generator row by its source, the receiver record by its target.
+//
+// Metal keeps P14's plain-`inline` style throughout (it has no inline control); the structure
+// mirrors the CUDA kernel's RoCE block function for function.
+// ---------------------------------------------------------------------------------------------
+
+// The zero-byte pacing token, the payload of every pacing tick and timeout of the queue pair.
+inline void roce_token_packet(const device ulong *row, ulong flow, thread ulong *packet) {
+    packet_clear(packet);
+    packet[PK_ID] = row[G_PAYLOAD];
+    packet[PK_FLOW] = flow;
+    packet[PK_KIND] = ROCE_PACING_TIMER_PACKET;
+}
+
+// `roce::packet_size`: `min(mtu, total - psn)`.
+inline ulong roce_packet_size(const device ulong *row, ulong psn) {
+    ulong remaining = row[G_RATE_TOTAL] - psn;
+    return row[G_RATE_PACKET_SIZE] < remaining ? row[G_RATE_PACKET_SIZE] : remaining;
+}
+
+// `roce::window_bound` (P16 ruling D7): `next_psn - snd_una >= w`, with `w` the window or, when it
+// varies, `max(1, floor(window * R_C / R_max))` exactly. Callers test `window != 0` first, so a
+// queue pair without a window pays one zero test.
+inline bool roce_window_bound(const device ulong *row) {
+    ulong window = row[G_ROCE_WINDOW];
+    if (row[G_ROCE_VARIABLE_WINDOW] != 0) {
+        window = mul_div_u64(window, row[G_DCQCN_CURRENT_RATE], max(row[G_DCQCN_MAX_RATE], 1ul));
+        window = max(window, 1ul);
+    }
+    return row[G_ROCE_NEXT_PSN] - row[G_ROCE_SND_UNA] >= window;
+}
+
+// `settle_roce_sender`: the status (`roce::settled_status`) and the outstanding-byte mirrors.
+inline void roce_settle(device ulong *row, ulong parked_status) {
+    ulong total = row[G_RATE_TOTAL];
+    ulong status = parked_status;
+    if (row[G_ROCE_SND_UNA] >= total) {
+        status = 2;
+    } else if (row[G_ROCE_PACER_ARMED] != 0) {
+        // `roce::armed_status`: Scheduled when one more tick of credit covers the next packet and
+        // the window, if any, is open.
+        status = 1;
+        if (row[G_ROCE_NEXT_PSN] < total &&
+            (row[G_ROCE_WINDOW] == 0 || !roce_window_bound(row))) {
+            ulong tick_low;
+            ulong tick_high;
+            u128_from_mul_u64(
+                row[G_DCQCN_CURRENT_RATE], row[G_RATE_INTERVAL], tick_low, tick_high);
+            ulong credit_low;
+            ulong credit_high;
+            ulong size = roce_packet_size(row, row[G_ROCE_NEXT_PSN]);
+            ulong cost_low;
+            ulong cost_high;
+            u128_mul(size << 3, size >> 61, DCQCN_SCALE, 0, cost_low, cost_high);
+            if (u128_add(row[G_RATE_CREDIT_LOW], row[G_RATE_CREDIT_HIGH], tick_low, tick_high,
+                    credit_low, credit_high) &&
+                u128_at_least(credit_low, credit_high, cost_low, cost_high)) {
+                status = 0;
+            }
+        }
+    }
+    row[G_STATUS] = status;
+    ulong outstanding = row[G_BYTES] - row[G_ROCE_SND_UNA];
+    row[G_OUTSTANDING] = outstanding;
+    row[G_UNACKNOWLEDGED] = outstanding;
+}
+
+// `restart_roce_pacer`: a parked pacer with packets to send restarts on the first point of its
+// pacing grid strictly after `now` (ruling D3). `tick` is the restarted tick's time, or NONE when
+// the pacer stays as it is; a restart beyond the stop time leaves it Stopped. False on overflow.
+inline bool roce_restart(device ulong *row, ulong now, ulong stop, thread ulong &tick) {
+    tick = NONE;
+    // Every restart attempt ends a window park (ruling D7).
+    row[G_ROCE_WINDOW_PARKED] = 0;
+    ulong total = row[G_RATE_TOTAL];
+    if (row[G_ROCE_PACER_ARMED] != 0 || row[G_ROCE_NEXT_PSN] >= total ||
+        row[G_ROCE_SND_UNA] >= total) {
+        return true;
+    }
+    ulong first = row[G_RATE_FIRST];
+    ulong interval = row[G_RATE_INTERVAL];
+    ulong time = first;
+    if (now >= first) {
+        // The 128-bit product, not a `> NONE / interval` test: LLVM folds that test into a 64-bit
+        // multiply-with-overflow, which Apple's GPU backend cannot legalize.
+        ulong ticks = (now - first) / interval;
+        ulong product_low;
+        ulong product_high;
+        u128_from_mul_u64(ticks + 1, interval, product_low, product_high);
+        if (ticks == NONE || product_high != 0 || !checked_add(product_low, first, time)) {
+            return false;
+        }
+    }
+    row[G_DEPARTURE] = time;
+    if (time <= stop) {
+        row[G_ROCE_PACER_ARMED] = 1;
+        tick = time;
+    } else {
+        row[G_STATUS] = 3;
+    }
+    return true;
+}
+
+// Emits the queue pair's restarted pacing tick, then its re-armed timeout (`emit_roce_timers`).
+inline bool roce_emit_timers(
+    ulong node,
+    const thread ulong *event,
+    const device ulong *row,
+    ulong flow,
+    ulong tick,
+    ulong timeout,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong token[EVENT_WORDS];
+    roce_token_packet(row, flow, token);
+    if (tick != NONE && !emit_child(
+            node, event, node, PACING_TIMER, tick, token, error, params, node_state, fel_meta,
+            fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state)) {
+        return false;
+    }
+    return timeout == NONE || emit_child(
+        node, event, node, RETRANSMISSION_TIMEOUT, timeout, token, error, params, node_state,
+        fel_meta, fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// `host_roce_pacing_timer`: one tick of credit at the controller's current rate, the packet at the
+// next PSN when the credit covers it, and the next tick on the grid. A tick that finds its data
+// class paused at its host (host-link PFC, tested first) sends nothing, adds no credit and parks.
+inline bool roce_pacing_tick(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *scheduler_state,
+    device ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    if (flow >= params[P_FLOW_COUNT] || row[G_VALID] == 0 || row[G_OWNER] != node ||
+        row[G_KIND] != GENERATOR_KIND_ROCE || row[G_ROCE_PACER_ARMED] == 0 ||
+        row[G_PAYLOAD] != event[E_PAYLOAD] || row[G_DEPARTURE] != event[E_TIME]) {
+        set_semantic_error(error, 80, node);
+        return false;
+    }
+    ulong now = event[E_TIME];
+    ulong total = row[G_RATE_TOTAL];
+    row[G_ROCE_PACER_ARMED] = 0;
+    // The controller's due instants at or before the tick apply before it reads the rate or
+    // settles its prediction (P16 ruling D2).
+    dcqcn_materialize_if_due(row, row[G_ROCE_SND_UNA] >= total, saturating_add_u64(now, 1));
+    ulong pfc_row = pfc_queue_row(node, params, scheduler_state);
+    if (pfc_row != NONE &&
+        pfc_priority_paused(
+            pfc_row, pfc_flow_data_class(flow, params, scheduler_state), scheduler_state)) {
+        // A pair with packets left joins its class's parked bitset for the RESUME (P16 H4, Scalar's
+        // `pause_parked` insert); the readback derives the parked list itself (ruling D3).
+        if (row[G_ROCE_NEXT_PSN] < total && row[G_ROCE_SND_UNA] < total) {
+            pfc_mark_parked(pfc_row, flow, params, scheduler_state);
+        }
+        roce_settle(row, 1);
+        return true;
+    }
+    // P16 ruling D7: a closed window, at the rate as of the tick, parks the pacer without credit
+    // until feedback moves `snd_una`.
+    if (row[G_ROCE_WINDOW] != 0 && row[G_ROCE_NEXT_PSN] < total && roce_window_bound(row)) {
+        row[G_ROCE_WINDOW_PARKED] = 1;
+        roce_settle(row, 1);
+        return true;
+    }
+    bool emitted = false;
+    ulong psn = row[G_ROCE_NEXT_PSN];
+    ulong size = 0;
+    ulong payload = 0;
+    bool retransmission = false;
+    ulong timeout = NONE;
+    if (psn < total) {
+        ulong tick_low;
+        ulong tick_high;
+        u128_from_mul_u64(row[G_DCQCN_CURRENT_RATE], row[G_RATE_INTERVAL], tick_low, tick_high);
+        ulong credit_low;
+        ulong credit_high;
+        if (!u128_add(row[G_RATE_CREDIT_LOW], row[G_RATE_CREDIT_HIGH], tick_low, tick_high,
+                credit_low, credit_high)) {
+            set_semantic_error(error, 81, node);
+            return false;
+        }
+        size = roce_packet_size(row, psn);
+        ulong cost_low;
+        ulong cost_high;
+        u128_mul(size << 3, size >> 61, DCQCN_SCALE, 0, cost_low, cost_high);
+        if (u128_at_least(credit_low, credit_high, cost_low, cost_high)) {
+            u128_sub(credit_low, credit_high, cost_low, cost_high, credit_low, credit_high);
+            retransmission = psn < row[G_BYTES];
+            bool outstanding_before = row[G_ROCE_SND_UNA] < row[G_BYTES];
+            if (!allocate_tcp_payload(node, node_state, params, payload) ||
+                node_state[node_base + N_COUNTER_0] == NONE) {
+                set_semantic_error(error, 81, node);
+                return false;
+            }
+            node_state[node_base + N_COUNTER_0] += 1;
+            row[G_ROCE_NEXT_PSN] = psn + size;
+            if (!retransmission) {
+                if (row[G_PACKETS] == NONE) {
+                    set_semantic_error(error, 81, node);
+                    return false;
+                }
+                row[G_BYTES] = psn + size;
+                row[G_PACKETS] += 1;
+            }
+            if (row[G_ROCE_RTO] != 0 && !outstanding_before) {
+                if (!checked_add(now, row[G_ROCE_RTO], timeout)) {
+                    set_semantic_error(error, 81, node);
+                    return false;
+                }
+                row[G_ROCE_RTO_DEADLINE] = timeout;
+            }
+            emitted = true;
+        }
+        row[G_RATE_CREDIT_LOW] = credit_low;
+        row[G_RATE_CREDIT_HIGH] = credit_high;
+    }
+    ulong parked = 1;
+    ulong tick = NONE;
+    if (row[G_ROCE_NEXT_PSN] < total) {
+        ulong next;
+        if (!checked_add(now, row[G_RATE_INTERVAL], next)) {
+            set_semantic_error(error, 81, node);
+            return false;
+        }
+        row[G_DEPARTURE] = next;
+        if (next <= params[P_STOP_TIME]) {
+            row[G_ROCE_PACER_ARMED] = 1;
+            tick = next;
+        } else {
+            parked = 3;
+        }
+    }
+    roce_settle(row, parked);
+    if (!roce_emit_timers(
+            node, event, row, flow, tick, timeout, error, params, node_state, fel_meta,
+            fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state)) {
+        return false;
+    }
+    if (!emitted) {
+        return true;
+    }
+    ulong data[EVENT_WORDS];
+    packet_clear(data);
+    data[E_TIME] = now;
+    data[E_PHASE] = 1;
+    data[PK_ID] = payload;
+    data[PK_FLOW] = flow;
+    data[PK_SIZE] = size;
+    data[PK_KIND] = ROCE_DATA_PACKET;
+    data[PK_META_0] = psn;
+    data[PK_META_1] = now;
+    data[PK_META_2] = retransmission ? 1 : 0;
+    if (!source_queue_insert(node, data, error, params, queue_meta, queue_records) ||
+        !record_sourced(node, data, error, params, summary, observation_meta, observed)) {
+        return false;
+    }
+    if (node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0) {
+        node_state[node_base + N_READY_PENDING] = 1;
+        return emit_child(
+            node, event, node, TX_READY, now, data, error, params, node_state, fel_meta,
+            fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+    }
+    return true;
+}
+
+// `host_roce_feedback_arrival`: a fresh ACK advances the cumulative acknowledgment; a NACK also
+// rewinds the next PSN to it (Go-back-N). Every advance or rewind restarts the timeout, removing
+// the superseded record in this transition (the live-state contract), and restarts a parked pacer.
+// The controller's due instants before the arrival apply first; the ACK that completes the pair
+// freezes the controller; otherwise an ECN echo is a feedback (P16 rulings D2, D4, D11), except for
+// a pair without congestion control, whose sender ignores it (P17).
+inline bool roce_feedback_arrival(
+    ulong node,
+    const thread ulong *event,
+    bool nack,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    const device ulong *flows,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *arrivals,
+    device ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    if (flow >= params[P_FLOW_COUNT] || flows[flow * FLOW_WORDS] != node ||
+        row[G_VALID] == 0 || row[G_OWNER] != node || row[G_KIND] != GENERATOR_KIND_ROCE ||
+        row[G_FEEDBACK] == NONE) {
+        set_semantic_error(error, 83, node);
+        return false;
+    }
+    if (!record_arrival(
+            node, event, 3, error, params, summary, observation_meta, observed, arrivals)) {
+        return false;
+    }
+    row[G_FEEDBACK] += 1;
+    ulong now = event[E_TIME];
+    ulong total = row[G_RATE_TOTAL];
+    dcqcn_materialize_if_due(row, row[G_ROCE_SND_UNA] >= total, now);
+    ulong acknowledgment = event[PK_META_0];
+    if (acknowledgment > row[G_BYTES]) {
+        set_semantic_error(error, 84, node);
+        return false;
+    }
+    ulong snd_una = row[G_ROCE_SND_UNA];
+    ulong snd_una_before = snd_una;
+    bool stale = nack ? acknowledgment < snd_una : acknowledgment <= snd_una;
+    ulong tick = NONE;
+    ulong timeout = NONE;
+    if (!stale) {
+        bool outstanding_before = snd_una < row[G_BYTES];
+        snd_una = max(snd_una, acknowledgment);
+        row[G_ROCE_SND_UNA] = snd_una;
+        row[G_ROCE_NEXT_PSN] = nack ? snd_una : max(row[G_ROCE_NEXT_PSN], snd_una);
+        if (row[G_ROCE_RTO] != 0) {
+            if (outstanding_before && !heap_remove_timer(
+                    node, flow, row[G_PAYLOAD], row[G_ROCE_RTO_DEADLINE], error, params,
+                    fel_meta, fel_records, stream_state, tcp_state)) {
+                return false;
+            }
+            if (snd_una < row[G_BYTES]) {
+                if (!checked_add(now, row[G_ROCE_RTO], timeout)) {
+                    set_semantic_error(error, 84, node);
+                    return false;
+                }
+                row[G_ROCE_RTO_DEADLINE] = timeout;
+            } else {
+                row[G_ROCE_RTO_DEADLINE] = 0;
+            }
+        }
+        if (!roce_restart(row, now, params[P_STOP_TIME], tick)) {
+            set_semantic_error(error, 84, node);
+            return false;
+        }
+    }
+    if (snd_una_before < total && row[G_ROCE_SND_UNA] >= total) {
+        dcqcn_settle(row, now);
+    }
+    // Word 2 of an ACK or NACK: the packet size in bits 0..32, the ECN echo in bit 32. A pair
+    // without congestion control (P17) ignores the echo; its inert controller is never armed, so
+    // the settle above returns at once for it. The mode is tested last: a DCQCN pair reads it only
+    // on an echoing ACK or NACK.
+    if ((event[PK_META_2] >> 32) != 0 && row[G_ROCE_SND_UNA] < total &&
+        row[G_ROCE_CONGESTION_CONTROL] == 0) {
+        dcqcn_on_feedback(row, now);
+    }
+    roce_settle(row, row[G_STATUS]);
+    return roce_emit_timers(
+        node, event, row, flow, tick, timeout, error, params, node_state, fel_meta, fel_records,
+        remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// `host_roce_timeout`: Go-back-N rewinds to the cumulative acknowledgment, the fixed timeout
+// re-arms, and a parked pacer restarts. The popped record's slot was cleared by the pop; a record
+// owned by the flow must be the armed timeout, exactly as for TCP (the live-state contract).
+inline bool roce_timeout(
+    ulong node,
+    const thread ulong *event,
+    ulong popped_timer_owner,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    ulong now = event[E_TIME];
+    bool armed = row[G_OWNER] == node && row[G_ROCE_RTO] != 0 &&
+        row[G_ROCE_SND_UNA] < row[G_BYTES] && row[G_ROCE_RTO_DEADLINE] == now &&
+        row[G_PAYLOAD] == event[E_PAYLOAD];
+    bool owned = popped_timer_owner != NONE && popped_timer_owner == flow;
+    if (armed != owned) {
+        set_semantic_error(error, 61, node);
+        return false;
+    }
+    if (!armed) {
+        return true;
+    }
+    // An armed timeout implies an incomplete pair (P16 ruling D2: due instants at or before now).
+    dcqcn_materialize_if_due(row, false, saturating_add_u64(now, 1));
+    row[G_ROCE_NEXT_PSN] = row[G_ROCE_SND_UNA];
+    ulong timeout;
+    ulong tick;
+    if (!checked_add(now, row[G_ROCE_RTO], timeout) ||
+        !roce_restart(row, now, params[P_STOP_TIME], tick)) {
+        set_semantic_error(error, 85, node);
+        return false;
+    }
+    row[G_ROCE_RTO_DEADLINE] = timeout;
+    roce_settle(row, row[G_STATUS]);
+    return roce_emit_timers(
+        node, event, row, flow, tick, timeout, error, params, node_state, fel_meta, fel_records,
+        remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// The receiver's whole state step for one data arrival, on its record: the Go-back-N rule
+// (`roce::receive`). The queue pair has no notification point (P16: its ACKs echo ECN).
+inline ulong roce_receive(
+    device ulong *record,
+    ulong psn,
+    ulong size,
+    ulong now
+) {
+    ulong earliest;
+    ulong expected = record[RR_EXPECTED];
+    ulong action;
+    if (psn == expected) {
+        expected += size;
+        record[RR_EXPECTED] = expected;
+        record[RR_SINCE_ACK] += 1;
+        action = record[RR_SINCE_ACK] >= record[RR_ACK_EVERY] || expected == record[RR_TOTAL]
+            ? ROCE_ACTION_ACK : ROCE_ACTION_NONE;
+    } else if (psn < expected) {
+        action = record[RR_DUPLICATE_ACK] != 0 ? ROCE_ACTION_DUPLICATE_ACK : ROCE_ACTION_NONE;
+    } else {
+        bool admitted = (record[RR_FLAGS] & RR_FLAG_LAST_NACK) == 0 ||
+            record[RR_NACK_PSN] != expected ||
+            (checked_add(record[RR_NACK_TIME], record[RR_NACK_INTERVAL], earliest) &&
+                now >= earliest);
+        if (admitted) {
+            record[RR_NACK_PSN] = expected;
+            record[RR_NACK_TIME] = now;
+            record[RR_FLAGS] |= RR_FLAG_LAST_NACK;
+            action = ROCE_ACTION_NACK;
+        } else {
+            action = ROCE_ACTION_NACK_SUPPRESSED;
+        }
+    }
+    if (action <= ROCE_ACTION_NACK) {
+        record[RR_SINCE_ACK] = 0;
+    }
+    return action;
+}
+
+// The ACK or NACK a queue-pair receiver sources: the frontier, the echoed send time, and the data
+// size with the ECN echo in bit 32 (P16 ruling D6).
+inline void roce_receiver_packet(
+    thread ulong *packet,
+    ulong now,
+    ulong payload,
+    ulong flow,
+    ulong size,
+    ulong kind,
+    ulong meta_0,
+    ulong meta_1,
+    ulong meta_2
+) {
+    packet_clear(packet);
+    packet[E_TIME] = now;
+    packet[E_PHASE] = 1;
+    packet[PK_ID] = payload;
+    packet[PK_FLOW] = flow;
+    packet[PK_SIZE] = size;
+    packet[PK_KIND] = kind;
+    packet[PK_META_0] = meta_0;
+    packet[PK_META_1] = meta_1;
+    packet[PK_META_2] = meta_2;
+}
+
+// `host_roce_data_arrival`: the Go-back-N receiver accepts the in-order packet, or drops the packet
+// and answers it; an ACK or NACK echoes the packet's CE mark, and no CNP is sent (P16 rulings D4,
+// D5). One TX_READY claims an idle egress for the ACK or NACK.
+inline bool roce_data_arrival(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    const device ulong *flows,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *arrivals,
+    device ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong flow = event[PK_FLOW];
+    const device ulong *receiver_row =
+        tcp_state + params[P_TCP_RECEIVER_OFFSET] + flow * TCP_RECEIVER_WORDS;
+    if (flow >= params[P_FLOW_COUNT] || flows[flow * FLOW_WORDS + 1] != node ||
+        receiver_row[0] != ROCE_RECEIVER_MARKER ||
+        node_state[node_base + N_COUNTER_2] == NONE) {
+        set_semantic_error(error, 86, node);
+        return false;
+    }
+    device ulong *record = tcp_state + receiver_row[1];
+    ulong now = event[E_TIME];
+    ulong end;
+    if (!checked_add(event[PK_META_0], event[PK_SIZE], end) || end > record[RR_TOTAL] ||
+        event[PK_SIZE] > 0xfffffffful) {
+        set_semantic_error(error, 86, node);
+        return false;
+    }
+    ulong action = roce_receive(record, event[PK_META_0], event[PK_SIZE], now);
+    bool feedback = action <= ROCE_ACTION_NACK;
+    node_state[node_base + N_COUNTER_2] += 1;
+    ulong feedback_payload = 0;
+    if (feedback && (!allocate_tcp_payload(node, node_state, params, feedback_payload) ||
+            node_state[node_base + N_COUNTER_0] == NONE)) {
+        set_semantic_error(error, 87, node);
+        return false;
+    }
+    if (feedback) {
+        node_state[node_base + N_COUNTER_0] += 1;
+    }
+    bool schedule_ready = feedback &&
+        node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0;
+    if (schedule_ready) {
+        node_state[node_base + N_READY_PENDING] = 1;
+    }
+    if (!record_arrival(
+            node, event, 2, error, params, summary, observation_meta, observed, arrivals)) {
+        return false;
+    }
+    if (!feedback) {
+        return true;
+    }
+    ulong echo = (event[PK_KIND] & PK_ECN_FLAG) != 0 ? 1ul << 32 : 0ul;
+    ulong packet[EVENT_WORDS];
+    roce_receiver_packet(
+        packet, now, feedback_payload, flow, record[RR_ACK_SIZE],
+        action == ROCE_ACTION_NACK ? ROCE_NACK_PACKET : ROCE_ACK_PACKET,
+        record[RR_EXPECTED], event[PK_META_1], event[PK_SIZE] | echo);
+    if (!source_queue_insert(node, packet, error, params, queue_meta, queue_records) ||
+        !record_sourced(node, packet, error, params, summary, observation_meta, observed)) {
+        return false;
+    }
+    if (!schedule_ready) {
+        return true;
+    }
+    return emit_child(
+        node, event, node, TX_READY, now, packet, error, params, node_state, fel_meta,
+        fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// P16 G1: whether a stage's prerequisites are complete (`StageDependencies::prerequisites_complete`).
+// At every event boundary this equals the stage's `activated` (the validator pins it), so the
+// device stores no release flag.
+inline bool stage_prerequisites(ulong flags) {
+    return ((flags & SR_HAS_LOCAL) == 0 || (flags & SR_LOCAL_COMPLETE) != 0) &&
+        ((flags & SR_HAS_INBOUND) == 0 || (flags & SR_INBOUND_COMPLETE) != 0);
+}
+
+// P16 G1: `flow` is a collective stage its prerequisites have not released. False without a stage
+// region.
+inline bool stage_unreleased(
+    ulong flow,
+    const device ulong *params,
+    const device ulong *tcp_state
+) {
+    ulong region = params[P_STAGE_OFFSET];
+    if (region == NONE) {
+        return false;
+    }
+    ulong flags = tcp_state[region + flow * STAGE_ROW_WORDS + SR_FLAGS];
+    return (flags & SR_IS_STAGE) != 0 && !stage_prerequisites(flags);
+}
+
+// Host-link PFC (P15): the queue pairs a RESUME of class `priority` restarts at a host, each on its
+// next grid point strictly after the RESUME, in generator-position (`FlowId`) order.
+//
+// Specification: `validate::expected_pause_parked`, the validator's characterization of Scalar's
+// `HostPfcState::pause_parked`, which holds while the class is paused. P16 H4 (ruling G9): the scan
+// walks the set bits of the class's parked bitset, a superset of that set (a bit is set when a
+// paused tick parks a pair of the class with packets left, and an ACK, NACK, timeout or completion
+// leaves it set), in ascending slot order, which is ascending generator position. To each set bit
+// it applies that function's conjuncts, with the data class implied by the bitset and in place of
+// `is_paused(class)`, because Scalar takes the set after the last controller's resume has unpaused
+// the class: it skips a pair whose pacer is armed, window-parked (P16 ruling D7), stopped, has sent
+// or had acknowledged everything, or is a collective stage its prerequisites have not released
+// (P16 G1). So it restarts exactly Scalar's set in Scalar's order; a skip has no effect. The walk
+// clears each word before restarting its pairs; no restart writes the bitsets.
+inline bool roce_resume_parked(
+    ulong node,
+    const thread ulong *event,
+    ulong row,
+    ulong priority,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *scheduler_state,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong list = scheduler_state[row + 4];
+    ulong pairs = scheduler_state[list];
+    ulong bitset = pfc_parked_bitset(list, pairs, priority);
+    ulong words = (pairs + 63) / 64;
+    RECORD_RESUME_SCAN(params, scheduler_state, node, 0, 1);
+    RECORD_RESUME_SCAN(params, scheduler_state, node, 2, words);
+    for (ulong word = 0; word < words; ++word) {
+        ulong bits = scheduler_state[bitset + word];
+        if (bits == 0) {
+            continue;
+        }
+        scheduler_state[bitset + word] = 0;
+        while (bits != 0) {
+            ulong slot = word * 64 + ctz(bits);
+            bits &= bits - 1;
+            RECORD_RESUME_SCAN(params, scheduler_state, node, 1, 1);
+            ulong flow = scheduler_state[list + 1 + slot];
+            device ulong *generator = generators + flow * GENERATOR_WORDS;
+            ulong total = generator[G_RATE_TOTAL];
+            if (generator[G_ROCE_PACER_ARMED] != 0 || generator[G_ROCE_WINDOW_PARKED] != 0 ||
+                generator[G_STATUS] == 3 || generator[G_ROCE_NEXT_PSN] >= total ||
+                generator[G_ROCE_SND_UNA] >= total || stage_unreleased(flow, params, tcp_state)) {
+                continue;
+            }
+            // A phase-0 transition: the controller's due instants before the RESUME apply first.
+            dcqcn_materialize_if_due(generator, false, event[E_TIME]);
+            ulong tick;
+            if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], tick)) {
+                set_semantic_error(error, 88, node);
+                return false;
+            }
+            roce_settle(generator, generator[G_STATUS]);
+            if (!roce_emit_timers(
+                    node, event, generator, flow, tick, NONE, error, params, node_state, fel_meta,
+                    fel_records, remote_meta, remote_staging, stream_state, stream_records,
+                    tcp_state)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// `switch_pfc_remote_arrival`: assign one controller's pause bit; on the last resume, schedule
+// service for the first packet whose priority is no longer paused.
+inline bool pfc_frame_arrival(
+    ulong node,
+    const thread ulong *event,
+    ulong role,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    const device ulong *queue_meta,
+    const device ulong *queue_records,
+    device ulong *scheduler_state,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong row = DAYS_MECHANISMS ? pfc_queue_row(node, params, scheduler_state) : NONE;
+    ulong priority = event[PK_META_1];
+    if (row == NONE || node_state[node_base + N_EGRESS] != event[PK_META_0] || priority >= 8) {
+        set_semantic_error(error, 77, node);
+        return false;
+    }
+    ulong controllers = scheduler_state[row];
+    ulong bit = NONE;
+    for (ulong index = 0; index < controllers; ++index) {
+        if (scheduler_state[row + PFC_ROW_HEADER_WORDS + index] == event[E_ORIGIN]) {
+            bit = index;
+            break;
+        }
+    }
+    if (bit == NONE) {
+        set_semantic_error(error, 78, node);
+        return false;
+    }
+    ulong word = scheduler_state[row + 3] + priority * scheduler_state[row + 2] + bit / 64;
+    ulong mask_bit = 1ul << (bit % 64);
+    if (event[PK_META_2] != 0) {
+        scheduler_state[word] |= mask_bit;
+        return true;
+    }
+    // A duplicate or early resume is an idempotent no-op; another holder keeps the pause.
+    if ((scheduler_state[word] & mask_bit) == 0) {
+        return true;
+    }
+    scheduler_state[word] &= ~mask_bit;
+    if (pfc_priority_paused(row, priority, scheduler_state)) {
+        return true;
+    }
+    ulong position = pfc_first_eligible(
+        node, pfc_paused_mask(row, scheduler_state), queue_meta, queue_records, params,
+        scheduler_state);
+    if (position != NONE && node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0) {
+        node_state[node_base + N_READY_PENDING] = 1;
+        ulong next[EVENT_WORDS];
+        pfc_copy_queue_record(node, position, queue_meta, queue_records, next);
+        if (!emit_child(
+                node, event, node, TX_READY, event[E_TIME], next, error, params, node_state,
+                fel_meta, fel_records, remote_meta, remote_staging, stream_state, stream_records,
+                tcp_state)) {
+            return false;
+        }
+    }
+    // P15 host-link PFC (`host_pfc_remote_arrival`): after the TX_READY, the RESUME restarts the
+    // host's pause-parked queue pairs of this class, each emitting its tick in `FlowId` order.
+    if (DAYS_MECHANISMS && role == HOST) {
+        return roce_resume_parked(
+            node, event, row, priority, error, params, node_state, generators, scheduler_state,
+            fel_meta, fel_records, remote_meta, remote_staging, stream_state, stream_records,
+            tcp_state);
+    }
+    return true;
+}
+
+// Removes the WFQ packet at `logical` together with its finish tag, which moves to the in-service
+// tag. Later records and their tags shift down one slot, as `queue_remove_at` shifts records, so
+// every tag stays with its packet.
+inline bool wfq_remove_at(
+    ulong node,
+    ulong logical,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *scheduler_state,
+    thread ulong *record
+) {
+    ulong base = node * QUEUE_META_WORDS;
+    ulong offset = queue_meta[base];
+    ulong capacity = max(queue_meta[base + 1], 1ul);
+    ulong head = queue_meta[base + 2];
+    ulong count = queue_meta[base + 3];
+    if (logical >= count) {
+        return false;
+    }
+    ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+    ulong tag_offset = scheduler_state[scheduler_base + S_QUEUE_TAG_OFFSET];
+    ulong physical = (head + logical) % capacity;
+    copy_device_to_thread(queue_records, offset + physical, record);
+    rational_copy(
+        scheduler_state, tag_offset + physical * RATIONAL_WORDS,
+        scheduler_base + S_IN_SERVICE_TAG);
+    if (logical == 0) {
+        rational_zero(scheduler_state, tag_offset + physical * RATIONAL_WORDS);
+        queue_meta[base + 2] = (head + 1) % capacity;
+        queue_meta[base + 3] = count - 1;
+        return true;
+    }
+    for (ulong cursor = logical; cursor + 1 < count; ++cursor) {
+        ulong source = (head + cursor + 1) % capacity;
+        ulong target = (head + cursor) % capacity;
+        copy_device_record(queue_records, offset + source, queue_records, offset + target);
+        rational_copy(
+            scheduler_state, tag_offset + source * RATIONAL_WORDS,
+            tag_offset + target * RATIONAL_WORDS);
+    }
+    rational_zero(scheduler_state, tag_offset + ((head + count - 1) % capacity) * RATIONAL_WORDS);
+    queue_meta[base + 3] = count - 1;
+    return true;
+}
+
+// P16 G1: `activate_wrapped_stage`, for a stage whose prerequisites this event completed. Its
+// generator must be `Blocked` (an unreleased stage always is; Scalar's release test requires it).
+//   TCP: `prepare_tcp_attempts` from sequence 0 with the window filled at the release time, as an
+//        ordinary flow's first window (Scalar's prepare plus install).
+//   RoCE (`start_roce_stage`): the grid is anchored at the release time and the pacer armed, its
+//        first tick at that time; the controller stays pristine and the RTO starts with a send.
+//   Compute (`start_compute_stage`): a zero-byte token names a timer at release + duration, or the
+//        stage stops without one when that passes the stop time.
+inline bool stage_release(
+    ulong node,
+    const thread ulong *event,
+    ulong flow,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *tcp_state
+) {
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    if (row[G_VALID] == 0 || row[G_OWNER] != node || row[G_STATUS] != 1) {
+        set_semantic_error(error, 102, node);
+        return false;
+    }
+    ulong now = event[E_TIME];
+    ulong kind = row[G_KIND];
+    if (kind == 1) {
+        return prepare_tcp_attempts(
+            node, flow, event, false, 0, true, false, error, params, node_state, generators,
+            fel_meta, fel_records, queue_meta, queue_records, remote_meta, remote_staging,
+            stream_state, stream_records, summary, observation_meta, observed, tcp_state);
+    }
+    if (kind == GENERATOR_KIND_ROCE) {
+        row[G_RATE_FIRST] = now;
+        row[G_ROCE_PACER_ARMED] = 1;
+        row[G_DEPARTURE] = now;
+        roce_settle(row, row[G_STATUS]);
+        return roce_emit_timers(
+            node, event, row, flow, now, NONE, error, params, node_state, fel_meta, fel_records,
+            remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+    }
+    ulong deadline;
+    if (kind != GENERATOR_KIND_CONSTANT || !checked_add(now, row[G_COMPUTE_DURATION], deadline)) {
+        set_semantic_error(error, 104, node);
+        return false;
+    }
+    row[G_DEPARTURE] = deadline;
+    if (deadline > params[P_STOP_TIME]) {
+        row[G_STATUS] = 3;
+        row[G_PAYLOAD] = 0;
+        return true;
+    }
+    ulong token;
+    if (!allocate_tcp_payload(node, node_state, params, token)) {
+        set_semantic_error(error, 104, node);
+        return false;
+    }
+    row[G_STATUS] = 0;
+    row[G_PAYLOAD] = token;
+    ulong packet[EVENT_WORDS];
+    packet_clear(packet);
+    packet[PK_ID] = token;
+    packet[PK_FLOW] = flow;
+    // P16 H2: a stage notify's token carries its chunk; a compute stage's is a zero-byte DATA one.
+    packet[PK_SIZE] = row[G_NOTIFY_BYTES];
+    packet[PK_KIND] = row[G_NOTIFY_BYTES] != 0 ? STAGE_NOTIFY_PACKET : DATA_PACKET;
+    return emit_child(
+        node, event, node, PACING_TIMER, deadline, packet, error, params, node_state, fel_meta,
+        fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// P16 G1: `host_compute_timer`'s own transition. The local completion it causes runs in the
+// event's stage pass (`stage_after_event`), after this transition, as Scalar's does.
+inline bool compute_timer(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *generators,
+    const device ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    if ((tcp_state[params[P_STAGE_OFFSET] + flow * STAGE_ROW_WORDS + SR_FLAGS] & SR_IS_STAGE) ==
+        0) {
+        return true;
+    }
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    if (row[G_STATUS] != 0 || row[G_PAYLOAD] != event[E_PAYLOAD] ||
+        row[G_DEPARTURE] != event[E_TIME]) {
+        set_semantic_error(error, 103, node);
+        return false;
+    }
+    row[G_STATUS] = 2;
+    return true;
+}
+
+// P16 H2: `host_notify_timer`'s own transition; mirrors `notify_timer` in `cuda_kernels.cu`.
+inline bool notify_timer(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    const device ulong *flows,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    ulong arrival;
+    if (params[P_STAGE_OFFSET] == NONE || flow >= params[P_FLOW_COUNT] || row[G_VALID] == 0 ||
+        row[G_OWNER] != node || row[G_KIND] != GENERATOR_KIND_CONSTANT || row[G_STATUS] != 0 ||
+        row[G_PAYLOAD] != event[E_PAYLOAD] || row[G_DEPARTURE] != event[E_TIME] ||
+        !checked_add(event[E_TIME], row[G_NOTIFY_LANE], arrival)) {
+        set_semantic_error(error, 105, node);
+        return false;
+    }
+    row[G_STATUS] = 2;
+    row[G_PACKETS] = 1;
+    row[G_BYTES] = row[G_NOTIFY_BYTES];
+    return emit_child(
+        node, event, flows[flow * FLOW_WORDS + 1], REMOTE_ARRIVAL, arrival, event, error, params,
+        node_state, fel_meta, fel_records, remote_meta, remote_staging, stream_state,
+        stream_records, tcp_state);
+}
+
+// P16 G1: the stage pass of one host transition (`complete_local_successors` or
+// `record_inbound_progress`, then `activate_ready_collectives`), run after the transition's own
+// emissions, as Scalar releases after them. Mirrors `stage_after_event` in `cuda_kernels.cu`, which
+// documents the rule.
+inline bool stage_after_event(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *tcp_state
+) {
+    ulong kind = event[E_KIND];
+    ulong packet = event[PK_KIND] & PK_KIND_MASK;
+    ulong flow = event[PK_FLOW];
+    if (node_state[node * NODE_WORDS + N_KIND] != HOST || flow >= params[P_FLOW_COUNT]) {
+        return true;
+    }
+    // P16 H2: a stage notify's arrival advances its inbound successors by the whole chunk, and its
+    // sender's timer completes its local successors.
+    bool inbound = kind == REMOTE_ARRIVAL &&
+        (packet == TCP_DATA_PACKET || packet == ROCE_DATA_PACKET ||
+            packet == STAGE_NOTIFY_PACKET);
+    bool local = (kind == REMOTE_ARRIVAL &&
+            (packet == TCP_ACK_PACKET || packet == ROCE_ACK_PACKET ||
+                packet == ROCE_NACK_PACKET)) ||
+        (kind == PACING_TIMER && (packet == DATA_PACKET || packet == STAGE_NOTIFY_PACKET));
+    if (!inbound && !local) {
+        return true;
+    }
+    ulong region = params[P_STAGE_OFFSET];
+    ulong list = tcp_state[region + flow * STAGE_ROW_WORDS +
+        (inbound ? SR_INBOUND_SUCCESSORS : SR_LOCAL_SUCCESSORS)];
+    ulong count = list & 0xfffffffful;
+    if (count == 0) {
+        return true;
+    }
+    ulong frontier = 0;
+    if (inbound && packet == STAGE_NOTIFY_PACKET) {
+        frontier = event[PK_SIZE];
+    } else if (inbound) {
+        const device ulong *receiver =
+            tcp_state + params[P_TCP_RECEIVER_OFFSET] + flow * TCP_RECEIVER_WORDS;
+        frontier = packet == TCP_DATA_PACKET ? receiver[3] : tcp_state[receiver[1] + RR_EXPECTED];
+    } else {
+        const device ulong *row = generators + flow * GENERATOR_WORDS;
+        bool complete = row[G_KIND] == 1 ? row[G_TCP_HIGHEST_ACK] >= row[G_TCP_TOTAL]
+            : row[G_KIND] == GENERATOR_KIND_ROCE ? row[G_ROCE_SND_UNA] >= row[G_RATE_TOTAL]
+            : row[G_KIND] == GENERATOR_KIND_CONSTANT && row[G_STATUS] == 2;
+        if (!complete) {
+            return true;
+        }
+        // A completion is credited once: later ACKs of a finished flow count nothing.
+        device ulong *own = tcp_state + region + flow * STAGE_ROW_WORDS + SR_FLAGS;
+        if ((*own & SR_LOCAL_CREDITED) != 0) {
+            return true;
+        }
+        *own |= SR_LOCAL_CREDITED;
+    }
+    ulong successors = region + (list >> 32);
+    // The advance of this flow's frontier since it was last credited, for its inbound joins.
+    ulong advance = 0;
+    if (inbound && (tcp_state[region + flow * STAGE_ROW_WORDS + SR_FLAGS] & SR_INBOUND_CREDIT) != 0) {
+        device ulong *credit = tcp_state + successors - 1;
+        if (frontier < *credit) {
+            set_semantic_error(error, 101, node);
+            return false;
+        }
+        advance = frontier - *credit;
+        *credit = frontier;
+    }
+    for (ulong index = 0; index < count; ++index) {
+        ulong successor = tcp_state[successors + index];
+        if (successor >= params[P_FLOW_COUNT]) {
+            set_semantic_error(error, 100, node);
+            return false;
+        }
+        device ulong *stage = tcp_state + region + successor * STAGE_ROW_WORDS;
+        ulong flags = stage[SR_FLAGS];
+        if (inbound) {
+            if ((flags & SR_HAS_INBOUND) == 0 || (flags & SR_INBOUND_COMPLETE) != 0) {
+                continue;
+            }
+            // A single predecessor's count is its frontier; a join adds each one's advance.
+            ulong received = (flags & SR_INBOUND_JOIN) != 0
+                ? stage[SR_INBOUND_RECEIVED] + advance : frontier;
+            if (received == stage[SR_INBOUND_RECEIVED]) {
+                continue;
+            }
+            if (received < stage[SR_INBOUND_RECEIVED] || received > stage[SR_INBOUND_REQUIRED]) {
+                set_semantic_error(error, 101, node);
+                return false;
+            }
+            stage[SR_INBOUND_RECEIVED] = received;
+            if (received != stage[SR_INBOUND_REQUIRED]) {
+                continue;
+            }
+            flags |= SR_INBOUND_COMPLETE;
+        } else {
+            if ((flags & SR_HAS_LOCAL) == 0 || (flags & SR_LOCAL_COMPLETE) != 0) {
+                continue;
+            }
+            if ((flags & SR_LOCAL_JOIN) != 0) {
+                flags += SR_JOIN_ONE;
+                ulong completed = (flags >> 32) & 0xfffful;
+                if (completed > (flags >> 48)) {
+                    set_semantic_error(error, 100, node);
+                    return false;
+                }
+                if (completed != (flags >> 48)) {
+                    stage[SR_FLAGS] = flags;
+                    continue;
+                }
+            }
+            flags |= SR_LOCAL_COMPLETE;
+        }
+        stage[SR_FLAGS] = flags;
+        if (stage_prerequisites(flags) && !stage_release(
+                node, event, successor, error, params, node_state, generators, fel_meta,
+                fel_records, queue_meta, queue_records, remote_meta, remote_staging,
+                stream_state, stream_records, summary, observation_meta, observed, tcp_state)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool dispatch_event(
+    ulong node,
+    thread ulong *event,
+    ulong popped_timer_owner,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    const device ulong *flows,
+    const device ulong *routes,
+    const device ulong *links,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *in_service,
+    device ulong *scheduler_state,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *departures,
+    device ulong *arrivals,
+    device ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong role = node_state[node_base + N_KIND];
+    ulong kind = event[E_KIND];
+
+    if (kind == PACING_TIMER && role == HOST) {
+        ulong flow = event[PK_FLOW];
+        ulong generator = flow * GENERATOR_WORDS;
+        // P15: a queue pair's pacing token is tested first (one tag compare ahead of today's paths,
+        // as Scalar's `host_pacing_timer` does).
+        if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == ROCE_PACING_TIMER_PACKET) {
+            return roce_pacing_tick(
+                node, event, error, params, node_state, generators, fel_meta, fel_records,
+                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
+                stream_records, summary, observation_meta, observed, scheduler_state, tcp_state);
+        }
+        // P16 H2: a stage notify's token names its sender's timer (Scalar's `host_notify_timer`).
+        if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == STAGE_NOTIFY_PACKET) {
+            return notify_timer(
+                node, event, error, params, node_state, generators, flows, fel_meta, fel_records,
+                remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+        }
+        if (DAYS_MECHANISMS && flow < params[P_FLOW_COUNT] &&
+            generators[generator + G_VALID] != 0 && generators[generator + G_OWNER] == node &&
+            generators[generator + G_KIND] == GENERATOR_KIND_DCQCN) {
+            return dcqcn_pacing_timer(
+                node, event, error, params, node_state, generators, fel_meta, fel_records,
+                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
+                stream_records, summary, observation_meta, observed, tcp_state);
+        }
+        // P16 G1: a compute stage's timer (Scalar's `host_compute_timer`).
+        if (DAYS_MECHANISMS && params[P_STAGE_OFFSET] != NONE && flow < params[P_FLOW_COUNT] &&
+            generators[generator + G_VALID] != 0 && generators[generator + G_OWNER] == node &&
+            generators[generator + G_KIND] == GENERATOR_KIND_CONSTANT) {
+            return compute_timer(node, event, error, params, generators, tcp_state);
+        }
+        if (flow >= params[P_FLOW_COUNT] || generators[generator + G_VALID] == 0 ||
+            generators[generator + G_OWNER] != node || generators[generator + G_KIND] != 2) {
+            return true;
+        }
+        ulong status = generators[generator + G_STATUS];
+        if ((status != 0 && status != 1) ||
+            generators[generator + G_PAYLOAD] != event[E_PAYLOAD] ||
+            generators[generator + G_DEPARTURE] != event[E_TIME]) {
+            return true;
+        }
+
+        ulong scale_low;
+        ulong scale_high;
+        ulong tick_low;
+        ulong tick_high;
+        ulong bits_low = event[PK_SIZE] << 3;
+        ulong bits_high = event[PK_SIZE] >> 61;
+        ulong cost_low;
+        ulong cost_high;
+        if (!u128_from_mul_u64(
+                generators[generator + G_RATE_DENOMINATOR], 1000000000ul,
+                scale_low, scale_high) ||
+            !u128_from_mul_u64(
+                generators[generator + G_RATE_NUMERATOR],
+                generators[generator + G_RATE_INTERVAL], tick_low, tick_high) ||
+            !u128_mul(bits_low, bits_high, scale_low, scale_high, cost_low, cost_high)) {
+            set_semantic_error(error, 59, node);
+            return false;
+        }
+        ulong credit_low;
+        ulong credit_high;
+        if (!u128_add(
+                generators[generator + G_RATE_CREDIT_LOW],
+                generators[generator + G_RATE_CREDIT_HIGH], tick_low, tick_high,
+                credit_low, credit_high)) {
+            set_semantic_error(error, 59, node);
+            return false;
+        }
+        bool emitted = u128_at_least(credit_low, credit_high, cost_low, cost_high);
+        if (emitted) {
+            u128_sub(credit_low, credit_high, cost_low, cost_high, credit_low, credit_high);
+            if (generators[generator + G_PACKETS] == NONE ||
+                generators[generator + G_BYTES] > NONE - event[PK_SIZE] ||
+                node_state[node_base + N_COUNTER_0] == NONE) {
+                set_semantic_error(error, 59, node);
+                return false;
+            }
+            generators[generator + G_PACKETS] += 1;
+            generators[generator + G_BYTES] += event[PK_SIZE];
+            node_state[node_base + N_COUNTER_0] += 1;
+        }
+        generators[generator + G_RATE_CREDIT_LOW] = credit_low;
+        generators[generator + G_RATE_CREDIT_HIGH] = credit_high;
+
+        bool finished = generators[generator + G_BYTES] >= generators[generator + G_RATE_TOTAL];
+        ulong candidate = 0;
+        if (!finished && !checked_add(
+                event[E_TIME], generators[generator + G_RATE_INTERVAL], candidate)) {
+            set_semantic_error(error, 59, node);
+            return false;
+        }
+        if (!finished && candidate <= params[P_STOP_TIME]) {
+            ulong payload = event[PK_ID];
+            ulong size = event[PK_SIZE];
+            if (emitted) {
+                ulong sequence = node_state[node_base + N_NEXT_PAYLOAD];
+                if (sequence == NONE || sequence > (NONE - node) / params[P_NODE_COUNT]) {
+                    set_semantic_error(error, 59, node);
+                    return false;
+                }
+                payload = sequence * params[P_NODE_COUNT] + node;
+                node_state[node_base + N_NEXT_PAYLOAD] = sequence + 1;
+                ulong remaining = generators[generator + G_RATE_TOTAL] -
+                    generators[generator + G_BYTES];
+                size = min(generators[generator + G_RATE_PACKET_SIZE], remaining);
+            }
+            ulong next_bits_low = size << 3;
+            ulong next_bits_high = size >> 61;
+            ulong next_cost_low;
+            ulong next_cost_high;
+            if (!u128_mul(
+                    next_bits_low, next_bits_high, scale_low, scale_high,
+                    next_cost_low, next_cost_high)) {
+                set_semantic_error(error, 59, node);
+                return false;
+            }
+            ulong next_credit_low;
+            ulong next_credit_high;
+            bool next_scheduled = u128_add(
+                    credit_low, credit_high, tick_low, tick_high,
+                    next_credit_low, next_credit_high) &&
+                u128_at_least(next_credit_low, next_credit_high, next_cost_low, next_cost_high);
+            generators[generator + G_STATUS] = next_scheduled ? 0 : 1;
+            generators[generator + G_DEPARTURE] = candidate;
+            generators[generator + G_PAYLOAD] = payload;
+            ulong next_packet[EVENT_WORDS];
+            packet_clear(next_packet);
+            next_packet[PK_ID] = payload;
+            next_packet[PK_FLOW] = flow;
+            next_packet[PK_SIZE] = size;
+            next_packet[PK_KIND] = DATA_PACKET;
+            if (!emit_child(
+                    node, event, node, PACING_TIMER, candidate, next_packet, error, params,
+                    node_state, fel_meta, fel_records, remote_meta, remote_staging,
+                    stream_state, stream_records,
+                    tcp_state)) {
+                return false;
+            }
+        } else {
+            generators[generator + G_STATUS] = finished ? 2 : 3;
+            if (!finished) {
+                generators[generator + G_DEPARTURE] = candidate;
+            }
+        }
+
+        if (!emitted) {
+            return true;
+        }
+        ulong sourced_packet[EVENT_WORDS];
+        for (uint word = 0; word < EVENT_WORDS; ++word) {
+            sourced_packet[word] = event[word];
+        }
+        sourced_packet[E_PHASE] = 1;
+        if (!source_queue_insert(
+                node, sourced_packet, error, params, queue_meta, queue_records) ||
+            !record_sourced(
+                node, event, error, params, summary, observation_meta, observed)) {
+            return false;
+        }
+        if (node_state[node_base + N_SERVICE_VALID] == 0 &&
+            node_state[node_base + N_READY_PENDING] == 0) {
+            node_state[node_base + N_READY_PENDING] = 1;
+            return emit_child(
+                node, event, node, TX_READY, event[E_TIME], event, error, params,
+                node_state, fel_meta, fel_records, remote_meta, remote_staging,
+                stream_state, stream_records,
+                tcp_state);
+        }
+        return true;
+    }
+
+    if (kind == PACKET_ARRIVAL) {
+        if (role != HOST) {
+            set_semantic_error(error, 3, node);
+            return false;
+        }
+        ulong generator_base = event[PK_FLOW] * GENERATOR_WORDS;
+        bool owns_generator =
+            event[PK_FLOW] < params[P_FLOW_COUNT] &&
+            generators[generator_base] != 0 &&
+            generators[generator_base + 1] == node;
+        if (owns_generator && generators[generator_base + G_KIND] == 1) {
+            if (
+                generators[generator_base + G_STATUS] != 0 ||
+                generators[generator_base + G_DEPARTURE] != event[E_TIME] ||
+                generators[generator_base + G_PAYLOAD] != event[PK_ID] ||
+                (event[PK_KIND] & PK_KIND_MASK) != TCP_DATA_PACKET ||
+                event[PK_META_0] != generators[generator_base + G_TCP_NEXT] ||
+                event[PK_META_1] != event[E_TIME] ||
+                event[PK_META_2] != 0
+            ) {
+                set_semantic_error(error, 52, node);
+                return false;
+            }
+            if (
+                generators[generator_base + G_PACKETS] == NONE ||
+                generators[generator_base + G_BYTES] > NONE - event[PK_SIZE] ||
+                generators[generator_base + G_TCP_NEXT] > NONE - event[PK_SIZE] ||
+                generators[generator_base + G_TCP_FLIGHT] > NONE - event[PK_SIZE] ||
+                node_state[node_base + N_COUNTER_0] == NONE
+            ) {
+                set_semantic_error(error, 53, node);
+                return false;
+            }
+            generators[generator_base + G_PACKETS] += 1;
+            generators[generator_base + G_BYTES] += event[PK_SIZE];
+            generators[generator_base + G_TCP_NEXT] += event[PK_SIZE];
+            generators[generator_base + G_TCP_FLIGHT] += event[PK_SIZE];
+            generators[generator_base + G_TCP_LAST_ATTEMPT] = event[PK_ID];
+            generators[generator_base + G_OUTSTANDING] =
+                generators[generator_base + G_TCP_FLIGHT];
+            generators[generator_base + G_UNACKNOWLEDGED] =
+                generators[generator_base + G_TCP_FLIGHT];
+            generators[generator_base + G_STATUS] = 1;
+            node_state[node_base + N_COUNTER_0] += 1;
+            ulong sourced_packet[EVENT_WORDS];
+            for (uint word = 0; word < EVENT_WORDS; ++word) {
+                sourced_packet[word] = event[word];
+            }
+            sourced_packet[E_PHASE] = 1;
+            if (
+                !tcp_ledger_insert(event[PK_FLOW], event, error, params, tcp_state) ||
+                !source_queue_insert(
+                    node, sourced_packet, error, params, queue_meta, queue_records) ||
+                !record_sourced(
+                    node,
+                    event,
+                    error,
+                    params,
+                    summary,
+                    observation_meta,
+                    observed
+                )
+            ) {
+                return false;
+            }
+            return prepare_tcp_attempts(
+                node,
+                event[PK_FLOW],
+                event,
+                false,
+                0,
+                true,
+                false,
+                error,
+                params,
+                node_state,
+                generators,
+                fel_meta,
+                fel_records,
+                queue_meta,
+                queue_records,
+                remote_meta,
+                remote_staging,
+                stream_state,
+                stream_records,
+                summary,
+                observation_meta,
+                observed,
+                tcp_state
+            );
+        }
+        if (owns_generator) {
+            if (
+                generators[generator_base + 4] != 0 ||
+                generators[generator_base + 5] != event[E_TIME] ||
+                generators[generator_base + 6] != event[PK_ID]
+            ) {
+                set_semantic_error(error, 4, node);
+                return false;
+            }
+            if (
+                generators[generator_base + 2] == NONE ||
+                generators[generator_base + 3] > NONE - event[PK_SIZE]
+            ) {
+                set_semantic_error(error, 5, node);
+                return false;
+            }
+            generators[generator_base + 2] += 1;
+            generators[generator_base + 3] += event[PK_SIZE];
+
+            ulong candidate = 0;
+            bool semantic_next;
+            if (generators[generator_base + 15] == 0) {
+                semantic_next =
+                    generators[generator_base + 3] < generators[generator_base + 16];
+                if (
+                    semantic_next &&
+                    !checked_add(
+                        event[E_TIME],
+                        generators[generator_base + 13],
+                        candidate
+                    )
+                ) {
+                    set_semantic_error(error, 6, node);
+                    return false;
+                }
+            } else {
+                ulong end;
+                if (!checked_add(
+                    generators[generator_base + 12],
+                    generators[generator_base + 16],
+                    end
+                )) {
+                    set_semantic_error(error, 6, node);
+                    return false;
+                }
+                if (!checked_add(
+                    event[E_TIME],
+                    generators[generator_base + 13],
+                    candidate
+                )) {
+                    set_semantic_error(error, 6, node);
+                    return false;
+                }
+                semantic_next = candidate < end;
+            }
+            if (semantic_next && candidate <= params[P_STOP_TIME]) {
+                ulong sequence = node_state[node_base + N_NEXT_PAYLOAD];
+                if (sequence == NONE || sequence > (NONE - node) / params[P_NODE_COUNT]) {
+                    set_semantic_error(error, 7, node);
+                    return false;
+                }
+                ulong payload = sequence * params[P_NODE_COUNT] + node;
+                node_state[node_base + N_NEXT_PAYLOAD] = sequence + 1;
+                generators[generator_base + 4] = 0;
+                generators[generator_base + 5] = candidate;
+                generators[generator_base + 6] = payload;
+                ulong next_packet[EVENT_WORDS];
+                for (uint word = 0; word < EVENT_WORDS; ++word) {
+                    next_packet[word] = 0;
+                }
+                next_packet[PK_ID] = payload;
+                next_packet[PK_FLOW] = event[PK_FLOW];
+                next_packet[PK_SIZE] = generators[generator_base + 14];
+                next_packet[PK_KIND] = DATA_PACKET;
+                if (!emit_child(
+                    node,
+                    event,
+                    node,
+                    PACKET_ARRIVAL,
+                    candidate,
+                    next_packet,
+                    error,
+                    params,
+                    node_state,
+                    fel_meta,
+                    fel_records,
+                    remote_meta,
+                    remote_staging,
+                    stream_state,
+                    stream_records,
+                    tcp_state
+                )) {
+                    return false;
+                }
+            } else {
+                generators[generator_base + 4] = semantic_next ? 3 : 2;
+                if (semantic_next) {
+                    generators[generator_base + 5] = candidate;
+                }
+            }
+        }
+        if (node_state[node_base + N_COUNTER_0] == NONE) {
+            set_semantic_error(error, 8, node);
+            return false;
+        }
+        node_state[node_base + N_COUNTER_0] += 1;
+        ulong sourced_packet[EVENT_WORDS];
+        for (uint word = 0; word < EVENT_WORDS; ++word) {
+            sourced_packet[word] = event[word];
+        }
+        sourced_packet[E_PHASE] = 1;
+        if (!source_queue_insert(
+            node,
+            sourced_packet,
+            error,
+            params,
+            queue_meta,
+            queue_records
+        )) {
+            return false;
+        }
+        if (!record_sourced(
+            node,
+            event,
+            error,
+            params,
+            summary,
+            observation_meta,
+            observed
+        )) {
+            return false;
+        }
+        if (
+            node_state[node_base + N_SERVICE_VALID] == 0 &&
+            node_state[node_base + N_READY_PENDING] == 0
+        ) {
+            node_state[node_base + N_READY_PENDING] = 1;
+            if (!emit_child(
+                node,
+                event,
+                node,
+                TX_READY,
+                event[E_TIME],
+                event,
+                error,
+                params,
+                node_state,
+                fel_meta,
+                fel_records,
+                remote_meta,
+                remote_staging,
+                stream_state,
+                stream_records,
+                tcp_state
+            )) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (kind == TX_READY) {
+        node_state[node_base + N_READY_PENDING] = 0;
+        if (node_state[node_base + N_SERVICE_VALID] != 0) {
+            set_semantic_error(error, 9, node);
+            return false;
+        }
+        ulong selected[EVENT_WORDS];
+        ulong selected_physical;
+        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        ulong scheduler_kind = role == SWITCH
+            ? scheduler_state[scheduler_base + S_KIND]
+            : SCHED_FIFO;
+        ulong selected_position = 0;
+        bool selected_position_valid = true;
+        // PFC: while a priority is paused, selection runs over the eligible packets only, as the
+        // scalar eligible-packet plan does. With nothing eligible the decision point is a no-op.
+        // P15 host-link PFC: a host with egress pause state serves the first packet whose class is
+        // not paused, as a switch FIFO does (`host_pfc_start_eligible`).
+        ulong pfc_row = DAYS_MECHANISMS ? pfc_queue_row(node, params, scheduler_state) : NONE;
+        ulong paused_mask = DAYS_MECHANISMS && pfc_row != NONE
+            ? pfc_paused_mask(pfc_row, scheduler_state) : 0;
+        if (DAYS_MECHANISMS && paused_mask != 0) {
+            selected_position = pfc_first_eligible(
+                node, paused_mask, queue_meta, queue_records, params, scheduler_state);
+            if (selected_position == NONE) {
+                return true;
+            }
+        }
+        if (scheduler_kind == SCHED_DRR) {
+            selected_position_valid = drr_select_position(
+                node,
+                error,
+                queue_meta,
+                queue_records,
+                scheduler_state,
+                params,
+                paused_mask,
+                selected_position
+            );
+        } else if (scheduler_kind == SCHED_WRR) {
+            selected_position_valid = wrr_select_position(
+                node,
+                error,
+                queue_meta,
+                queue_records,
+                scheduler_state,
+                params,
+                paused_mask,
+                selected_position
+            );
+        }
+        if (!selected_position_valid) {
+            return false;
+        }
+        bool positional = scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR ||
+            (DAYS_MECHANISMS && paused_mask != 0);
+        bool wfq_tagged_removal =
+            DAYS_MECHANISMS && scheduler_kind == SCHED_WFQ && paused_mask != 0;
+        bool removed = DAYS_MECHANISMS && wfq_tagged_removal
+            ? wfq_remove_at(
+                node, selected_position, queue_meta, queue_records, scheduler_state, selected)
+            : positional
+            ? queue_remove_at(
+                node,
+                selected_position,
+                queue_meta,
+                queue_records,
+                selected,
+                selected_physical
+            )
+            : queue_pop(node, queue_meta, queue_records, selected, selected_physical);
+        if (!removed) {
+            if (scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR) {
+                set_semantic_error(error, 35, node);
+                return false;
+            }
+            return true;
+        }
+        if (role == SWITCH) {
+            ulong queue_base = node * QUEUE_META_WORDS;
+            ulong queued_bytes = queue_meta[queue_base + 4];
+            if (queued_bytes < selected[PK_SIZE]) {
+                set_semantic_error(error, 60, node);
+                return false;
+            }
+            queue_meta[queue_base + 4] = queued_bytes - selected[PK_SIZE];
+        }
+        if (role == SWITCH && scheduler_kind == SCHED_WFQ && !wfq_tagged_removal) {
+            ulong tag_offset = scheduler_state[scheduler_base + S_QUEUE_TAG_OFFSET];
+            rational_copy(
+                scheduler_state,
+                tag_offset + selected_physical * RATIONAL_WORDS,
+                scheduler_base + S_IN_SERVICE_TAG
+            );
+            rational_zero(
+                scheduler_state,
+                tag_offset + selected_physical * RATIONAL_WORDS
+            );
+        }
+        // PFC drain: the dequeued packet leaves its ingress monitor's occupancy, and crossing XON
+        // releases the pause with a resume frame, emitted before the transmission's children.
+        ulong resume_ingress = NONE;
+        ulong resume_priority = 0;
+        if (DAYS_MECHANISMS && role == SWITCH && pfc_row != NONE) {
+            resume_priority = pfc_packet_priority(selected, params, scheduler_state);
+            ulong incoming = packet_incoming_link(node, selected, flows, routes, links);
+            ulong ingress = incoming == NONE
+                ? NONE : pfc_enabled_ingress(pfc_row, incoming, resume_priority, scheduler_state);
+            if (ingress != NONE) {
+                ulong occupancy = scheduler_state[ingress + PI_OCCUPANCY + resume_priority];
+                if (occupancy < selected[PK_SIZE]) {
+                    set_semantic_error(error, 79, node);
+                    return false;
+                }
+                occupancy -= selected[PK_SIZE];
+                scheduler_state[ingress + PI_OCCUPANCY + resume_priority] = occupancy;
+                if (scheduler_state[ingress + PI_ASSERTED + resume_priority] != 0 &&
+                    occupancy <= scheduler_state[ingress + PI_XON + resume_priority]) {
+                    scheduler_state[ingress + PI_ASSERTED + resume_priority] = 0;
+                    resume_ingress = ingress;
+                }
+            }
+        }
+        node_state[node_base + N_SERVICE_VALID] = 1;
+        copy_thread_to_device(selected, in_service, node);
+        ulong egress = node_state[node_base + N_EGRESS];
+        if (egress == NONE || egress >= params[P_LINK_COUNT]) {
+            set_semantic_error(error, 10, node);
+            return false;
+        }
+        ulong link_base = egress * LINK_WORDS;
+        if (links[link_base] != node) {
+            set_semantic_error(error, 11, node);
+            return false;
+        }
+        ulong serialization;
+        if (!serialization_ns(selected[PK_SIZE], links[link_base + 2], serialization)) {
+            set_semantic_error(error, 12, node);
+            return false;
+        }
+        ulong departure_time;
+        ulong arrival_time;
+        if (
+            !checked_add(event[E_TIME], serialization, departure_time) ||
+            !checked_add(departure_time, links[link_base + 3], arrival_time)
+        ) {
+            set_semantic_error(error, 13, node);
+            return false;
+        }
+        ulong target;
+        if (!(DAYS_MECHANISMS
+                ? packet_remote_target_mechanisms(selected, egress, flows, routes, links, target)
+                : packet_remote_target(selected, egress, flows, routes, links, target))) {
+            set_semantic_error(error, 14, node);
+            return false;
+        }
+        if (DAYS_MECHANISMS && resume_ingress != NONE && !emit_pfc_frame(
+                node, event, resume_ingress, selected[PK_FLOW], resume_priority, 0, error,
+                params, node_state, scheduler_state, fel_meta, fel_records, remote_meta,
+                remote_staging, stream_state, stream_records, tcp_state)) {
+            return false;
+        }
+        if (!emit_child(
+            node,
+            event,
+            node,
+            TX_COMPLETE,
+            departure_time,
+            selected,
+            error,
+            params,
+            node_state,
+            fel_meta,
+            fel_records,
+            remote_meta,
+            remote_staging,
+            stream_state,
+            stream_records,
+            tcp_state
+        )) {
+            return false;
+        }
+        return emit_child(
+            node,
+            event,
+            target,
+            REMOTE_ARRIVAL,
+            arrival_time,
+            selected,
+            error,
+            params,
+            node_state,
+            fel_meta,
+            fel_records,
+            remote_meta,
+            remote_staging,
+            stream_state,
+            stream_records,
+            tcp_state
+        );
+    }
+
+    if (kind == TX_COMPLETE) {
+        if (
+            node_state[node_base + N_SERVICE_VALID] == 0 ||
+            in_service[node * EVENT_WORDS + PK_ID] != event[PK_ID]
+        ) {
+            set_semantic_error(error, 15, node);
+            return false;
+        }
+        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        if (role == SWITCH && scheduler_state[scheduler_base + S_KIND] == SCHED_WFQ) {
+            ulong egress = node_state[node_base + N_EGRESS];
+            if (
+                egress == NONE ||
+                egress >= params[P_LINK_COUNT] ||
+                !wfq_complete(
+                    node,
+                    event,
+                    links[egress * LINK_WORDS + 2],
+                    error,
+                    scheduler_state
+                )
+            ) {
+                return false;
+            }
+        }
+        node_state[node_base + N_SERVICE_VALID] = 0;
+        uint departure_counter = role == HOST ? N_COUNTER_1 : N_COUNTER_2;
+        if (node_state[node_base + departure_counter] == NONE) {
+            set_semantic_error(error, 16, node);
+            return false;
+        }
+        node_state[node_base + departure_counter] += 1;
+        if (!record_departure(
+            node,
+            event,
+            error,
+            params,
+            summary,
+            observation_meta,
+            observed,
+            departures
+        )) {
+            return false;
+        }
+        if (
+            queue_meta[node * QUEUE_META_WORDS + 3] != 0 &&
+            node_state[node_base + N_READY_PENDING] == 0
+        ) {
+            ulong next[EVENT_WORDS];
+            ulong pfc_row = DAYS_MECHANISMS ? pfc_queue_row(node, params, scheduler_state) : NONE;
+            if (DAYS_MECHANISMS && pfc_row != NONE) {
+                // PFC: the next decision point serves the first packet whose priority is unpaused;
+                // with none eligible, service waits for a resume.
+                ulong position = pfc_first_eligible(
+                    node, pfc_paused_mask(pfc_row, scheduler_state), queue_meta, queue_records,
+                    params, scheduler_state);
+                if (position == NONE) {
+                    return true;
+                }
+                pfc_copy_queue_record(node, position, queue_meta, queue_records, next);
+            } else if (!queue_front(node, queue_meta, queue_records, next)) {
+                set_semantic_error(error, 17, node);
+                return false;
+            }
+            node_state[node_base + N_READY_PENDING] = 1;
+            return emit_child(
+                node,
+                event,
+                node,
+                TX_READY,
+                event[E_TIME],
+                next,
+                error,
+                params,
+                node_state,
+                fel_meta,
+                fel_records,
+                remote_meta,
+                remote_staging,
+                stream_state,
+                stream_records,
+                tcp_state
+            );
+        }
+        return true;
+    }
+
+    if (kind == REMOTE_ARRIVAL && role == SWITCH) {
+        if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
+            return pfc_frame_arrival(
+                node, event, role, error, params, node_state, generators, queue_meta,
+                queue_records, scheduler_state, fel_meta, fel_records, remote_meta,
+                remote_staging, stream_state, stream_records, tcp_state);
+        }
+        if (node_state[node_base + N_COUNTER_0] == NONE) {
+            set_semantic_error(error, 18, node);
+            return false;
+        }
+        node_state[node_base + N_COUNTER_0] += 1;
+        ulong egress;
+        if (!(DAYS_MECHANISMS
+                ? packet_egress_mechanisms(node, event, flows, routes, links, egress)
+                : packet_egress(node, event, flows, routes, links, egress))) {
+            set_semantic_error(error, 19, node);
+            return false;
+        }
+        if (egress != node_state[node_base + N_EGRESS]) {
+            set_semantic_error(error, 20, node);
+            return false;
+        }
+        ulong semantic_capacity = node_state[node_base + N_SEMANTIC_QUEUE_CAPACITY];
+        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        // PFC: the monitor of the packet's incoming link, when it controls the packet's priority.
+        // Admission past its buffer capacity drops before any AQM decision.
+        ulong pfc_row =
+            DAYS_MECHANISMS ? pfc_queue_row(node, params, scheduler_state) : NONE;
+        ulong pfc_priority = 0;
+        ulong pfc_ingress = NONE;
+        if (DAYS_MECHANISMS && pfc_row != NONE) {
+            pfc_priority = pfc_packet_priority(event, params, scheduler_state);
+            ulong incoming = packet_incoming_link(node, event, flows, routes, links);
+            pfc_ingress = incoming == NONE
+                ? NONE : pfc_enabled_ingress(pfc_row, incoming, pfc_priority, scheduler_state);
+        }
+        ulong admission;
+        if (DAYS_MECHANISMS && pfc_ingress != NONE &&
+            (scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] >
+                NONE - event[PK_SIZE] ||
+             scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] + event[PK_SIZE] >
+                scheduler_state[pfc_ingress + PI_CAPACITY + pfc_priority])) {
+            admission = 2;
+        } else if (!switch_admission_action(
+            node,
+            event,
+            semantic_capacity,
+            error,
+            queue_meta,
+            scheduler_state,
+            admission
+        )) {
+            return false;
+        }
+        if (admission == 2) {
+            if (node_state[node_base + N_COUNTER_1] == NONE) {
+                set_semantic_error(error, 21, node);
+                return false;
+            }
+            node_state[node_base + N_COUNTER_1] += 1;
+            return record_arrival(
+                node,
+                event,
+                1,
+                error,
+                params,
+                summary,
+                observation_meta,
+                observed,
+                arrivals
+            );
+        }
+        // Admission marks only ECN-capable data, and only in the mechanisms build.
+        if (DAYS_MECHANISMS && admission == 1) {
+            event[PK_KIND] |= PK_ECN_FLAG;
+        }
+        ulong scheduler_kind = scheduler_state[scheduler_base + S_KIND];
+        bool inserted;
+        if (scheduler_kind == SCHED_FIFO) {
+            inserted = queue_push(node, event, error, params, queue_meta, queue_records);
+        } else if (scheduler_kind == SCHED_SP) {
+            inserted = sp_queue_insert(
+                node,
+                event,
+                error,
+                params,
+                queue_meta,
+                queue_records,
+                scheduler_state
+            );
+        } else if (scheduler_kind == SCHED_WFQ) {
+            inserted = wfq_enqueue(
+                node,
+                event,
+                links[egress * LINK_WORDS + 2],
+                error,
+                params,
+                queue_meta,
+                queue_records,
+                scheduler_state
+            );
+        } else if (scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR) {
+            inserted = queue_push(node, event, error, params, queue_meta, queue_records);
+        } else {
+            set_semantic_error(error, 32, node);
+            return false;
+        }
+        if (!inserted) {
+            return false;
+        }
+        ulong queue_base = node * QUEUE_META_WORDS;
+        ulong queued_bytes = queue_meta[queue_base + 4];
+        if (queued_bytes > NONE - event[PK_SIZE]) {
+            set_semantic_error(error, 60, node);
+            return false;
+        }
+        queue_meta[queue_base + 4] = queued_bytes + event[PK_SIZE];
+        if (!record_arrival(
+            node,
+            event,
+            0,
+            error,
+            params,
+            summary,
+            observation_meta,
+            observed,
+            arrivals
+        )) {
+            return false;
+        }
+        if (DAYS_MECHANISMS && pfc_ingress != NONE) {
+            // XOFF: the admitted bytes count against the monitor; reaching XOFF while unasserted
+            // pauses the upstream queue's priority, before this arrival's ready event.
+            ulong depth =
+                scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] + event[PK_SIZE];
+            scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] = depth;
+            if (depth >= scheduler_state[pfc_ingress + PI_XOFF + pfc_priority] &&
+                scheduler_state[pfc_ingress + PI_ASSERTED + pfc_priority] == 0) {
+                scheduler_state[pfc_ingress + PI_ASSERTED + pfc_priority] = 1;
+                if (!emit_pfc_frame(
+                        node, event, pfc_ingress, event[PK_FLOW], pfc_priority, 1, error,
+                        params, node_state, scheduler_state, fel_meta, fel_records,
+                        remote_meta, remote_staging, stream_state, stream_records,
+                        tcp_state)) {
+                    return false;
+                }
+            }
+        }
+        if (
+            egress != NONE &&
+            node_state[node_base + N_SERVICE_VALID] == 0 &&
+            node_state[node_base + N_READY_PENDING] == 0 &&
+            !(DAYS_MECHANISMS && pfc_row != NONE &&
+                pfc_priority_paused(pfc_row, pfc_priority, scheduler_state))
+        ) {
+            node_state[node_base + N_READY_PENDING] = 1;
+            return emit_child(
+                node,
+                event,
+                node,
+                TX_READY,
+                event[E_TIME],
+                event,
+                error,
+                params,
+                node_state,
+                fel_meta,
+                fel_records,
+                remote_meta,
+                remote_staging,
+                stream_state,
+                stream_records,
+                tcp_state
+            );
+        }
+        return true;
+    }
+
+    if (
+        kind == REMOTE_ARRIVAL &&
+        role == HOST &&
+        (event[PK_KIND] & PK_KIND_MASK) == TCP_DATA_PACKET
+    ) {
+        ulong flow = event[PK_FLOW];
+        ulong flow_base = flow * FLOW_WORDS;
+        ulong receiver = params[P_TCP_RECEIVER_OFFSET] + flow * TCP_RECEIVER_WORDS;
+        if (
+            flow >= params[P_FLOW_COUNT] ||
+            flows[flow_base + 1] != node ||
+            tcp_state[receiver] == 0 ||
+            tcp_state[receiver + 1] != node ||
+            event[PK_META_0] > NONE - event[PK_SIZE]
+        ) {
+            set_semantic_error(error, 54, node);
+            return false;
+        }
+        if (!tcp_receive_range(
+            flow,
+            event[PK_META_0],
+            event[PK_META_0] + event[PK_SIZE],
+            error,
+            params,
+            tcp_state
+        )) {
+            return false;
+        }
+        ulong ack_payload;
+        if (
+            !allocate_tcp_payload(node, node_state, params, ack_payload) ||
+            node_state[node_base + N_COUNTER_2] == NONE ||
+            node_state[node_base + N_COUNTER_0] == NONE
+        ) {
+            set_semantic_error(error, 55, node);
+            return false;
+        }
+        node_state[node_base + N_COUNTER_2] += 1;
+        node_state[node_base + N_COUNTER_0] += 1;
+        if (!record_arrival(
+            node,
+            event,
+            2,
+            error,
+            params,
+            summary,
+            observation_meta,
+            observed,
+            arrivals
+        )) {
+            return false;
+        }
+        ulong ack[EVENT_WORDS];
+        packet_clear(ack);
+        ack[E_TIME] = event[E_TIME];
+        ack[E_PHASE] = 1;
+        ack[PK_ID] = ack_payload;
+        ack[PK_FLOW] = flow;
+        ack[PK_SIZE] = tcp_state[receiver + 2];
+        ack[PK_KIND] = TCP_ACK_PACKET;
+        ack[PK_META_0] = tcp_state[receiver + 3];
+        ack[PK_META_1] = event[PK_SIZE];
+        ack[PK_META_2] = event[PK_META_1];
+        if (
+            !source_queue_insert(node, ack, error, params, queue_meta, queue_records) ||
+            !record_sourced(node, ack, error, params, summary, observation_meta, observed)
+        ) {
+            return false;
+        }
+        if (
+            node_state[node_base + N_SERVICE_VALID] == 0 &&
+            node_state[node_base + N_READY_PENDING] == 0
+        ) {
+            node_state[node_base + N_READY_PENDING] = 1;
+            return emit_child(
+                node,
+                event,
+                node,
+                TX_READY,
+                event[E_TIME],
+                ack,
+                error,
+                params,
+                node_state,
+                fel_meta,
+                fel_records,
+                remote_meta,
+                remote_staging,
+                stream_state,
+                stream_records,
+                tcp_state
+            );
+        }
+        return true;
+    }
+
+    if (
+        kind == REMOTE_ARRIVAL &&
+        role == HOST &&
+        (event[PK_KIND] & PK_KIND_MASK) == TCP_ACK_PACKET
+    ) {
+        ulong flow = event[PK_FLOW];
+        ulong flow_base = flow * FLOW_WORDS;
+        ulong generator = flow * GENERATOR_WORDS;
+        if (
+            flow >= params[P_FLOW_COUNT] ||
+            flows[flow_base] != node ||
+            generators[generator + G_VALID] == 0 ||
+            generators[generator + G_OWNER] != node ||
+            generators[generator + G_KIND] != 1
+        ) {
+            set_semantic_error(error, 56, node);
+            return false;
+        }
+        if (!record_arrival(
+            node,
+            event,
+            3,
+            error,
+            params,
+            summary,
+            observation_meta,
+            observed,
+            arrivals
+        )) {
+            return false;
+        }
+        if (generators[generator + G_FEEDBACK] == NONE) {
+            set_semantic_error(error, 57, node);
+            return false;
+        }
+        generators[generator + G_FEEDBACK] += 1;
+        ulong acknowledgment = min(event[PK_META_0], generators[generator + G_TCP_NEXT]);
+        ulong control[12];
+        for (uint word = 0; word < 12; ++word) {
+            control[word] = generators[generator + G_CONTROL + word];
+        }
+        bool processed_ack = false;
+        bool retransmit = false;
+        ulong retransmit_sequence = 0;
+        bool fill = false;
+        bool acknowledged_new = false;
+        ulong flight_before = generators[generator + G_TCP_FLIGHT];
+
+        if (acknowledgment > generators[generator + G_TCP_HIGHEST_ACK]) {
+            ulong acknowledged_bytes =
+                acknowledgment - generators[generator + G_TCP_HIGHEST_ACK];
+            ulong rtt_sample = event[E_TIME] >= event[PK_META_2]
+                ? max(event[E_TIME] - event[PK_META_2], 1ul)
+                : 1;
+            ulong srtt = generators[generator + G_TCP_SRTT];
+            ulong rtt_var = generators[generator + G_TCP_RTTVAR];
+            generators[generator + G_TCP_RTO] = update_rto(srtt, rtt_var, rtt_sample);
+            generators[generator + G_TCP_SRTT] = srtt;
+            generators[generator + G_TCP_RTTVAR] = rtt_var;
+            controller_new_ack(
+                control,
+                acknowledged_bytes,
+                event[E_TIME],
+                rtt_sample,
+                acknowledgment
+            );
+            generators[generator + G_TCP_FLIGHT] =
+                flight_before > acknowledged_bytes ? flight_before - acknowledged_bytes : 0;
+            generators[generator + G_TCP_HIGHEST_ACK] = acknowledgment;
+            generators[generator + G_TCP_DUP_ACKS] = 0;
+            if (generators[generator + G_TCP_TIMER_ACTIVE] != 0) {
+                if (!heap_remove_timer(
+                    node,
+                    flow,
+                    generators[generator + G_TCP_TIMER_ATTEMPT],
+                    generators[generator + G_TCP_TIMER_DEADLINE],
+                    error,
+                    params,
+                    fel_meta,
+                    fel_records,
+                    stream_state,
+                    tcp_state
+                )) {
+                    return false;
+                }
+                generators[generator + G_TCP_TIMER_ACTIVE] = 0;
+            }
+            if (
+                control[CTL_PHASE] == TCP_FAST_RECOVERY &&
+                acknowledgment < generators[generator + G_TCP_RECOVERY_HIGH]
+            ) {
+                retransmit = true;
+                retransmit_sequence = acknowledgment;
+            }
+            fill = acknowledgment < generators[generator + G_TCP_TOTAL];
+            acknowledged_new = true;
+            processed_ack = true;
+        } else if (
+            acknowledgment == generators[generator + G_TCP_HIGHEST_ACK] &&
+            acknowledgment < generators[generator + G_TCP_TOTAL] &&
+            flight_before != 0
+        ) {
+            ulong recovery_high = generators[generator + G_TCP_NEXT];
+            bool fast = controller_duplicate_ack(control, flight_before, event[E_TIME]);
+            generators[generator + G_TCP_DUP_ACKS] = control[CTL_DUP_ACKS];
+            if (fast) {
+                generators[generator + G_TCP_RECOVERY_HIGH] = recovery_high;
+                control[CTL_RECOVERY_HIGH] = recovery_high;
+                if (generators[generator + G_TCP_TIMER_ACTIVE] != 0) {
+                    if (!heap_remove_timer(
+                        node,
+                        flow,
+                        generators[generator + G_TCP_TIMER_ATTEMPT],
+                        generators[generator + G_TCP_TIMER_DEADLINE],
+                        error,
+                        params,
+                        fel_meta,
+                        fel_records,
+                        stream_state,
+                        tcp_state
+                    )) {
+                        return false;
+                    }
+                    generators[generator + G_TCP_TIMER_ACTIVE] = 0;
+                }
+                retransmit = true;
+                retransmit_sequence = acknowledgment;
+            } else if (generators[generator + G_TCP_DUP_ACKS] > 3) {
+                fill = true;
+            }
+            processed_ack = true;
+        }
+        for (uint word = 0; word < 12; ++word) {
+            generators[generator + G_CONTROL + word] = control[word];
+        }
+        generators[generator + G_OUTSTANDING] = generators[generator + G_TCP_FLIGHT];
+        generators[generator + G_UNACKNOWLEDGED] = generators[generator + G_TCP_FLIGHT];
+        if (
+            acknowledged_new &&
+            !tcp_ledger_acknowledge(flow, acknowledgment, error, params, tcp_state)
+        ) {
+            return false;
+        }
+        if (!processed_ack) {
+            return true;
+        }
+        bool scheduled = generators[generator + G_STATUS] == 0;
+        if (scheduled && !retransmit) {
+            return true;
+        }
+        return prepare_tcp_attempts(
+            node,
+            flow,
+            event,
+            retransmit,
+            retransmit_sequence,
+            fill && !scheduled,
+            scheduled,
+            error,
+            params,
+            node_state,
+            generators,
+            fel_meta,
+            fel_records,
+            queue_meta,
+            queue_records,
+            remote_meta,
+            remote_staging,
+            stream_state,
+            stream_records,
+            summary,
+            observation_meta,
+            observed,
+            tcp_state
+        );
+    }
+
+    // P15: a queue pair's timeout precedes the TCP handler, whose armed/owned check would fault on
+    // a timeout record a queue pair owns.
+    if (DAYS_MECHANISMS && kind == RETRANSMISSION_TIMEOUT && role == HOST &&
+        event[PK_FLOW] < params[P_FLOW_COUNT] &&
+        generators[event[PK_FLOW] * GENERATOR_WORDS + G_VALID] != 0 &&
+        generators[event[PK_FLOW] * GENERATOR_WORDS + G_KIND] == GENERATOR_KIND_ROCE) {
+        return roce_timeout(
+            node, event, popped_timer_owner, error, params, node_state, generators, fel_meta,
+            fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+    }
+
+    if (kind == RETRANSMISSION_TIMEOUT && role == HOST) {
+        ulong flow = event[PK_FLOW];
+        ulong generator = flow * GENERATOR_WORDS;
+        bool armed =
+            flow < params[P_FLOW_COUNT] &&
+            generators[generator + G_VALID] != 0 &&
+            generators[generator + G_OWNER] == node &&
+            generators[generator + G_KIND] == 1 &&
+            generators[generator + G_TCP_TIMER_ACTIVE] != 0 &&
+            generators[generator + G_TCP_TIMER_ATTEMPT] == event[E_PAYLOAD] &&
+            generators[generator + G_TCP_TIMER_DEADLINE] == event[E_TIME];
+        // Live-state contract (T20g item 2): the flow's owned heap record is live exactly when it
+        // matches the armed timer. Eager removal makes the two conditions equivalent, so any
+        // disagreement is a corrupted slot index rather than a modelling condition. A record owned
+        // by no flow is legacy import residue, which stays lazily recognized.
+        bool owned = popped_timer_owner != NONE && popped_timer_owner == flow;
+        if (armed != owned) {
+            set_semantic_error(error, 61, node);
+            return false;
+        }
+        if (!armed) {
+            return true;
+        }
+        generators[generator + G_TCP_TIMER_ACTIVE] = 0;
+        ulong control[12];
+        for (uint word = 0; word < 12; ++word) {
+            control[word] = generators[generator + G_CONTROL + word];
+        }
+        ulong flight = generators[generator + G_TCP_FLIGHT];
+        controller_timeout(control, flight);
+        for (uint word = 0; word < 12; ++word) {
+            generators[generator + G_CONTROL + word] = control[word];
+        }
+        generators[generator + G_TCP_RTO] = min(
+            saturating_mul_u64(generators[generator + G_TCP_TIMER_RTO], 2),
+            TCP_MAX_RTO
+        );
+        return prepare_tcp_attempts(
+            node,
+            flow,
+            event,
+            true,
+            generators[generator + G_TCP_HIGHEST_ACK],
+            false,
+            false,
+            error,
+            params,
+            node_state,
+            generators,
+            fel_meta,
+            fel_records,
+            queue_meta,
+            queue_records,
+            remote_meta,
+            remote_staging,
+            stream_state,
+            stream_records,
+            summary,
+            observation_meta,
+            observed,
+            tcp_state
+        );
+    }
+
+    if (kind == REMOTE_ARRIVAL && role == HOST) {
+        ulong flow_base = event[PK_FLOW] * FLOW_WORDS;
+        ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
+        // P15: queue-pair data at its receiver, ACK and NACK at its sender, and host-link PFC
+        // frames (switches pausing this host's egress).
+        if (DAYS_MECHANISMS && packet_kind == ROCE_DATA_PACKET) {
+            return roce_data_arrival(
+                node, event, error, params, node_state, flows, fel_meta, fel_records,
+                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
+                stream_records, summary, observation_meta, observed, arrivals, tcp_state);
+        }
+        if (DAYS_MECHANISMS &&
+            (packet_kind == ROCE_ACK_PACKET || packet_kind == ROCE_NACK_PACKET)) {
+            return roce_feedback_arrival(
+                node, event, packet_kind == ROCE_NACK_PACKET, error, params, node_state,
+                generators, flows, fel_meta, fel_records, remote_meta, remote_staging,
+                stream_state, stream_records, summary, observation_meta, observed, arrivals,
+                tcp_state);
+        }
+        // P16 H2: a stage notify's arrival (Scalar's `host_notify_arrival`): the stage pass after
+        // this event advances its successors by the chunk; nothing else is counted or observed.
+        if (DAYS_MECHANISMS && packet_kind == STAGE_NOTIFY_PACKET) {
+            if (event[PK_FLOW] >= params[P_FLOW_COUNT] || flows[flow_base + 1] != node) {
+                set_semantic_error(error, 106, node);
+                return false;
+            }
+            return true;
+        }
+        if (DAYS_MECHANISMS && packet_kind == PFC_PACKET) {
+            return pfc_frame_arrival(
+                node, event, role, error, params, node_state, generators, queue_meta,
+                queue_records, scheduler_state, fel_meta, fel_records, remote_meta,
+                remote_staging, stream_state, stream_records, tcp_state);
+        }
+        if (DAYS_MECHANISMS && packet_kind == DCQCN_CNP_PACKET) {
+            return dcqcn_cnp_arrival(
+                node, event, error, params, generators, flows, summary, observation_meta,
+                observed, arrivals);
+        }
+        if (DAYS_MECHANISMS && packet_kind == DATA_PACKET &&
+            event[PK_FLOW] < params[P_FLOW_COUNT] &&
+            flows[flow_base + 1] == node &&
+            tcp_state[params[P_TCP_RECEIVER_OFFSET] + event[PK_FLOW] * TCP_RECEIVER_WORDS] >=
+                DCQCN_RECEIVER_NO_CNP) {
+            return dcqcn_data_arrival(
+                node, event, error, params, node_state, fel_meta, fel_records, queue_meta,
+                queue_records, remote_meta, remote_staging, stream_state, stream_records,
+                summary, observation_meta, observed, arrivals, tcp_state);
+        }
+        ulong disposition = 2;
+        if (
+            (event[PK_KIND] & PK_KIND_MASK) == FEEDBACK_PACKET &&
+            event[PK_FLOW] < params[P_FLOW_COUNT] &&
+            generators[event[PK_FLOW] * GENERATOR_WORDS] != 0 &&
+            generators[event[PK_FLOW] * GENERATOR_WORDS + 1] == node
+        ) {
+            ulong generator_base = event[PK_FLOW] * GENERATOR_WORDS;
+            if (generators[generator_base + 8] == NONE) {
+                set_semantic_error(error, 22, node);
+                return false;
+            }
+            generators[generator_base + 8] += 1;
+            disposition = 3;
+        } else {
+            ulong expected =
+                ((event[PK_KIND] & PK_KIND_MASK) == DATA_PACKET ||
+                 (event[PK_KIND] & PK_KIND_MASK) == TCP_DATA_PACKET)
+                    ? flows[flow_base + 1]
+                    : flows[flow_base];
+            if (expected != node) {
+                set_semantic_error(error, 23, node);
+                return false;
+            }
+            if (node_state[node_base + N_COUNTER_2] == NONE) {
+                set_semantic_error(error, 24, node);
+                return false;
+            }
+            node_state[node_base + N_COUNTER_2] += 1;
+        }
+        return record_arrival(
+            node,
+            event,
+            disposition,
+            error,
+            params,
+            summary,
+            observation_meta,
+            observed,
+            arrivals
+        );
+    }
+
+    set_semantic_error(error, 25, node);
+    return false;
+}
+
+inline bool hydrate_tx_complete_event(
+    ulong node,
+    thread ulong *event,
+    device ulong *error,
+    const device ulong *in_service
+) {
+    if (event[E_KIND] != TX_COMPLETE) {
+        return true;
+    }
+    ulong service = node * EVENT_WORDS;
+    if (in_service[service + PK_ID] != event[E_PAYLOAD]) {
+        set_semantic_error(error, 15, node);
+        return false;
+    }
+    for (uint word = PK_ID; word <= PK_META_2; ++word) {
+        event[word] = in_service[service + word];
+    }
+    return true;
+}
+
+// T21 fix 2 — per-round FEL root cache accessors. Transliterated word for word from
+// `cuda_kernels.cu`; see that file's header for the read-set argument that makes the cache exact.
+static inline ulong round_scratch_cache(const device ulong *params) {
+    return params[P_ROUND_SCRATCH_OFFSET];
+}
+
+static inline void store_fel_root(
+    device ulong *stream_state,
+    const device ulong *params,
+    ulong node,
+    bool present,
+    ulong time
+) {
+    ulong slot = round_scratch_cache(params) + node * ROUND_SCRATCH_CACHE_WORDS;
+    stream_state[slot] = present ? time : 0;
+    stream_state[slot + 1] = present ? 1 : 0;
+}
+
+static inline bool load_fel_root(
+    const device ulong *stream_state,
+    const device ulong *params,
+    ulong node,
+    thread ulong &time
+) {
+    ulong slot = round_scratch_cache(params) + node * ROUND_SCRATCH_CACHE_WORDS;
+    time = stream_state[slot];
+    return stream_state[slot + 1] != 0;
+}
+
+// T21 fix 1 — the per-block reduction partials, `CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS`
+// words appended after the FEL-root cache in the same scratch region. Transliterated word for word
+// from `cuda_kernels.cu`.
+//
+// A sweep threadgroup writes ONLY its own row, and only from lane 0 after that threadgroup's own
+// `threadgroup_barrier`. A combine reads rows written by a PREVIOUS dispatch. There is therefore
+// no cross-threadgroup ordering to establish: the dispatch boundary establishes it. These are
+// plain `device ulong` accesses — deliberately NOT `volatile`, which is one of the two suspects
+// `evidence/P12/aterm-fixes.md` §3.3 named.
+static inline ulong round_scratch_partials(const device ulong *params) {
+    return params[P_ROUND_SCRATCH_OFFSET] +
+        params[P_NODE_COUNT] * ROUND_SCRATCH_CACHE_WORDS;
+}
+
+static inline void store_round_partial(
+    device ulong *stream_state,
+    const device ulong *params,
+    ulong block,
+    ulong slot,
+    ulong value
+) {
+    stream_state[
+        round_scratch_partials(params) +
+        block * ROUND_SCRATCH_PARTIAL_WORDS +
+        slot
+    ] = value;
+}
+
+static inline ulong load_round_partial(
+    const device ulong *stream_state,
+    const device ulong *params,
+    ulong block,
+    ulong slot
+) {
+    return stream_state[
+        round_scratch_partials(params) +
+        block * ROUND_SCRATCH_PARTIAL_WORDS +
+        slot
+    ];
+}
+
+// O1.4 — one count per threadgroup in the widest configurable per-LP grid. The host sizes this
+// tail to max(P_NODE_COUNT, 1), because one thread per threadgroup is the widest supported
+// geometry. Dispatch A writes every launched slot; Dispatch B reads only those values.
+static inline ulong round_scratch_compaction_counts(const device ulong *params) {
+    return round_scratch_partials(params) +
+        CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS;
+}
+
+static inline void store_compaction_count(
+    device ulong *stream_state,
+    const device ulong *params,
+    ulong block,
+    ulong value
+) {
+    stream_state[round_scratch_compaction_counts(params) + block] = value;
+}
+
+static inline ulong load_compaction_count(
+    const device ulong *stream_state,
+    const device ulong *params,
+    ulong block
+) {
+    return stream_state[round_scratch_compaction_counts(params) + block];
+}
+
+// T21 fix 1 — the horizon's Θ(N) FEL-root sweep, on the whole grid. Transliterated word for word
+// from `cuda_kernels.cu`; see that kernel's header for the partition-invariance argument.
+kernel void days_horizon_sweep(
+    const device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *fel_meta [[buffer(7)]],
+    const device ulong *fel_records [[buffer(8)]],
+    device ulong *stream_state [[buffer(25)]],
+    const device ulong *stream_records [[buffer(26)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
+) {
+    threadgroup ulong minima[1024];
+    threadgroup uint validity[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
+        return;
+    }
+    ulong first = ulong(block) * ulong(block_size) + ulong(lane);
+    ulong stride = ulong(blocks) * ulong(block_size);
+    ulong minimum = 0;
+    bool valid = false;
+    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+        ulong candidate;
+        bool present = fel_root_time(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            candidate
+        );
+        // T21 fix 2: the round's single evaluation of this node's FEL root.
+        store_fel_root(stream_state, params, node, present, candidate);
+        if (present && (!valid || candidate < minimum)) {
+            minimum = candidate;
+            valid = true;
+        }
+    }
+    minima[lane] = minimum;
+    validity[lane] = valid ? 1 : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+        if (lane < stride_lanes) {
+            if (
+                validity[lane + stride_lanes] != 0 &&
+                (
+                    validity[lane] == 0 ||
+                    minima[lane + stride_lanes] < minima[lane]
+                )
+            ) {
+                minima[lane] = minima[lane + stride_lanes];
+                validity[lane] = 1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        store_round_partial(stream_state, params, block, 0, minima[0]);
+        store_round_partial(stream_state, params, block, 1, ulong(validity[0]));
+    }
+}
+
+// T21 fix 1 — the horizon combine. Transliterated word for word from `cuda_kernels.cu`.
+kernel void days_horizon(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    threadgroup ulong minima[1024];
+    threadgroup uint validity[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
+        return;
+    }
+    ulong minimum = 0;
+    bool valid = false;
+    for (
+        ulong block = lane;
+        block < CONTROL_SWEEP_BLOCKS;
+        block += 1024
+    ) {
+        if (load_round_partial(stream_state, params, block, 1) == 0) {
+            continue;
+        }
+        ulong candidate = load_round_partial(stream_state, params, block, 0);
+        if (!valid || candidate < minimum) {
+            minimum = candidate;
+            valid = true;
+        }
+    }
+    minima[lane] = minimum;
+    validity[lane] = valid ? 1 : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 512; stride != 0; stride >>= 1) {
+        if (lane < stride) {
+            if (
+                validity[lane + stride] != 0 &&
+                (
+                    validity[lane] == 0 ||
+                    minima[lane + stride] < minima[lane]
+                )
+            ) {
+                minima[lane] = minima[lane + stride];
+                validity[lane] = 1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane != 0) {
+        return;
+    }
+    minimum = minima[0];
+    if (
+        validity[0] == 0 ||
+        (control[C_RUN_END_HI] == 0 && minimum >= control[C_RUN_END_LO])
+    ) {
+        control[C_DONE] = 1;
+        return;
+    }
+    control[C_FRONTIER] = minimum;
+    ulong horizon_lo = control[C_RUN_END_LO];
+    ulong horizon_hi = control[C_RUN_END_HI];
+    if (params[P_HAS_LOOKAHEAD] != 0) {
+        ulong candidate_lo = minimum + params[P_LOOKAHEAD];
+        ulong candidate_hi = candidate_lo < minimum ? 1 : 0;
+        if (
+            candidate_hi < horizon_hi ||
+            (candidate_hi == horizon_hi && candidate_lo < horizon_lo)
+        ) {
+            horizon_lo = candidate_lo;
+            horizon_hi = candidate_hi;
+        }
+    }
+    control[C_HORIZON_LO] = horizon_lo;
+    control[C_HORIZON_HI] = horizon_hi;
+}
+
+// O1.4 dispatch A — `days_round_prepare`'s Θ(N) + Θ(C) resets plus one eligible count per
+// configurable per-LP threadgroup. Transliterated from CUDA; see that kernel for the guard-snapshot
+// and disjointness arguments.
+kernel void days_round_reset(
+    const device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *lp_state [[buffer(18)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
+) {
+    threadgroup ulong counts[1024];
+    bool enabled = !(
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    );
+    if (!enabled) {
+        if (lane == 0) {
+            store_compaction_count(stream_state, params, block, NONE);
+        }
+        return;
+    }
+
+    ulong first = ulong(block) * ulong(block_size) + ulong(lane);
+    ulong stride = ulong(blocks) * ulong(block_size);
+    if (params[P_STREAMS_ENABLED] != 0) {
+        for (
+            ulong channel = first;
+            channel < params[P_CHANNEL_COUNT];
+            channel += stride
+        ) {
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            stream_state[batch] = 0;
+            stream_state[batch + 1] = NONE;
+            stream_state[batch + 2] = NONE;
+            stream_state[batch + 3] = 0;
+        }
+    }
+    ulong local_count = 0;
+    if (first < params[P_NODE_COUNT]) {
+        ulong node = first;
+        ulong state = node * LP_STATE_WORDS;
+        lp_state[state + L_ERROR] = 0;
+        lp_state[state + L_ERROR_ARENA] = 0;
+        lp_state[state + L_ERROR_NODE] = NONE;
+        lp_state[state + L_ERROR_CAPACITY] = 0;
+        lp_state[state + L_ERROR_DEMAND] = 0;
+        remote_meta[node * META_WORDS + 3] = 0;
+        ulong time;
+        local_count = ulong(
+            load_fel_root(stream_state, params, node, time) &&
+            before_horizon(time, control)
+        );
+    }
+
+    counts[lane] = local_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = 1; offset < block_size; offset <<= 1) {
+        ulong addend = lane >= offset ? counts[lane - offset] : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        counts[lane] += addend;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane + 1 == block_size) {
+        store_compaction_count(stream_state, params, block, counts[lane]);
+    }
+}
+
+// O1.4 dispatch B — stable write from counts and the guard snapshot published by Dispatch A.
+kernel void days_round_prepare(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *fel_meta [[buffer(7)]],
+    const device ulong *fel_records [[buffer(8)]],
+    device ulong *worklist [[buffer(13)]],
+    device ulong *lp_state [[buffer(18)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *stream_state [[buffer(25)]],
+    const device ulong *stream_records [[buffer(26)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
+) {
+    threadgroup ulong counts[1024];
+    threadgroup ulong block_base;
+    threadgroup ulong active_total;
+    ulong block_count = load_compaction_count(stream_state, params, block);
+    if (block_count == NONE) {
+        return;
+    }
+
+    ulong node = ulong(block) * ulong(block_size) + ulong(lane);
+    ulong local_count = 0;
+    if (node < params[P_NODE_COUNT]) {
+        ulong time;
+        if (
+            load_fel_root(stream_state, params, node, time) &&
+            before_horizon(time, control)
+        ) {
+            local_count += 1;
+        }
+    }
+
+    counts[lane] = local_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = 1; offset < block_size; offset <<= 1) {
+        ulong addend = lane >= offset ? counts[lane - offset] : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        counts[lane] += addend;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0) {
+        ulong base = 0;
+        ulong total = 0;
+        for (ulong candidate = 0; candidate < blocks; ++candidate) {
+            ulong count = load_compaction_count(stream_state, params, candidate);
+            if (candidate < block) {
+                base += count;
+            }
+            total += count;
+        }
+        block_base = base;
+        active_total = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (active_total > params[P_WORKLIST_CAPACITY]) {
+        if (block == 0 && lane == 0) {
+            control[C_ERROR] = ERROR_CAPACITY;
+            control[C_ERROR_ARENA] = ARENA_WORKLIST;
+            control[C_ERROR_NODE] = NONE;
+            control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
+            control[C_ERROR_DEMAND] = active_total;
+            device uint *drain_dispatch =
+                reinterpret_cast<device uint *>(control + C_INDIRECT_OFFSET_WORDS);
+            drain_dispatch[0] = 0;
+            drain_dispatch[1] = 1;
+            drain_dispatch[2] = 1;
+        }
+        return;
+    }
+
+    if (local_count != 0) {
+        ulong write = block_base + counts[lane] - local_count;
+        worklist[write] = node;
+        lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (lane == 0 && block + 1 == blocks) {
+        ulong active = active_total;
+        device uint *drain_dispatch =
+            reinterpret_cast<device uint *>(control + C_INDIRECT_OFFSET_WORDS);
+        control[C_ACTIVE] = active;
+        control[C_OUTBOX] = 0;
+        control[C_CONTINUATION] = 1;
+        drain_dispatch[0] = uint(
+            (active + params[P_ROUND_THREADS] - 1) / params[P_ROUND_THREADS]
+        );
+        drain_dispatch[1] = 1;
+        drain_dispatch[2] = 1;
+    }
+}
+
+kernel void days_round(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *node_state [[buffer(2)]],
+    device ulong *generators [[buffer(3)]],
+    const device ulong *flows [[buffer(4)]],
+    const device ulong *routes [[buffer(5)]],
+    const device ulong *links [[buffer(6)]],
+    device ulong *fel_meta [[buffer(7)]],
+    device ulong *fel_records [[buffer(8)]],
+    device ulong *queue_meta [[buffer(9)]],
+    device ulong *queue_records [[buffer(10)]],
+    device ulong *in_service [[buffer(11)]],
+    const device ulong *worklist [[buffer(13)]],
+    device ulong *summary [[buffer(14)]],
+    device ulong *observed [[buffer(15)]],
+    device ulong *departures [[buffer(16)]],
+    device ulong *arrivals [[buffer(17)]],
+    device ulong *lp_state [[buffer(18)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *remote_staging [[buffer(20)]],
+    device ulong *observation_meta [[buffer(21)]],
+    device ulong *stream_state [[buffer(25)]],
+    device ulong *stream_records [[buffer(26)]],
+    device ulong *scheduler_state [[buffer(27)]],
+    device ulong *tcp_state [[buffer(30)]],
+    uint active_index [[thread_position_in_grid]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 1 ||
+        active_index >= control[C_ACTIVE]
+    ) {
+        return;
+    }
+    ulong node = worklist[active_index];
+    device ulong *state = lp_state + node * LP_STATE_WORDS;
+    if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
+        return;
+    }
+
+    ulong dispatch_transitions = 0;
+    while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
+        ulong event[EVENT_WORDS];
+        ulong selected_active;
+        ulong selected_stream;
+        if (!fel_peek(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            event,
+            selected_active,
+            selected_stream
+        ) || !before_horizon(event[E_TIME], control)) {
+            state[L_FINISHED] = 1;
+            return;
+        }
+        ulong popped_timer_owner;
+        if (!fel_pop_selected(
+            node,
+            selected_active,
+            selected_stream,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            tcp_state,
+            event,
+            popped_timer_owner
+        )) {
+            set_semantic_error(state, 26, node);
+            return;
+        }
+        if (!hydrate_tx_complete_event(node, event, state, in_service)) {
+            return;
+        }
+        if (!dispatch_event(
+            node,
+            event,
+            popped_timer_owner,
+            state,
+            params,
+            node_state,
+            generators,
+            flows,
+            routes,
+            links,
+            fel_meta,
+            fel_records,
+            queue_meta,
+            queue_records,
+            in_service,
+            scheduler_state,
+            remote_meta,
+            remote_staging,
+            stream_state,
+            stream_records,
+            summary,
+            observation_meta,
+            observed,
+            departures,
+            arrivals,
+            tcp_state
+        )) {
+            return;
+        }
+        // P16 G1: the stage pass of this transition, after its own emissions.
+        if (DAYS_MECHANISMS && params[P_STAGE_OFFSET] != NONE && !stage_after_event(
+                node, event, state, params, node_state, generators, fel_meta, fel_records,
+                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
+                stream_records, summary, observation_meta, observed, tcp_state)) {
+            return;
+        }
+        if (state[L_TRANSITIONS] == NONE) {
+            set_semantic_error(state, 27, node);
+            return;
+        }
+        state[L_TRANSITIONS] += 1;
+        dispatch_transitions += 1;
+    }
+}
+
+// T21 fix 1 — the round-control scan, on the whole grid. Transliterated word for word from
+// `cuda_kernels.cu`; see that kernel's header for the partition-invariance argument.
+kernel void days_round_control_sweep(
+    const device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *worklist [[buffer(13)]],
+    const device ulong *lp_state [[buffer(18)]],
+    device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
+) {
+    threadgroup ulong first_errors[1024];
+    threadgroup uint unfinished_lanes[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 1
+    ) {
+        return;
+    }
+
+    ulong first = ulong(block) * ulong(block_size) + ulong(lane);
+    ulong stride = ulong(blocks) * ulong(block_size);
+    ulong first_error = NONE;
+    uint unfinished = 0;
+    for (ulong active = first; active < control[C_ACTIVE]; active += stride) {
+        ulong node = worklist[active];
+        ulong state = node * LP_STATE_WORDS;
+        if (first_error == NONE && lp_state[state + L_ERROR] != 0) {
+            first_error = node;
+        }
+        if (unfinished == 0 && lp_state[state + L_FINISHED] == 0) {
+            unfinished = 1;
+        }
+        if (first_error != NONE && unfinished != 0) {
+            break;
+        }
+    }
+    first_errors[lane] = first_error;
+    unfinished_lanes[lane] = unfinished;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+        if (lane < stride_lanes) {
+            first_errors[lane] = min(first_errors[lane], first_errors[lane + stride_lanes]);
+            unfinished_lanes[lane] |= unfinished_lanes[lane + stride_lanes];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        store_round_partial(stream_state, params, block, 0, first_errors[0]);
+        store_round_partial(
+            stream_state,
+            params,
+            block,
+            1,
+            ulong(unfinished_lanes[0])
+        );
+    }
+}
+
+// T21 fix 1 — the round-control combine. Transliterated word for word from `cuda_kernels.cu`.
+kernel void days_round_control(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *lp_state [[buffer(18)]],
+    const device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    threadgroup ulong first_errors[1024];
+    threadgroup uint unfinished_lanes[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 1
+    ) {
+        return;
+    }
+
+    ulong first_error = NONE;
+    uint unfinished = 0;
+    for (
+        ulong block = lane;
+        block < CONTROL_SWEEP_BLOCKS;
+        block += 1024
+    ) {
+        first_error = min(
+            first_error,
+            load_round_partial(stream_state, params, block, 0)
+        );
+        unfinished |= uint(load_round_partial(stream_state, params, block, 1) != 0);
+    }
+    first_errors[lane] = first_error;
+    unfinished_lanes[lane] = unfinished;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 512; stride != 0; stride >>= 1) {
+        if (lane < stride) {
+            first_errors[lane] = min(first_errors[lane], first_errors[lane + stride]);
+            unfinished_lanes[lane] |= unfinished_lanes[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane != 0) {
+        return;
+    }
+    if (first_errors[0] != NONE) {
+        ulong state = first_errors[0] * LP_STATE_WORDS;
+        control[C_ERROR] = lp_state[state + L_ERROR];
+        control[C_ERROR_ARENA] = lp_state[state + L_ERROR_ARENA];
+        control[C_ERROR_NODE] = lp_state[state + L_ERROR_NODE];
+        control[C_ERROR_CAPACITY] = lp_state[state + L_ERROR_CAPACITY];
+        control[C_ERROR_DEMAND] = lp_state[state + L_ERROR_DEMAND];
+    } else if (unfinished_lanes[0] != 0) {
+        control[C_RELAUNCHES] += 1;
+    } else {
+        control[C_CONTINUATION] = 2;
+    }
+}
+
+// T21 fix 1 — the exchange-prefix STREAMS scan, on the whole grid. Transliterated word for word
+// from `cuda_kernels.cu`; see that kernel's header, which also records that this is the kernel the
+// FIRST attempt's in-dispatch combine failed in.
+kernel void days_exchange_prefix_sweep(
+    const device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *remote_staging [[buffer(20)]],
+    device ulong *stream_state [[buffer(25)]],
+    const device ulong *stream_records [[buffer(26)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
+) {
+    threadgroup ulong sums[1024];
+    threadgroup uint exceeded[1024];
+    threadgroup ulong failures[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2 ||
+        params[P_STREAMS_ENABLED] == 0
+    ) {
+        return;
+    }
+
+    // Braced so the per-channel body below stays a line-for-line copy of the pre-T21 kernel's,
+    // including the `capacity` the stream header shadows inside the loop.
+    {
+        ulong capacity = params[P_OUTBOX_CAPACITY];
+        ulong local_sum = 0;
+        uint local_exceeded = 0;
+        ulong local_failure = NONE;
+        ulong first = ulong(block) * ulong(block_size) + ulong(lane);
+        ulong grid_stride = ulong(blocks) * ulong(block_size);
+        for (
+            ulong channel = first;
+            channel < params[P_CHANNEL_COUNT];
+            channel += grid_stride
+        ) {
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            ulong batch_count = stream_state[batch];
+            local_sum = saturating_add_ulong(local_sum, batch_count);
+            local_exceeded |= uint(local_sum > capacity);
+            stream_state[batch + 3] = 0;
+            ulong stream_base = channel * META_WORDS;
+            ulong capacity = stream_state[stream_base + 1];
+            ulong count = stream_state[stream_base + 3];
+            bool invalid_capacity =
+                count > capacity || batch_count > capacity - min(count, capacity);
+            bool invalid_order = false;
+            if (
+                params[P_STREAM_ORDER_CHECKS] != 0 &&
+                !invalid_capacity &&
+                batch_count != 0
+            ) {
+                ulong first_slot = stream_state[batch + 1];
+                invalid_order = before_horizon(
+                    remote_staging[
+                        first_slot * REMOTE_STAGING_EVENT_WORDS + E_TIME
+                    ],
+                    control
+                );
+                if (!invalid_order && count != 0) {
+                    ulong head = stream_state[stream_base + 2];
+                    ulong tail = (head + count - 1) % max(capacity, 1ul);
+                    invalid_order = !stored_word_cross_key_less(
+                        stream_records,
+                        stream_record_offset(
+                            channel,
+                            tail,
+                            params,
+                            stream_state
+                        ),
+                        remote_staging,
+                        first_slot * REMOTE_STAGING_EVENT_WORDS
+                    );
+                }
+            }
+            if ((invalid_capacity || invalid_order) && channel < local_failure) {
+                local_failure = channel;
+            }
+        }
+        sums[lane] = local_sum;
+        exceeded[lane] = local_exceeded;
+        failures[lane] = local_failure;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 512; stride != 0; stride >>= 1) {
+            if (lane < stride) {
+                ulong right_sum = sums[lane + stride];
+                uint combined_exceeded =
+                    exceeded[lane] | exceeded[lane + stride];
+                ulong combined_sum = saturating_add_ulong(sums[lane], right_sum);
+                combined_exceeded |= uint(combined_sum > capacity);
+                sums[lane] = combined_sum;
+                exceeded[lane] = combined_exceeded;
+                failures[lane] = min(failures[lane], failures[lane + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) {
+            store_round_partial(stream_state, params, block, 0, sums[0]);
+            store_round_partial(stream_state, params, block, 1, ulong(exceeded[0]));
+            store_round_partial(stream_state, params, block, 2, failures[0]);
+        }
+    }
+}
+
+// T21 fix 1 — the exchange-prefix combine, plus the legacy node-ordered prefix scan.
+// Transliterated word for word from `cuda_kernels.cu`.
+kernel void days_exchange_prefix(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    threadgroup ulong sums[1024];
+    threadgroup uint exceeded[1024];
+    threadgroup ulong failures[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+
+    if (params[P_STREAMS_ENABLED] != 0) {
+        ulong capacity = params[P_OUTBOX_CAPACITY];
+        ulong local_sum = 0;
+        uint local_exceeded = 0;
+        ulong local_failure = NONE;
+        for (
+            ulong block = lane;
+            block < CONTROL_SWEEP_BLOCKS;
+            block += 1024
+        ) {
+            local_sum = saturating_add_ulong(
+                local_sum,
+                load_round_partial(stream_state, params, block, 0)
+            );
+            local_exceeded |= uint(
+                load_round_partial(stream_state, params, block, 1) != 0
+            );
+            local_exceeded |= uint(local_sum > capacity);
+            local_failure = min(
+                local_failure,
+                load_round_partial(stream_state, params, block, 2)
+            );
+        }
+        sums[lane] = local_sum;
+        exceeded[lane] = local_exceeded;
+        failures[lane] = local_failure;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 512; stride != 0; stride >>= 1) {
+            if (lane < stride) {
+                ulong right_sum = sums[lane + stride];
+                uint combined_exceeded =
+                    exceeded[lane] | exceeded[lane + stride];
+                ulong combined_sum = saturating_add_ulong(sums[lane], right_sum);
+                combined_exceeded |= uint(combined_sum > capacity);
+                sums[lane] = combined_sum;
+                exceeded[lane] = combined_exceeded;
+                failures[lane] = min(failures[lane], failures[lane + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) {
+            control[C_OUTBOX] = sums[0];
+            ulong failure = failures[0];
+            if (exceeded[0] != 0) {
+                control[C_ERROR] = ERROR_CAPACITY;
+                control[C_ERROR_ARENA] = ARENA_OUTBOX;
+                control[C_ERROR_NODE] = NONE;
+                control[C_ERROR_CAPACITY] = capacity;
+                control[C_ERROR_DEMAND] = sums[0];
+            } else if (failure != NONE) {
+                ulong batch =
+                    params[P_CHANNEL_BATCH_OFFSET] +
+                    failure * CHANNEL_BATCH_WORDS;
+                ulong stream_base = failure * META_WORDS;
+                ulong capacity = stream_state[stream_base + 1];
+                ulong count = stream_state[stream_base + 3];
+                ulong batch_count = stream_state[batch];
+                control[C_ERROR_NODE] =
+                    stream_state[params[P_CHANNEL_TARGET_OFFSET] + failure];
+                if (
+                    count > capacity ||
+                    batch_count > capacity - min(count, capacity)
+                ) {
+                    control[C_ERROR] = ERROR_CAPACITY;
+                    control[C_ERROR_ARENA] = ARENA_CHANNEL_INBOX;
+                    control[C_ERROR_CAPACITY] = capacity;
+                    control[C_ERROR_DEMAND] = saturating_add_ulong(count, batch_count);
+                } else {
+                    control[C_ERROR] = ERROR_SEMANTIC + 42;
+                }
+            }
+        }
+        return;
+    }
+
+    ulong producers = params[P_NODE_COUNT];
+    ulong capacity = params[P_OUTBOX_CAPACITY];
+    ulong chunk = producers / 1024;
+    ulong remainder = producers % 1024;
+    ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
+    ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
+    ulong local_sum = 0;
+    uint local_exceeded = 0;
+    for (ulong producer = start; producer < end; ++producer) {
+        ulong base = producer * META_WORDS;
+        ulong count = remote_meta[base + 3];
+        local_sum = saturating_add_ulong(local_sum, count);
+        local_exceeded |= uint(local_sum > capacity);
+    }
+
+    sums[lane] = local_sum;
+    exceeded[lane] = local_exceeded;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = 1; offset < 1024; offset <<= 1) {
+        ulong left_sum = lane >= offset ? sums[lane - offset] : 0;
+        uint left_exceeded = lane >= offset ? exceeded[lane - offset] : 0;
+        ulong own_sum = sums[lane];
+        uint own_exceeded = exceeded[lane];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane >= offset) {
+            uint combined_exceeded = left_exceeded | own_exceeded;
+            ulong combined_sum = saturating_add_ulong(left_sum, own_sum);
+            combined_exceeded |= uint(combined_sum > capacity);
+            sums[lane] = combined_sum;
+            exceeded[lane] = combined_exceeded;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0 && exceeded[1023] != 0) {
+        control[C_ERROR] = ERROR_CAPACITY;
+        control[C_ERROR_ARENA] = ARENA_OUTBOX;
+        control[C_ERROR_NODE] = NONE;
+        control[C_ERROR_CAPACITY] = capacity;
+        control[C_ERROR_DEMAND] = sums[1023];
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (exceeded[1023] != 0) {
+        return;
+    }
+
+    ulong write = sums[lane] - local_sum;
+    for (ulong producer = start; producer < end; ++producer) {
+        ulong base = producer * META_WORDS;
+        remote_meta[base + 2] = write;
+        write += remote_meta[base + 3];
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        control[C_OUTBOX] = sums[1023];
+    }
+}
+
+inline ulong scatter_simd_broadcast_ulong(ulong value) {
+    uint low = simd_broadcast(uint(value), 0);
+    uint high = simd_broadcast(uint(value >> 32), 0);
+    return ulong(low) | (ulong(high) << 32);
+}
+
+inline ulong scatter_stream_target(
+    ulong staging_slot,
+    const device ulong *params,
+    device ulong *stream_state
+) {
+    ulong channel =
+        stream_state[params[P_STAGING_CHANNEL_OFFSET] + staging_slot];
+    ulong batch =
+        params[P_CHANNEL_BATCH_OFFSET] +
+        channel * CHANNEL_BATCH_WORDS;
+    ulong cursor = stream_state[batch + 3];
+    ulong stream_base = channel * META_WORDS;
+    ulong capacity = stream_state[stream_base + 1];
+    ulong physical = (
+        stream_state[stream_base + 2] +
+        stream_state[stream_base + 3] +
+        cursor
+    ) % max(capacity, 1ul);
+    stream_state[batch + 3] = cursor + 1;
+    return stream_state[stream_base] + physical * CHANNEL_EVENT_WORDS;
+}
+
+inline void scatter_stream_commit(
+    ulong producer,
+    const device ulong *params,
+    device ulong *stream_state
+) {
+    ulong outbound_meta =
+        params[P_OUTBOUND_META_OFFSET] + producer * OUTBOUND_META_WORDS;
+    ulong entry = stream_state[outbound_meta];
+    ulong entry_count = stream_state[outbound_meta + 1];
+    for (ulong index = 0; index < entry_count; ++index) {
+        ulong channel =
+            stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
+        ulong batch =
+            params[P_CHANNEL_BATCH_OFFSET] + channel * CHANNEL_BATCH_WORDS;
+        ulong count = stream_state[channel * META_WORDS + 3] + stream_state[batch];
+        stream_state[channel * META_WORDS + 3] = count;
+        RECORD_STREAM_HIGH_WATER(params, stream_state, channel, count);
+    }
+}
+
+inline void scatter_stream_producer_lane(
+    ulong producer,
+    ulong count,
+    const device ulong *params,
+    const device ulong *remote_meta,
+    const device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records
+) {
+    ulong base = producer * META_WORDS;
+    ulong staging = remote_meta[base];
+    for (ulong index = 0; index < count; ++index) {
+        ulong target =
+            scatter_stream_target(staging + index, params, stream_state);
+        copy_staging_to_channel(
+            remote_staging,
+            staging + index,
+            stream_records,
+            target
+        );
+    }
+    scatter_stream_commit(producer, params, stream_state);
+}
+
+kernel void days_exchange_scatter(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *outbox [[buffer(12)]],
+    const device ulong *worklist [[buffer(13)]],
+    const device ulong *remote_meta [[buffer(19)]],
+    const device ulong *remote_staging [[buffer(20)]],
+    device ulong *stream_state [[buffer(25)]],
+    device ulong *stream_records [[buffer(26)]],
+    uint global_thread [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint group_in_block [[simdgroup_index_in_threadgroup]],
+    uint groups_per_block [[simdgroups_per_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint blocks [[threadgroups_per_grid]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+    if (params[P_STREAMS_ENABLED] != 0) {
+        // Counts below three fit in at most one two-record copy cluster. Keep
+        // those producers on the original lane mapping so one SIMD group can
+        // advance one producer per lane concurrently.
+        if (global_thread < params[P_NODE_COUNT]) {
+            ulong producer = global_thread;
+            ulong count = remote_meta[producer * META_WORDS + 3];
+            if (count < SCATTER_COOPERATIVE_MIN_RECORDS) {
+                scatter_stream_producer_lane(
+                    producer,
+                    count,
+                    params,
+                    remote_meta,
+                    remote_staging,
+                    stream_state,
+                    stream_records
+                );
+            }
+        }
+
+        // Long producers retain one cooperative SIMD group each. The worklist
+        // is deterministic and unique; the count predicate makes the lane and
+        // cooperative traversals disjoint.
+        ulong group = ulong(block) * groups_per_block + group_in_block;
+        ulong group_stride = ulong(blocks) * groups_per_block;
+        for (
+            ulong active_index = group;
+            active_index < control[C_ACTIVE];
+            active_index += group_stride
+        ) {
+            ulong producer = worklist[active_index];
+            ulong count = 0;
+            if (lane == 0) {
+                count = remote_meta[producer * META_WORDS + 3];
+            }
+            count = scatter_simd_broadcast_ulong(count);
+
+            if (count >= SCATTER_COOPERATIVE_MIN_RECORDS) {
+                ulong staging = 0;
+                if (lane == 0) {
+                    staging = remote_meta[producer * META_WORDS];
+                }
+                staging = scatter_simd_broadcast_ulong(staging);
+                for (ulong index = 0; index < count; index += 2) {
+                    ulong first_target = 0;
+                    ulong second_target = 0;
+                    if (lane == 0) {
+                        first_target = scatter_stream_target(
+                            staging + index,
+                            params,
+                            stream_state
+                        );
+                        if (index + 1 < count) {
+                            second_target = scatter_stream_target(
+                                staging + index + 1,
+                                params,
+                                stream_state
+                            );
+                        }
+                    }
+                    first_target = scatter_simd_broadcast_ulong(first_target);
+                    second_target = scatter_simd_broadcast_ulong(second_target);
+
+                    if (lane < 2 * CHANNEL_EVENT_WORDS) {
+                        ulong record = lane / CHANNEL_EVENT_WORDS;
+                        uint word = lane % CHANNEL_EVENT_WORDS;
+                        if (index + record < count) {
+                            ulong source_slot = staging + index + record;
+                            ulong target_word =
+                                record == 0 ? first_target : second_target;
+                            ulong source_word = source_slot * REMOTE_STAGING_EVENT_WORDS +
+                                (word < 4 ? word : word + 1);
+                            stream_records[target_word + word] =
+                                remote_staging[source_word];
+                        }
+                    }
+                }
+
+                if (lane == 0) {
+                    scatter_stream_commit(producer, params, stream_state);
+                }
+            }
+        }
+        return;
+    }
+    if (global_thread >= params[P_NODE_COUNT]) {
+        return;
+    }
+    ulong producer = global_thread;
+    ulong base = ulong(producer) * META_WORDS;
+    ulong staging = remote_meta[base];
+    ulong compact = remote_meta[base + 2];
+    ulong count = remote_meta[base + 3];
+    for (ulong index = 0; index < count; ++index) {
+        copy_device_record(
+            remote_staging,
+            staging + index,
+            outbox,
+            compact + index
+        );
+    }
+}
+
+#ifdef DAYS_MERGE_AUDIT
+// P17 merge (test hooks only): transliteration of `merge_audit` in `cuda_kernels.cu`; see that
+// function's header for invariant E and why the per-LP checks plus the two global sums prove the
+// list is the full rebuild's set.
+void merge_audit(
+    ulong node,
+    const device ulong *params,
+    const device ulong *fel_meta,
+    const device ulong *fel_records,
+    device ulong *stream_state,
+    const device ulong *stream_records
+) {
+    ulong meta = params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong declared = stream_state[meta];
+    ulong declared_count = stream_state[meta + 1];
+    ulong active = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    ulong mismatches = 0;
+    ulong stream_entries = 0;
+    ulong none_entries = 0;
+    bool heap = fel_meta[node * META_WORDS + 3] != 0;
+    if (count > declared_count + 1) {
+        mismatches += 1;
+        count = declared_count + 1;
+    }
+    for (ulong index = 0; index < count; ++index) {
+        ulong entry = active + index * ACTIVE_STREAM_ENTRY_WORDS;
+        ulong stream = stream_state[entry];
+        for (ulong earlier = 0; earlier < index; ++earlier) {
+            if (stream_state[active + earlier * ACTIVE_STREAM_ENTRY_WORDS] == stream) {
+                mismatches += 1;
+            }
+        }
+        ulong record = NONE;
+        bool from_heap = false;
+        if (stream == NONE) {
+            none_entries += 1;
+            if (heap) {
+                record = fel_meta[node * META_WORDS] * EVENT_WORDS;
+                from_heap = true;
+            }
+        } else {
+            stream_entries += 1;
+            bool owned = false;
+            if (stream < params[P_SERVICE_STREAM_BASE]) {
+                for (ulong slot = 0; slot < declared_count; ++slot) {
+                    ulong declared_stream = stream_state[declared + slot];
+                    if (declared_stream >= params[P_SERVICE_STREAM_BASE]) {
+                        break;
+                    }
+                    owned = owned || declared_stream == stream;
+                }
+            } else if (stream < params[P_GENERATOR_STREAM_BASE]) {
+                owned = stream == params[P_SERVICE_STREAM_BASE] + node;
+            } else if (stream < params[P_STREAM_COUNT]) {
+                // The hooks region's per-flow source table follows the LP rows.
+                owned = stream_state[
+                    params[P_MERGE_AUDIT_OFFSET] +
+                    params[P_NODE_COUNT] * MERGE_AUDIT_WORDS +
+                    stream - params[P_GENERATOR_STREAM_BASE]
+                ] == node;
+            }
+            if (owned && stream_state[stream * META_WORDS + 3] != 0) {
+                ulong capacity = stream_state[stream * META_WORDS + 1];
+                ulong physical = stream_state[stream * META_WORDS + 2] % max(capacity, 1ul);
+                record = stream_record_offset(stream, physical, params, stream_state);
+            }
+        }
+        if (record == NONE) {
+            mismatches += 1;
+            continue;
+        }
+        for (uint word = 0; word < 4; ++word) {
+            ulong expected = from_heap ? fel_records[record + word] : stream_records[record + word];
+            if (stream_state[entry + 1 + word] != expected) {
+                mismatches += 1;
+                break;
+            }
+        }
+    }
+    if (heap != (none_entries != 0)) {
+        mismatches += 1;
+    }
+    if (heap && stream_state[active] != NONE) {
+        mismatches += 1;
+    }
+    ulong nonempty = 0;
+    for (
+        ulong stream = node;
+        stream < params[P_STREAM_COUNT];
+        stream += params[P_NODE_COUNT]
+    ) {
+        nonempty += ulong(stream_state[stream * META_WORDS + 3] != 0);
+    }
+    RECORD_MERGE(params, stream_state, node, MA_MISMATCHES, mismatches);
+    RECORD_MERGE(params, stream_state, node, MA_NONEMPTY_STREAMS, nonempty);
+    RECORD_MERGE(params, stream_state, node, MA_STREAM_ENTRIES, stream_entries);
+}
+#endif
+
+kernel void days_exchange_merge(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *fel_meta [[buffer(7)]],
+    device ulong *fel_records [[buffer(8)]],
+    const device ulong *outbox [[buffer(12)]],
+    device ulong *lp_state [[buffer(18)]],
+    const device ulong *remote_meta [[buffer(19)]],
+    const device ulong *inbound_meta [[buffer(22)]],
+    const device ulong *inbound_producers [[buffer(23)]],
+    device ulong *merge_cursors [[buffer(24)]],
+    device ulong *stream_state [[buffer(25)]],
+    const device ulong *stream_records [[buffer(26)]],
+    device ulong *tcp_state [[buffer(30)]],
+    uint target [[thread_position_in_grid]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2 ||
+        target >= params[P_NODE_COUNT]
+    ) {
+        return;
+    }
+    if (params[P_STREAMS_ENABLED] != 0) {
+        // P17 merge (`days-gpu/evidence/P17/merge/design.md`): processing keeps the LP's active
+        // list exact for every local push, pop and timer removal; only the scatter's remote
+        // delivery leaves a channel that went from empty to non-empty without an entry. So the
+        // merge keeps the maintained list and appends exactly those channels.
+        //
+        // A channel's batch word counts the records its unique producer appended this round
+        // (zeroed by the reset), and the scatter added it to the channel's count. `count == batch`
+        // with `batch != 0` therefore means the channel was empty after processing and is
+        // non-empty now, which by the list invariant is exactly a channel without an entry.
+        // The LP's stream list holds its inbound channels, ascending, then its service stream;
+        // `stream_state[meta + 1]` counts every stream the LP owns, generators included.
+        //
+        // The list's order is not canonical: every reader is order-independent (event keys are
+        // unique; `fel_peek` takes a strict minimum, the continuation predicate is universal),
+        // and the list is device scratch, never read back. The heap entry is moved back to index
+        // 0, where every merge left it before P17, so `active_find(NONE)` costs what it did.
+        //
+        // No capacity check: the list holds at most one entry per stream the LP owns plus the
+        // heap entry, and its region holds `stream_state[meta + 1] + 1` entries.
+        ulong meta =
+            params[P_LP_STREAM_META_OFFSET] +
+            ulong(target) * LP_STREAM_META_WORDS;
+        ulong declared = stream_state[meta];
+        ulong declared_count = stream_state[meta + 1];
+        ulong active = stream_state[meta + 2];
+        ulong active_count = stream_state[meta + 3];
+        RECORD_MERGE(params, stream_state, target, MA_INVOCATIONS, 1);
+        if (
+            active_count > 1 &&
+            fel_meta[ulong(target) * META_WORDS + 3] != 0 &&
+            stream_state[active] != NONE
+        ) {
+            for (ulong index = 1; index < active_count; ++index) {
+                ulong entry = active + index * ACTIVE_STREAM_ENTRY_WORDS;
+                if (stream_state[entry] == NONE) {
+                    for (uint word = 0; word < ACTIVE_STREAM_ENTRY_WORDS; ++word) {
+                        ulong value = stream_state[active + word];
+                        stream_state[active + word] = stream_state[entry + word];
+                        stream_state[entry + word] = value;
+                    }
+                    break;
+                }
+            }
+        }
+        for (ulong index = 0; index < declared_count; ++index) {
+            ulong stream = stream_state[declared + index];
+            RECORD_MERGE(params, stream_state, target, MA_STREAMS_READ, 1);
+            if (stream >= params[P_SERVICE_STREAM_BASE]) {
+                break;
+            }
+            ulong batch = stream_state[
+                params[P_CHANNEL_BATCH_OFFSET] + stream * CHANNEL_BATCH_WORDS
+            ];
+            ulong stream_base = stream * META_WORDS;
+            if (batch != 0 && stream_state[stream_base + 3] == batch) {
+                ulong entry = active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
+                active_count += 1;
+                RECORD_MERGE(params, stream_state, target, MA_APPENDED, 1);
+                stream_state[entry] = stream;
+                ulong capacity = stream_state[stream_base + 1];
+                ulong physical = stream_state[stream_base + 2] % max(capacity, 1ul);
+                ulong record = stream_record_offset(
+                    stream,
+                    physical,
+                    params,
+                    stream_state
+                );
+                for (uint word = 0; word < 4; ++word) {
+                    stream_state[entry + 1 + word] = stream_records[record + word];
+                }
+            }
+        }
+        stream_state[meta + 3] = active_count;
+#ifdef DAYS_MERGE_AUDIT
+        merge_audit(
+            target,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records
+        );
+#endif
+        return;
+    }
+    ulong inbound_base = ulong(target) * INBOUND_META_WORDS;
+    ulong edge_start = inbound_meta[inbound_base];
+    ulong edge_count = inbound_meta[inbound_base + 1];
+    for (ulong edge = edge_start; edge < edge_start + edge_count; ++edge) {
+        merge_cursors[edge] = 0;
+    }
+
+    device ulong *error = lp_state + ulong(target) * LP_STATE_WORDS;
+    while (true) {
+        ulong best_edge = NONE;
+        ulong best_slot = 0;
+        for (ulong edge = edge_start; edge < edge_start + edge_count; ++edge) {
+            ulong producer = inbound_producers[edge];
+            ulong producer_base = producer * META_WORDS;
+            ulong count = remote_meta[producer_base + 3];
+            ulong cursor = merge_cursors[edge];
+            while (cursor < count) {
+                ulong slot = remote_meta[producer_base + 2] + cursor;
+                if (outbox[slot * EVENT_WORDS + E_TARGET] == target) {
+                    break;
+                }
+                cursor += 1;
+            }
+            merge_cursors[edge] = cursor;
+            if (cursor == count) {
+                continue;
+            }
+            ulong slot = remote_meta[producer_base + 2] + cursor;
+            if (
+                best_edge == NONE ||
+                stored_key_less(outbox, slot, best_slot)
+            ) {
+                best_edge = edge;
+                best_slot = slot;
+            }
+        }
+        if (best_edge == NONE) {
+            break;
+        }
+        ulong event[EVENT_WORDS];
+        copy_device_to_thread(outbox, best_slot, event);
+        if (before_horizon(event[E_TIME], control)) {
+            set_semantic_error(error, 28, target);
+            return;
+        }
+        if (!heap_push(
+            target,
+            event,
+            error,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state
+        )) {
+            return;
+        }
+        merge_cursors[best_edge] += 1;
+    }
+}
+
+// T21 fix 1 — the finalize scans, on the whole grid. Transliterated word for word from
+// `cuda_kernels.cu`; see that kernel's header for the clamped-sum associativity argument.
+kernel void days_round_finalize_sweep(
+    const device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *lp_state [[buffer(18)]],
+    const device ulong *observation_meta [[buffer(21)]],
+    device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
+) {
+    threadgroup ulong values[1024];
+    threadgroup uint exceeded[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+
+    ulong capacities[3] = {
+        params[P_OBSERVED_CAPACITY],
+        params[P_DEPARTURE_CAPACITY],
+        params[P_ARRIVAL_CAPACITY]
+    };
+    ulong local_totals[3] = {0, 0, 0};
+    uint local_exceeded[3] = {0, 0, 0};
+    ulong first_error = NONE;
+    ulong first = ulong(block) * ulong(block_size) + ulong(lane);
+    ulong stride = ulong(blocks) * ulong(block_size);
+    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+        ulong state = node * LP_STATE_WORDS;
+        if (first_error == NONE && lp_state[state + L_ERROR] != 0) {
+            first_error = node;
+        }
+        if (params[P_FULL_OBSERVATIONS] != 0) {
+            ulong base = node * OBSERVATION_META_WORDS;
+            for (uint log = 0; log < 3; ++log) {
+                ulong count = observation_meta[base + log * META_WORDS + 3];
+                local_totals[log] = saturating_add_ulong(local_totals[log], count);
+                local_exceeded[log] |= uint(local_totals[log] > capacities[log]);
+            }
+        }
+    }
+
+    values[lane] = first_error;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+        if (lane < stride_lanes) {
+            values[lane] = min(values[lane], values[lane + stride_lanes]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        store_round_partial(stream_state, params, block, 0, values[0]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint log = 0; log < 3; ++log) {
+        values[lane] = local_totals[log];
+        exceeded[lane] = local_exceeded[log];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+            if (lane < stride_lanes) {
+                ulong left = values[lane];
+                ulong right = values[lane + stride_lanes];
+                uint combined_exceeded = exceeded[lane] | exceeded[lane + stride_lanes];
+                ulong combined_total = saturating_add_ulong(left, right);
+                combined_exceeded |= uint(combined_total > capacities[log]);
+                values[lane] = combined_total;
+                exceeded[lane] = combined_exceeded;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) {
+            store_round_partial(stream_state, params, block, 1 + log * 2, values[0]);
+            store_round_partial(
+                stream_state,
+                params,
+                block,
+                2 + log * 2,
+                ulong(exceeded[0])
+            );
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// T21 fix 1 — the finalize combine. Transliterated word for word from `cuda_kernels.cu`.
+kernel void days_round_finalize(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *lp_state [[buffer(18)]],
+    const device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    threadgroup ulong values[1024];
+    threadgroup uint exceeded[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+
+    // T24: the host omits the sweep only for streams + Summary. Transliterated word for word from
+    // CUDA; the retained dispatch is the ordered round-state publication boundary.
+    if (
+        params[P_STREAMS_ENABLED] != 0 &&
+        params[P_FULL_OBSERVATIONS] == 0
+    ) {
+        if (lane == 0) {
+            control[C_CONTINUATION] = 0;
+            control[C_ROUNDS] += 1;
+        }
+        return;
+    }
+
+    ulong capacities[3] = {
+        params[P_OBSERVED_CAPACITY],
+        params[P_DEPARTURE_CAPACITY],
+        params[P_ARRIVAL_CAPACITY]
+    };
+    ulong first_error = NONE;
+    for (
+        ulong block = lane;
+        block < CONTROL_SWEEP_BLOCKS;
+        block += 1024
+    ) {
+        first_error = min(
+            first_error,
+            load_round_partial(stream_state, params, block, 0)
+        );
+    }
+
+    values[lane] = first_error;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 512; stride != 0; stride >>= 1) {
+        if (lane < stride) {
+            values[lane] = min(values[lane], values[lane + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0 && values[0] != NONE) {
+        ulong state = values[0] * LP_STATE_WORDS;
+        control[C_ERROR] = lp_state[state + L_ERROR];
+        control[C_ERROR_ARENA] = lp_state[state + L_ERROR_ARENA];
+        control[C_ERROR_NODE] = lp_state[state + L_ERROR_NODE];
+        control[C_ERROR_CAPACITY] = lp_state[state + L_ERROR_CAPACITY];
+        control[C_ERROR_DEMAND] = lp_state[state + L_ERROR_DEMAND];
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (values[0] != NONE) {
+        return;
+    }
+    // Complete the reduction-result read before reusing the threadgroup scratch planes.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (params[P_FULL_OBSERVATIONS] == 0) {
+        if (lane == 0) {
+            control[C_CONTINUATION] = 0;
+            control[C_ROUNDS] += 1;
+        }
+        return;
+    }
+
+    ulong arenas[3] = {ARENA_OBSERVED, ARENA_DEPARTURES, ARENA_ARRIVALS};
+    for (uint log = 0; log < 3; ++log) {
+        ulong local_total = 0;
+        uint local_exceeded = 0;
+        for (
+            ulong block = lane;
+            block < CONTROL_SWEEP_BLOCKS;
+            block += 1024
+        ) {
+            local_total = saturating_add_ulong(
+                local_total,
+                load_round_partial(stream_state, params, block, 1 + log * 2)
+            );
+            local_exceeded |= uint(
+                load_round_partial(stream_state, params, block, 2 + log * 2) != 0
+            );
+            local_exceeded |= uint(local_total > capacities[log]);
+        }
+        values[lane] = local_total;
+        exceeded[lane] = local_exceeded;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 512; stride != 0; stride >>= 1) {
+            if (lane < stride) {
+                ulong left = values[lane];
+                ulong right = values[lane + stride];
+                uint combined_exceeded = exceeded[lane] | exceeded[lane + stride];
+                ulong combined_total = saturating_add_ulong(left, right);
+                combined_exceeded |= uint(combined_total > capacities[log]);
+                values[lane] = combined_total;
+                exceeded[lane] = combined_exceeded;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0 && exceeded[0] != 0 && control[C_ERROR] == 0) {
+            control[C_ERROR] = ERROR_CAPACITY;
+            control[C_ERROR_ARENA] = arenas[log];
+            control[C_ERROR_NODE] = NONE;
+            control[C_ERROR_CAPACITY] = capacities[log];
+            control[C_ERROR_DEMAND] = values[0];
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
+    if (lane == 0 && control[C_ERROR] == 0) {
+        control[C_CONTINUATION] = 0;
+        control[C_ROUNDS] += 1;
+    }
+}
+
+// T20l fix 2 — device-side readback compaction.
+//
+// Every striped result arena is sized for worst-case occupancy and is therefore mostly empty:
+// T20l phase 1 §4.2 measured the frontier attempt copying 18.6-19.2 GB back to recover 487,958
+// pending events and 2,931,779 packet descriptors, and §8 recorded that the meta planes bounding
+// those live records are already on the device before the copy starts. This kernel gathers one
+// arena's live records into a dense destination so the host copies the live words instead of the
+// arena.
+//
+// AUDIT (T20g style). This kernel has exactly ONE device write site, `destination[...]` below.
+// `destination` is a buffer allocated for the readback alone: it is never bound to any simulation
+// kernel, never read by one, and never part of complete state. `source`, `plan` and `args` are all
+// `const device`. The kernel therefore cannot alter a single semantic word, and it runs only after
+// the attempt has been screened as successful, so it cannot alter a fault payload either.
+//
+// DETERMINISM. One thread owns one entity; destinations are disjoint by construction because the
+// host lays them out as the exclusive prefix sum of the device-written live counts, in the order
+// the host decode walks the entities. There are no atomics, and the output does not depend on
+// dispatch order, thread scheduling or threadgroup size.
+//
+// The slot arithmetic mirrors `executor/src/device_compaction.rs::live_record_slots`, which in turn
+// reproduces `read_queue`, the stream decode loop and `tcp_ledger_ring::ledger_record_slot`.
+constant uint COMPACT_PLAN_ROW_WORDS = 5;
+
+kernel void days_compact_gather(
+    device ulong *destination [[buffer(0)]],
+    const device ulong *source [[buffer(1)]],
+    const device ulong *plan [[buffer(2)]],
+    const device ulong *args [[buffer(3)]],
+    uint entity [[thread_position_in_grid]]
+) {
+    ulong entity_count = args[0];
+    ulong record_words = args[1];
+    bool ring = args[2] != 0;
+    if (ulong(entity) >= entity_count) {
+        return;
+    }
+    const device ulong *row = plan + ulong(entity) * COMPACT_PLAN_ROW_WORDS;
+    ulong source_words = row[0];
+    ulong span = max(row[1], 1ul);
+    ulong head = row[2];
+    ulong count = row[3];
+    ulong destination_words = row[4];
+    for (ulong index = 0; index < count; ++index) {
+        ulong physical = ring ? (head + index) % span : index;
+        ulong from = source_words + physical * record_words;
+        ulong to = destination_words + index * record_words;
+        for (ulong word = 0; word < record_words; ++word) {
+            destination[to + word] = source[from + word];
+        }
+    }
+}

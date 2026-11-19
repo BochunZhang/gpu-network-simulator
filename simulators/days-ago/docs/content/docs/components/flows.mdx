@@ -1,0 +1,31 @@
+---
+title: Flows
+description: Days AGO flow descriptors, source-owned generators, routing, and backend limits.
+---
+
+**Scope: Days AGO.** The legacy actor implementation of flows is described in [Legacy flows](/docs/legacy/components/flows).
+
+The scenario compiler lowers supported TOML into backend-neutral flow descriptors and source-owned generator state inside the `SimulationImage`.
+
+## Flow descriptors
+
+Lowering creates a `FlowDescriptor` with a stable `FlowId`, source and target `NodeId` values, priority, a directed data route, and a reverse feedback route. Routes contain `LinkId` values, not actor IDs.
+
+## Generators
+
+The source host LP owns a `FlowGeneratorState`. The compiler lowers supported traffic into these generator families:
+
+- constant open-loop traffic for `PacketDistribution`
+- source-owned TCP Reno or CUBIC state
+- the Mellanox-form DCQCN controller and credit pacer for unreliable DCQCN flows, and the same controller with Go-back-N sender state and the window for RoCE queue pairs
+- resolved stages for the collectives (`RingAllReduce`, `AllGather`, `ReduceScatter`, `AllToAll`, and `SendRecv`), the timers of compute stages, and, on the Spectrum-X fabric, the stage notifies that carry same-server messages
+
+Target hosts own TCP cumulative-ACK state, the DCQCN notification point of unreliable flows, and the Go-back-N receiver of queue pairs, which echoes ECN on its ACKs and NACKs. Generator status records whether the next emission is scheduled, blocked, finished, or stopped beyond the scenario endpoint.
+
+## What lowering accepts
+
+Lowering derives flow IDs and routes from canonical semantic keys. It rejects explicit flow IDs, dependency lists, per-flow routing, and explicit paths instead of discarding them. It also rejects nondeterministic packet distributions and transport options outside the implemented mechanism set. See [Flow configuration](/docs/configuration/flows) for the accepted subsets.
+
+## Backend limits
+
+Scalar and CPU execute every generator family. Metal and CUDA execute constant, TCP, DCQCN and RoCE queue-pair generators, including the DCQCN controller, the notification point and the queue-pair window, plus the standalone `Rate` generator that image builders can construct through the executor API (TOML lowering produces rate state only inside DCQCN). They also execute collective and compute stages over TCP and RoCE.

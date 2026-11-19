@@ -1,0 +1,28 @@
+---
+title: Switches and logical processes
+description: Days AGO switch-egress ownership and backend capability checks.
+---
+
+**Scope: Days AGO.** The legacy `PacketSwitch` demultiplexer actor is described in [Legacy switch](/docs/legacy/components/switch).
+
+Days AGO makes each directed switch egress port a logical process (LP).
+
+## LP model
+
+Lowering assigns one LP to each host and one LP to each semantic `(physical switch, directed egress link)` pair. It sorts those semantic keys before assigning dense `NodeId` values, which removes construction order and hash-map iteration from identity.
+
+A lowered switch LP owns:
+
+- `SwitchState.physical_switch`, shared by all egress LPs for that physical switch
+- one `SwitchQueueState` with its egress link, scheduler, admission policy, optional PFC state, waiting queue, and in-service packet
+- a local child-event sequence and packet counters
+
+The image has no forwarding-table actor. Each `FlowDescriptor` carries canonical forward and reverse `LinkId` routes. On `RemoteArrival`, the transition finds the packet's next directed link and therefore the destination egress LP. The owning LP performs admission, service selection, and completion without shared mutable switch state.
+
+This ownership is the unit used by Scalar, persistent CPU workers, Metal, and CUDA. Safe-horizon rounds drain each active LP below the exclusive horizon, buffer remote events, then merge those events at the round barrier in canonical order.
+
+## Capability checks
+
+The compiler rejects mechanisms outside the Days AGO model, such as VirtualClock and the legacy drop policies `RED`, `RED_ECN` and `ECN_THRESHOLD` (removed in P16; the ECN ramp replaces them). Backend validation then checks device-specific state before launch: Metal and CUDA run every lowered mechanism, including the ECN ramp, collective and compute stages, counted joins, stage notifies, PFC on switch and host links, DCQCN, and RoCE queue pairs; they reject a zero-lookahead channel, a WFQ rational beyond the device width, and a queue capacity beyond 32 bits.
+
+Errors name the backend and direct the caller to Scalar or CPU. A capability failure returns no partial run result.

@@ -1,0 +1,50 @@
+---
+title: Installation
+description: Build the Days AGO days CLI with the Scalar, CPU, Metal, and CUDA engines.
+---
+
+Days is a Rust workspace. Use the current stable Rust toolchain and run commands from the repository root.
+
+## Scalar and CPU
+
+The root `days` package compiles TOML into an integer-nanosecond `SimulationImage` and provides the `days` CLI; the `days-executor` package runs the image. The Scalar and CPU engines need no extra features:
+
+```bash
+cargo build --release --bin days
+```
+
+## Metal
+
+On Apple platforms, the `metal` feature enables the Metal backend:
+
+```bash
+cargo build --release --features metal --bin days
+```
+
+The Metal backend is tested on the Apple M5 Max and M3. It refuses Apple M1-family GPUs (GPU family Apple7) before compiling any kernel, because the Metal compiler for that family produces incorrect code for the Days kernels; use `--engine scalar` or `--engine cpu` there. M2-family GPUs (Apple8) are untested.
+
+## CUDA
+
+The `cuda` feature enables the CUDA backend. It needs a compatible NVIDIA driver and a CUDA 13 toolkit whose `nvcc` can compile `sm_86`, `sm_89` and `sm_121`. `nvcc` must be on `PATH`, or named by the `NVCC` environment variable:
+
+```bash
+cargo build --release --features cuda --bin days
+```
+
+Without `nvcc`, a `cuda` build fails in the executor's build script with a message that names the missing compiler.
+
+## Feature flags
+
+| Feature | Enables |
+| --- | --- |
+| `metal` | the Metal backend (Apple only) |
+| `cuda` | the CUDA backend (requires a CUDA 13 `nvcc`) |
+| `cuda-planner-test` | the host-only CUDA planner equality test; enables `test`, builds without `nvcc`, and compiles no CUDA kernels |
+| `test` | test-only helpers, including the executor's planner test hooks |
+| `metal-test-hooks`, `cuda-test-hooks` | device conformance hooks for the device test surfaces |
+
+Images containing a mechanism a device backend does not implement are rejected before execution; see [backend capability validation](/docs/internals#backend-capability-validation).
+
+## Legacy Days
+
+The frozen legacy simulator builds as its own package, `days-legacy`, with its own feature flags. See [Legacy Days](/docs/legacy).

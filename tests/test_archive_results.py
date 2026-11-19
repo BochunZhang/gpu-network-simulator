@@ -118,6 +118,32 @@ class ArchiveResultsTest(unittest.TestCase):
         self.assertEqual(receipt['archive_sha256'], original_sha)
         self.assertEqual(receipt['state'], 'failed')
 
+    def test_full_warp_capture_round_trip_with_bulk_members(self):
+        row = {
+            'id': 'gedes-000-fat-tree48-27648-02', 'parent_id': 'gedes-000-fat-tree48-27648',
+            'subtask_id': '02', 'task_status': '2026-11-18T13:29:35Z',
+            'subtask_status': '2026-11-19T04:44:56Z', 'version': 1795063496,
+            'version_label': 'v1-261119-044456', 'slug': 'fat-tree48-27648',
+            'kind': 'gedes_fat_tree48', 'task': {'params': {'warp_trace': True}},
+            'source_commit': 'a'*40, 'task_sha256': 'b'*64, 'worker': 'node-a',
+            'host_id': 'host', 'claim': 'test', 'state': 'succeeded',
+        }
+        remote = self.root / 'cpfs/results'
+        output = runner.run_path(remote, row)
+        (output / 'warp').mkdir(parents=True)
+        contents = {name: bytes([i + 1])*2345 for i, name in enumerate(runner.WARP_TRACE_FILES)}
+        for name, data in contents.items():
+            (output / name).write_bytes(data)
+        with patch.object(runner, 'FILE_LIMIT', 1000):
+            runner.prepare_archive(output, row)
+        archive = runner.archive_path(remote, row)
+        with patch.object(importer, 'MAX_BYTES', 4096):
+            receipt = importer.archive_package(archive, self.results, self.status)
+        self.assertEqual(runner.read_json(receipt)['state'], 'succeeded')
+        local = runner.run_path(self.results, row)
+        for name, data in contents.items():
+            self.assertEqual((local / name).read_bytes(), data)
+
     def test_classified_receipt_remains_idempotent_after_redownload(self):
         child = 'gedes-000-smoke-02'
         fields = {'parent_id': 'gedes-000-smoke', 'subtask_id': '02',

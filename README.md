@@ -4,6 +4,12 @@
 
 2026-11-18 建立的新队列从零项任务开始。此前 13 项实验已单独备份，旧编号、结果和运行状态仅供回查。后续如要重做其中一个实验，先 review 其目的、配置和验收条件，再按新队列的分类顺序发布。[历史实验索引](history/pre-review-20261118/README.md) · [研究路线草案](docs/research-roadmap.md) · [第三方参考](third_party/README.md)
 
+## FT48 模拟器源码与 warp 测量
+
+FT48 处理器从领取提交中的 [Days AGO](simulators/days-ago/SOURCE.md) 和 [GeDES](simulators/gedes/PROVENANCE.md) 构建。两项 `02` 子任务在单张 GB200 上采集完整 FT48 运行的 warp 进入与退出、CTA 归属及 SM 位置。Days 按 graph replay 和末尾的 gather 回收，GeDES 每 32 次 replay 回收一批。两项都另存 CUDA Graph 的依赖图。
+
+下载结果包后，打开 `warp/preview.perfetto.json` 查看第一轮的部分 CTA，或按 replay 和 kernel 选择完整数据中的其他区间。包内的 `warp/lifetimes.bin` 和 `warp/index.sqlite` 分别保存全部记录和索引；若重放次数与已有 FT48 数据相同，单是二进制记录约为 Days 0.812 GiB、GeDES 51.38 GiB（未压缩）。[记录格式与查看命令](profiling/warp_trace/README.md)
+
 ## 启动执行器
 
 在所有设备都能访问的同一 CPFS 目录下克隆一次。需要 Git、Bash 和 Python 3.9+。GPU 实验按所选处理器准备相应驱动和编译工具。

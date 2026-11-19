@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 WIDE_FIXTURE = Path(
     'configs/benchmarks/width_via_load_k48_h16/fattree_k48_h16_load_30_sustained.toml'
 )
-PORT_PATCH = Path('tools/days_sm100.patch')
+SIMULATOR_DIR = Path('simulators/days-ago')
 SMOKE_FIXTURE_SHA256 = 'a715aa8e4492583c1727224f161b61324d653382d331d270fb1850863f2a5440'
 WIDE_FIXTURE_SHA256 = 'ca005a37bbab9192f85cac61ea2f3fe63c73db8aeba1d72df46096a92950ba7c'
 HOST_COUNT = 18_432
@@ -73,7 +73,7 @@ def _work_differences(baseline, profiled):
     return differences
 
 
-def run(source, output, handlers, profile=False):
+def run(source, output, handlers, profile=False, warp_trace=False):
     wide = {'fixture': WIDE_FIXTURE.as_posix(), 'k': 48, 'hosts_per_edge': 16, 'hosts': HOST_COUNT,
             'flows': FLOW_COUNT, 'inclusive_stop_ns': STOP_NS, 'seed': 17_048, 'packet_bytes': PACKET_BYTES,
             'packet_interval_ns': PACKET_INTERVAL_NS, 'link_rate_bps': 100_000_000_000, 'link_delay_ns': 1_000,
@@ -81,7 +81,7 @@ def run(source, output, handlers, profile=False):
             'expected_offered_bytes': EXPECTED_PACKETS * PACKET_BYTES}
     smoke = {'fixture': handlers.DAYS_FIXTURE, 'runs': {}}
     summary = {'upstream': handlers.DAYS[0], 'revision': handlers.DAYS[1],
-               'cuda_target': 'sm_100', 'smoke': smoke, 'wide': wide,
+               'source_path': SIMULATOR_DIR.as_posix(), 'cuda_target': 'sm_100', 'smoke': smoke, 'wide': wide,
                'timing_scope': {
                    'process_seconds': 'Full simulator process including scenario lowering and result fingerprinting',
                    'lowering_ns': 'Scenario lowering',
@@ -92,6 +92,11 @@ def run(source, output, handlers, profile=False):
     build_log = output / 'build.log'
     try:
         capability, env = handlers.selected_gpu(output)
+        if profile and warp_trace:
+            raise ValueError('Nsight Systems and IKET require separate profiler runs')
+        env = dict(env)
+        env.pop('FT48_WARP_OUTPUT', None)
+        env.pop('FT48_WARP_LIBDIR', None)
         if capability != '10.0':
             raise RuntimeError(f'Days FatTree48 experiment requires SM100, observed {capability}')
         handlers.command([env.get('NVCC', 'nvcc'), '--version'], output / 'nvcc.txt', env=env)
@@ -103,17 +108,16 @@ def run(source, output, handlers, profile=False):
             nsys = profiler.preflight(output, env, handlers)
         with TemporaryDirectory(prefix='.days-fat-tree48-', dir=output) as temp:
             scratch = Path(temp)
-            summary['stage'] = 'checkout'
-            src = handlers.checkout(handlers.DAYS, scratch, output, env)
+            src = source / SIMULATOR_DIR
+            if warp_trace:
+                summary['stage'] = 'warp-preflight'
+                warp = handlers._support_module(source, 'warp_ft48')
+                env = warp.prepare(source, output, scratch, env, handlers)
             summary['stage'] = 'fixtures'
             for case, expected in ((smoke, SMOKE_FIXTURE_SHA256), (wide, WIDE_FIXTURE_SHA256)):
                 case['fixture_sha256'] = _sha256(src / case['fixture'])
                 if case['fixture_sha256'] != expected:
                     raise RuntimeError(f'Days pinned fixture hash mismatch: {case["fixture"]}')
-            summary['stage'] = 'sm100-port'
-            patch = source / PORT_PATCH
-            summary['sm100_patch_sha256'] = _sha256(patch)
-            handlers.command(['git', 'apply', '--whitespace=error', patch], output / 'sm100-port.txt', src, env)
             summary['stage'] = 'build'
             env['CARGO_TARGET_DIR'] = str(scratch / 'target')
             summary['build_seconds'] = handlers.command(
@@ -141,20 +145,34 @@ def run(source, output, handlers, profile=False):
             if sourced != EXPECTED_PACKETS or received + dropped > sourced:
                 raise RuntimeError(f'Days fixed-window packet gate failed: expected {EXPECTED_PACKETS} sourced, '
                                    f'observed {sourced} sourced, {received} received and {dropped} dropped')
-            if profile:
-                summary['stage'] = 'fat-tree48-nsys'
+            if profile or warp_trace:
+                label = 'warp' if warp_trace else 'nsys'
+                summary['stage'] = f'fat-tree48-{label}'
                 profiled = wide['profile'] = {'run': {}}
                 summary['timing_scope']['profiled_process_seconds'] = (
+                    'IKET lifetime-only capture including trace collection.' if warp_trace else
                     'Nsight Systems wrapper including simulator execution and trace generation.'
                 )
-                _measure(binary, wide['fixture'], 'cuda', output / 'fat-tree48-cuda-nsys.txt', src, env,
-                         handlers, profiled['run'], prefix=profiler.prefix(nsys, output))
+                capture_env = warp.capture_environment(source, output, env, 'days') if warp_trace else env
+                prefix = () if warp_trace else profiler.prefix(nsys, output)
+                _measure(binary, wide['fixture'], 'cuda', output / f'fat-tree48-cuda-{label}.txt', src,
+                         capture_env, handlers, profiled['run'], prefix=prefix)
                 differences = profiled['work_differences'] = _work_differences(record, profiled['run'])
+                rounds = profiled['run']['device']['rounds']
+                if warp_trace:
+                    summary['stage'] = 'warp-collect'
+                    dot = output / 'warp/graph.dot'
+                    if not dot.is_file() or dot.stat().st_size == 0:
+                        raise RuntimeError('missing Days CUDA Graph dependency export')
+                    profiled['graph_dependencies'] = 'warp/graph.dot'
+                    profiled['trace'] = warp.collect(source, output, 'days', rounds)
                 if differences:
+                    summary['stage'] = f'fat-tree48-{label}'
                     raise RuntimeError(f'Days profiled work differs from baseline: {", ".join(differences)}')
-                summary['stage'] = 'nsys-collect'
-                profiled['trace'] = profiler.collect(nsys, output, env, handlers, simulator='days-ago',
-                                                     rounds=record['device']['rounds'])
+                if profile:
+                    summary['stage'] = 'nsys-collect'
+                    profiled['trace'] = profiler.collect(nsys, output, env, handlers, simulator='days-ago',
+                                                         rounds=rounds)
         summary.update(state='succeeded', stage='complete')
     except Exception as error:
         summary.update(state='failed', error=str(error))

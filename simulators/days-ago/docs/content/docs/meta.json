@@ -1,0 +1,31 @@
+{
+  "title": "Days Documentation",
+  "pages": [
+    "index",
+    "install",
+    "quickstart",
+    "examples",
+    "testing",
+    "configuration",
+    "architecture",
+    "components",
+    "reference",
+    "internals",
+    "verification",
+    "research",
+    "legacy"
+  ],
+  "index": "Home",
+  "install": "Install",
+  "quickstart": "Quickstart",
+  "examples": "Examples",
+  "testing": "Testing",
+  "verification": "Verification",
+  "configuration": "Configuration",
+  "architecture": "Architecture",
+  "components": "Components",
+  "reference": "Reference",
+  "internals": "Internals",
+  "research": "Verification and Research",
+  "legacy": "Legacy Days"
+}

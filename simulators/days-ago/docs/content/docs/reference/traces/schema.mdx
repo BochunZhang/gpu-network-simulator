@@ -1,0 +1,45 @@
+---
+title: Trace schema conventions
+description: Canonical keys and integer encodings for legacy and exact certificates.
+---
+
+**Scope: Days AGO and Legacy Days.** There is no single global CSV schema. Each certificate family defines its own
+row type, required fields, event vocabulary, and replay rule.
+
+## Legacy LeanGuard CSVs
+
+Legacy simulator traces such as `dcqcn_events.csv`, `pfc_events.csv`,
+`aqm_events.csv`, `wfq_events.csv`, `drr_events.csv`, and
+`cubic_events.csv` use a per-family schema. Their Lean checkers generally sort
+by `(time_ns, event_id)` and reject duplicate keys. Legacy `time_ns` values are
+exact integer encodings derived at the logging boundary from legacy model time.
+
+Rows use stable component/flow/packet IDs, finite `kind` tags, integer unit
+suffixes (`*_ns`, `*_bps`, `*_bytes`), and fixed-point values such as
+`*_ppb`. Inapplicable kind-specific columns are empty; the checker enforces the
+required subset for each kind.
+
+## Days AGO certificates
+
+Days AGO events already carry integer nanosecond time. Its certificate
+projections use the complete canonical key:
+
+```text
+(time_ns, event_phase, event_origin_node, event_origin_sequence)
+```
+
+The TCP serializer sorts by this key and rejects duplicates. Some `p10c_*`
+checkers instead require the input to be in strict canonical order and
+reject an out-of-order row. Days AGO families cover TCP Reno/CUBIC, SP,
+rate/PFC/DRR/WRR mechanisms, AQM, DCQCN, RoCE queue pairs, and collectives.
+
+## Diagnostics
+
+Checkers retain original CSV line numbers for errors. The first data record is
+line 2 because line 1 is the header. Acceptance is always defined by the
+family's Lean row parser and transition function, not by physical write order
+alone.
+
+Mechanical sources include `executor/src/tcp_trace.rs`,
+`executor/src/aqm_trace.rs`, `executor/src/mechanism_trace.rs`, and
+`lean/LeanGuard/`.

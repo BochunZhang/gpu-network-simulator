@@ -1,4 +1,3 @@
-import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -32,14 +31,10 @@ class DaysFatTree48Test(unittest.TestCase):
         self.wide_commands = {}
         self.wide_sourced = days.EXPECTED_PACKETS
         self.fail_build = False
-        self.fixture_bytes = b'mock fixture'
-        digest = hashlib.sha256(self.fixture_bytes).hexdigest()
         for patcher in (
             patch.object(handlers, 'selected_gpu', return_value=('10.0', self.worker_env)),
-            patch.object(handlers, 'checkout', side_effect=self.checkout),
+            patch.object(handlers, 'checkout', side_effect=AssertionError('expected maintained source')),
             patch.object(handlers, 'command', side_effect=self.command),
-            patch.object(days, 'SMOKE_FIXTURE_SHA256', digest),
-            patch.object(days, 'WIDE_FIXTURE_SHA256', digest),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -50,14 +45,6 @@ class DaysFatTree48Test(unittest.TestCase):
             executable = directory / tool
             executable.write_text(f'#!/bin/sh\nexit {int(broken == tool)}\n')
             executable.chmod(0o755)
-
-    def checkout(self, upstream, scratch, output, env):
-        source = scratch / 'source'
-        for fixture in (handlers.DAYS_FIXTURE, days.WIDE_FIXTURE):
-            path = source / fixture
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(self.fixture_bytes)
-        return source
 
     def command(self, args, log, cwd=None, env=None):
         if args == ['sh', REPO / 'tools/install_rust.sh']:
@@ -73,6 +60,7 @@ class DaysFatTree48Test(unittest.TestCase):
             self.assertEqual(env['CUDA_VISIBLE_DEVICES'], self.worker_env['CUDA_VISIBLE_DEVICES'])
             self.rust_commands[tuple(args[:2])] = (Path(resolved).parent, env.get('RUSTUP_TOOLCHAIN'))
         if args[:2] == ['cargo', 'build']:
+            self.assertEqual(cwd, REPO / days.SIMULATOR_DIR)
             if self.fail_build:
                 log.write_bytes(b'x' * (20 * 1024) + b'compiler failure\n')
                 raise RuntimeError('cargo returned 101')
@@ -81,8 +69,13 @@ class DaysFatTree48Test(unittest.TestCase):
             binary.write_bytes(b'same binary across engines')
         elif '--engine' in args:
             engine = args[args.index('--engine') + 1]
+            self.assertEqual(bool(env.get('FT48_WARP_OUTPUT')), log.name == 'fat-tree48-cuda-warp.txt')
+            if 'FT48_WARP_OUTPUT' in env:
+                directory = Path(env['FT48_WARP_OUTPUT'])
+                directory.mkdir(exist_ok=True)
+                (directory / 'graph.dot').write_text('digraph captured { a -> b }\n')
             wide = log.name.startswith('fat-tree48')
-            profiled = log.name == 'fat-tree48-cuda-nsys.txt'
+            profiled = log.name in ('fat-tree48-cuda-nsys.txt', 'fat-tree48-cuda-warp.txt')
             if wide:
                 self.wide_commands[log.name] = args
             sourced = self.wide_sourced if wide else 100
@@ -138,8 +131,10 @@ class DaysFatTree48Test(unittest.TestCase):
         self.assertEqual(profile['trace']['kernel_count'], 72)
         self.assertEqual(self.wide_commands['fat-tree48-cuda-nsys.txt'],
                          [*profile_prefix, *self.wide_commands['fat-tree48-cuda.txt']])
+        capture_env = profiler.collect.call_args.args[2]
+        self.assertEqual(capture_env['PATH'], self.worker_env['PATH'])
         profiler.collect.assert_called_once_with(profiler.preflight.return_value, self.output,
-                                                 self.worker_env, handlers, simulator='days-ago', rounds=6)
+                                                 capture_env, handlers, simulator='days-ago', rounds=6)
 
     def test_profile_work_mismatch_keeps_both_runs_and_fails(self):
         profiler = Mock()
@@ -158,6 +153,21 @@ class DaysFatTree48Test(unittest.TestCase):
         self.assertTrue((self.output / 'fat-tree48-cuda.txt').is_file())
         self.assertTrue((self.output / 'fat-tree48-cuda-nsys.txt').is_file())
         profiler.collect.assert_not_called()
+
+    def test_warp_profile_uses_maintained_build_and_compares_work(self):
+        warp = Mock()
+        warp.prepare.side_effect = lambda source, output, scratch, env, handlers: dict(env)
+        warp.capture_environment.side_effect = lambda source, output, env, kind: {
+            **env, 'FT48_WARP_OUTPUT': str(output / 'warp')
+        }
+        warp.collect.return_value = {'warp_instances': 123}
+        with patch.object(handlers, '_support_module', return_value=warp) as support:
+            days.run(REPO, self.output, handlers, warp_trace=True)
+        support.assert_called_once_with(REPO, 'warp_ft48')
+        profiled = self.summary()['wide']['profile']
+        self.assertEqual(profiled['trace']['warp_instances'], 123)
+        self.assertEqual(profiled['work_differences'], [])
+        warp.collect.assert_called_once_with(REPO, self.output, 'days', 6)
 
     def test_profile_preflight_failure_stops_before_the_build(self):
         profiler = Mock()

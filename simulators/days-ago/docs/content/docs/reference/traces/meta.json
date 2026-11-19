@@ -1,0 +1,6 @@
+{
+  "pages": ["schema", "manifest"],
+  "index": "Overview",
+  "schema": "Trace schema conventions",
+  "manifest": "Trace Manifest (traces.json)"
+}

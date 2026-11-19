@@ -1,0 +1,105 @@
+---
+title: LeanGuard (Design)
+description: Legacy and exact-executor trace certificates, canonicalization, and replay.
+---
+
+**Scope: Days AGO and Legacy Days.** LeanGuard checks an untrusted CSV certificate against executable Lean semantics. A checker parses
+typed rows, establishes a deterministic order, replays a partial transition function, and prints
+`ACCEPT` or the first `REJECT` diagnostic.
+
+## Two certificate lineages
+
+The repository deliberately keeps two schemas separate.
+
+### Legacy protocol traces
+
+The legacy engine writes protocol-specific traces when built with Cargo feature `lean`. Its DCQCN,
+PFC, CUBIC, AQM, DRR, and WFQ rows use the canonical key `(time_ns, event_id)`. Their checkers sort
+by that key and reject duplicates before replay. Rows use explicit integer units such as `time_ns`,
+`*_bps`, and `*_ppb`, even though the legacy simulator contains floating-point time and protocol
+state internally.
+
+These files are produced only when CSV logging is enabled. `csv_logging` defaults to `true`; setting
+it to `false` suppresses the CSV files and `traces.json`.
+
+### Days AGO certificates
+
+Days AGO represents time and protocol state with exact integers. Its certificates use
+the complete canonical `EventKey`:
+
+```text
+(time_ns, event_phase, event_origin_node, event_origin_sequence)
+```
+
+The TCP, Static Priority, AQM, rate, PFC, DRR, WRR, WFQ, and collective checkers canonicalize by this key
+(the collective schema adds an activation ordinal where one executor event produces multiple
+rows). The Days AGO DCQCN checker, `p10c_dcqcn_check`, instead requires the input to already be in strictly increasing
+`EventKey` order. Duplicate keys are rejected in both cases.
+
+The Rust projections live in `executor/src/tcp_trace.rs`, `executor/src/aqm_trace.rs`, and
+`executor/src/mechanism_trace.rs`. They serialize the full-observation diagnostic records that
+Scalar and CPU return; they are separate from the legacy logger's automatic `*_events.csv` output.
+
+## Replay contract
+
+A replay-oriented row contains the data its transition rule needs:
+
+- a canonical key and stable entity identifiers;
+- an event kind or transition input;
+- fixed configuration and guard inputs;
+- before/after state or another exact witness of the selected action.
+
+The checker rejects malformed fields, parameter drift, broken state continuity, illegal choices,
+unmatched paired events, arithmetic-domain violations, and a post-state that differs from the
+reference transition.
+
+## Lean targets
+
+`lean/lakefile.lean` defines the complete executable surface:
+
+| Target | Certificate |
+|---|---|
+| `dcqcn_check` | legacy DCQCN |
+| `pfc_check` | legacy PFC |
+| `cubic_check` | legacy CUBIC micro-events |
+| `drr_check` | legacy DRR |
+| `wfq_check` | legacy WFQ (Days AGO WFQ: `p10c_mechanisms_check wfq`) |
+| `aqm_check` | legacy AQM |
+| `aqm_dcqcn_check` | legacy cross-layer AQM to DCQCN causality |
+| `tcp_check` | Days AGO TCP (Reno and CUBIC) |
+| `sp_check` | Days AGO Static Priority |
+| `p10c_mechanisms_check` | Days AGO rate, PFC, DRR, WRR, or WFQ transitions |
+| `p10c_aqm_check` | Days AGO AQM |
+| `p10c_dcqcn_check` | Days AGO DCQCN |
+| `p10c_collective_check` | Days AGO collective progress |
+| `p10c_roce_check` | Days AGO RoCE queue pairs (receiver, sender joined with DCQCN, cross-role) |
+| `p10c_collective_diff` | test only: the collective checker against its retained list-scan reference |
+| `p10c_aqm_diff` | test only: the Days AGO AQM checker against its retained list-scan reference |
+
+## Checker cost
+
+A Days AGO trace can run to tens of thousands of rows, so the P10c checkers keep their replay
+state in hash maps keyed by flow, queue or stage and never search earlier rows per row: the RoCE,
+DCQCN, collective and AQM checkers are linear in the row count, except the collective checker's
+TCP replay, which keeps a per-flow frontier in an ordered map and is n log n. Where P16 replaced a scan, the old functions
+stayed in a test-only module and a differential harness runs both on every fixture and on
+generated mutants in CI; see [Continuous integration](/docs/verification/leanguard#continuous-integration).
+
+## Executor proof surface
+
+`lean/DaysExecutor.lean` imports the mechanized executor model. It covers the image and transition
+relations, exact `EventKey` order, safe-horizon construction, serial and round execution,
+decision-point scope, and intra-round reordering. `lean/DaysExecutorAxiomAudit.lean` audits the five
+exported theorem families (`F1` through `F5`) and their transitive axiom use.
+
+This proof surface and trace replay answer different questions: the former reasons about the
+executor model, while a certificate checker validates one concrete observed transition sequence.
+
+## Adding a checker
+
+1. Define a stable row schema and its canonical key.
+2. State whether the checker sorts rows or requires canonical input order.
+3. Implement parsing, domain checks, continuity, and the executable transition rule, with replay state keyed by entity rather than searched per row.
+4. Project the required record from the matching Rust transition point.
+5. Add positive, mutation-rejection, duplicate-key, and numeric-boundary fixtures.
+6. Register the executable in `lean/lakefile.lean`.

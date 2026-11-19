@@ -1,0 +1,23 @@
+---
+title: Conformance Verification (LeanGuard)
+description: Trace-certificate checking and executable Lean models for both Days engines.
+---
+
+**Scope: Days AGO and Legacy Days.** Days ships a Lean 4 verification tree under `lean/`. It has two related surfaces:
+
+- **Legacy protocol certificates**: `days-legacy`, built with the `lean` Cargo feature, writes
+  `*_events.csv` files. LeanGuard canonicalizes and replays those traces.
+- **Days AGO certificates and proofs**: the executor exposes exact-integer transition records for
+  TCP, AQM, DCQCN, RoCE queue pairs, PFC, schedulers, rate sources, and collectives. The `tcp_check`, `sp_check`, and
+  `p10c_*` checkers replay their CSV projections using the executor's complete `EventKey`, while
+  `lean/DaysExecutor/` formalizes the image, transition, safe-horizon, and round-execution model.
+
+An accepted certificate means every recorded transition satisfies that checker's executable
+reference semantics. It does not, by itself, prove code that was not represented in the trace.
+
+This section covers:
+
+- [Use guide](/docs/verification/leanguard): emit legacy traces, build the Lean targets, and run
+  legacy or exact-executor checkers.
+- [Design sketch](/docs/verification/design): canonical keys, replay contracts, and the separate
+  `DaysExecutor` theorem surface.

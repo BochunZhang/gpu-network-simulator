@@ -1,0 +1,429 @@
+import Std
+
+import LeanGuard.Shared.Check
+import LeanGuard.P10c.SplitMix
+
+namespace LeanGuard.P10c.Semantics
+
+open LeanGuard.Shared
+
+namespace Aqm
+
+open LeanGuard.P10c.SplitMix
+
+def maxQueueBytes : Nat := 2 ^ 64 - 1
+
+inductive Action
+  | enqueue
+  | mark
+  | drop
+  deriving DecidableEq, Repr
+
+/-- The ECN ramp of one queue (`EcnRampPolicy`): tail drop past `capacityBytes`; for ECN-capable
+data, no mark below `kminBytes`, a mark at or above `kmaxBytes`, and in between a mark with
+probability `Pmax * (d - kmin) / (kmax - kmin)`, `Pmax = pmaxNumerator / pmaxDenominator`. -/
+structure RampConfig where
+  capacityBytes : Nat
+  kminBytes : Nat
+  kmaxBytes : Nat
+  pmaxNumerator : Nat
+  pmaxDenominator : Nat
+  deriving DecidableEq, Repr
+
+/-- `ecn_ramp_policy_check`: a positive capacity, `1 ≤ kmin ≤ kmax ≤ capacity`, `0 < Pmax ≤ 1` in
+lowest terms, `Pmax = 1` on a step, and a span `pmaxDenominator * (kmax - kmin)` within a `u64`. -/
+def RampConfig.wellFormed (config : RampConfig) : Bool :=
+  config.capacityBytes > 0 &&
+    1 ≤ config.kminBytes && config.kminBytes ≤ config.kmaxBytes &&
+    config.kmaxBytes ≤ config.capacityBytes &&
+    0 < config.pmaxNumerator && config.pmaxNumerator ≤ config.pmaxDenominator &&
+    Nat.gcd config.pmaxNumerator config.pmaxDenominator = 1 &&
+    (config.kminBytes ≠ config.kmaxBytes || config.pmaxNumerator = config.pmaxDenominator) &&
+    config.pmaxDenominator * (config.kmaxBytes - config.kminBytes) ≤ maxU64
+
+/-- `ECN_RAMP_DOMAIN`, `"ECN_RAMP"` in ASCII. -/
+def rampDomain : Nat := 0x45434e5f52414d50
+
+/-- `ecn_queue_key`: the draw's per-queue key. -/
+def queueKey (seed node queue : Nat) : Nat :=
+  mix (mix (mix (seed ^^^ rampDomain) ^^^ node) ^^^ queue)
+
+/-- `ecn_draw`: the draw of one arrival (its payload id) at the queue with key `key`. -/
+def draw (key payload : Nat) : Nat := mix (key ^^^ payload)
+
+def queueByteSumRepresentable (queuedBytes packetSizeBytes : Nat) : Bool :=
+  queuedBytes + packetSizeBytes ≤ maxQueueBytes
+
+/-- `ecn_ramp_decision`, line for line: the post-admission byte depth `d` drops past the capacity;
+a packet that is not ECN-capable data is admitted unmarked; below `kmin` no mark, at or above
+`kmax` a mark; in between a mark iff `⌊u · span / 2^64⌋ < pmaxNumerator · (d − kmin)`. -/
+def rampDecision
+    (config : RampConfig) (isData : Bool) (queuedBytes packetSizeBytes u : Nat) : Action :=
+  let depth := queuedBytes + packetSizeBytes
+  if !queueByteSumRepresentable queuedBytes packetSizeBytes then
+    .drop
+  else if config.capacityBytes < depth then
+    .drop
+  else if !isData || depth < config.kminBytes then
+    .enqueue
+  else if config.kmaxBytes ≤ depth then
+    .mark
+  else
+    let span := config.pmaxDenominator * (config.kmaxBytes - config.kminBytes)
+    if (u * span) / modulus < config.pmaxNumerator * (depth - config.kminBytes) then
+      .mark
+    else
+      .enqueue
+
+end Aqm
+
+namespace Rate
+
+inductive Status
+  | scheduled
+  | blocked
+  | finished
+  | stopped
+  deriving DecidableEq, Repr
+
+structure State where
+  rateNumeratorBitsPerSecond : Nat
+  rateDenominator : Nat
+  pacingIntervalNs : Nat
+  packetSizeBytes : Nat
+  totalBytes : Nat
+  emittedBytes : Nat
+  creditQuanta : Nat
+  deriving DecidableEq, Repr
+
+structure TickResult where
+  state : State
+  emittedBytes : Nat
+  nextPacketBytes : Nat
+  nextStatus : Status
+  nextTimeNs : Option Nat
+  deriving DecidableEq, Repr
+
+def packetCost (state : State) (sizeBytes : Nat) : Nat :=
+  sizeBytes * 8 * state.rateDenominator * 1_000_000_000
+
+def tickCredit (state : State) : Nat :=
+  state.rateNumeratorBitsPerSecond * state.pacingIntervalNs
+
+def tick
+    (state : State)
+    (currentPacketBytes timeNs stopTimeNs : Nat) : TickResult :=
+  let credit := state.creditQuanta + tickCredit state
+  let emitted := if packetCost state currentPacketBytes ≤ credit then currentPacketBytes else 0
+  let credit := if emitted = 0 then credit else credit - packetCost state emitted
+  let emittedTotal := state.emittedBytes + emitted
+  let state := { state with emittedBytes := emittedTotal, creditQuanta := credit }
+  if state.totalBytes ≤ emittedTotal then
+    { state
+      emittedBytes := emitted
+      nextPacketBytes := 0
+      nextStatus := .finished
+      nextTimeNs := none }
+  else
+    let nextBytes := min state.packetSizeBytes (state.totalBytes - emittedTotal)
+    let nextTime := timeNs + state.pacingIntervalNs
+    if stopTimeNs < nextTime then
+      { state
+        emittedBytes := emitted
+        nextPacketBytes := nextBytes
+        nextStatus := .stopped
+        nextTimeNs := some nextTime }
+    else
+      let nextCredit := credit + tickCredit state
+      { state
+        emittedBytes := emitted
+        nextPacketBytes := nextBytes
+        nextStatus :=
+          if packetCost state nextBytes ≤ nextCredit then .scheduled else .blocked
+        nextTimeNs := some nextTime }
+
+end Rate
+
+namespace Pfc
+
+structure ThresholdState where
+  xonBytes : Nat
+  xoffBytes : Nat
+  asserted : Bool
+  deriving DecidableEq, Repr
+
+inductive Control
+  | pause
+  | resume
+  deriving DecidableEq, Repr
+
+def occupancyTransition (state : ThresholdState) (occupancyBytes : Nat) :
+    ThresholdState × Option Control :=
+  if !state.asserted && state.xoffBytes ≤ occupancyBytes then
+    ({ state with asserted := true }, some .pause)
+  else if state.asserted && occupancyBytes ≤ state.xonBytes then
+    ({ state with asserted := false }, some .resume)
+  else
+    (state, none)
+
+abbrev PauseMask := Std.HashMap Nat (List Nat)
+
+def applyControl (mask : PauseMask) (priority controller : Nat) : Control → PauseMask
+  | .pause =>
+      let controllers := mask.getD priority []
+      if controllers.contains controller then mask
+      else mask.insert priority ((controller :: controllers).mergeSort)
+  | .resume => mask.insert priority ((mask.getD priority []).erase controller)
+
+def eligible (mask : PauseMask) (priority : Nat) : Bool :=
+  (mask.getD priority []).isEmpty
+
+end Pfc
+
+structure Packet where
+  id : Nat
+  flow : Nat
+  sizeBytes : Nat
+  deriving DecidableEq, Repr
+
+def packetClass (packet : Packet) (classCount : Nat) : Nat :=
+  packet.flow % classCount
+
+namespace Drr
+
+structure State where
+  classCount : Nat
+  quanta : Std.HashMap Nat Nat
+  deficits : Std.HashMap Nat Nat := ∅
+  queues : Std.HashMap Nat (List Packet) := ∅
+  currentClass : Nat := 0
+  waiting : Nat := 0
+  deriving Repr
+
+def queue (state : State) (classId : Nat) : List Packet :=
+  state.queues.getD classId []
+
+def deficit (state : State) (classId : Nat) : Nat :=
+  state.deficits.getD classId 0
+
+def enqueue (state : State) (packet : Packet) : State :=
+  let classId := packetClass packet state.classCount
+  { state with
+    queues := state.queues.insert classId (queue state classId ++ [packet])
+    waiting := state.waiting + 1 }
+
+def addRoundQuanta (state : State) : State :=
+  let classes := List.range state.classCount
+  classes.foldl
+    (fun state classId =>
+      if (queue state classId).isEmpty then
+        { state with deficits := state.deficits.insert classId 0 }
+      else
+        let quantum := state.quanta.getD classId 0
+        { state with
+          deficits := state.deficits.insert classId (deficit state classId + quantum) })
+    state
+
+def advance (state : State) : State :=
+  let next := state.currentClass + 1
+  if next < state.classCount then
+    { state with currentClass := next }
+  else
+    addRoundQuanta { state with currentClass := 0 }
+
+def headEligible (state : State) : Bool :=
+  match queue state state.currentClass with
+  | [] => false
+  | packet :: _ => packet.sizeBytes ≤ deficit state state.currentClass
+
+def scanIneligible (lineNo : Nat) (state : State) : Except String State := do
+  require lineNo (!headEligible state) "DRR scan skipped an eligible head"
+  pure (advance state)
+
+def scan (lineNo steps : Nat) (state : State) : Except String State :=
+  match steps with
+  | 0 => pure state
+  | steps + 1 => do
+      let state ← scanIneligible lineNo state
+      scan lineNo steps state
+
+def schedule (lineNo scanSteps : Nat) (state : State) : Except String (State × Packet) := do
+  require lineNo (state.classCount > 0) "class_count must be > 0"
+  require lineNo (state.waiting > 0) "schedule on empty DRR"
+  let state ← scan lineNo scanSteps state
+  let classId := state.currentClass
+  match queue state classId with
+  | [] => throw s!"line {lineNo}: DRR scan ended on an empty class"
+  | packet :: rest => do
+      let available := deficit state classId
+      require lineNo (packet.sizeBytes ≤ available) "DRR head exceeds deficit"
+      let state :=
+        { state with
+          deficits := state.deficits.insert classId (available - packet.sizeBytes)
+          queues := state.queues.insert classId rest
+          waiting := state.waiting - 1 }
+      pure (state, packet)
+
+end Drr
+
+namespace Wrr
+
+structure State where
+  classCount : Nat
+  weights : Std.HashMap Nat Nat
+  sent : Std.HashMap Nat Nat := ∅
+  queues : Std.HashMap Nat (List Packet) := ∅
+  currentClass : Nat := 0
+  waiting : Nat := 0
+  deriving Repr
+
+def queue (state : State) (classId : Nat) : List Packet :=
+  state.queues.getD classId []
+
+def enqueue (state : State) (packet : Packet) : State :=
+  let classId := packetClass packet state.classCount
+  { state with
+    queues := state.queues.insert classId (queue state classId ++ [packet])
+    waiting := state.waiting + 1 }
+
+def advance (state : State) : State :=
+  let classId := state.currentClass
+  { state with
+    sent := state.sent.insert classId 0
+    currentClass := (classId + 1) % state.classCount }
+
+def scheduleLoop (lineNo : Nat) : Nat → State → Except String (State × Packet)
+  | 0, _ => throw s!"line {lineNo}: WRR scan exhausted"
+  | fuel + 1, state => do
+      let classId := state.currentClass
+      let weight ←
+        match state.weights.get? classId with
+        | none => throw s!"line {lineNo}: missing WRR weight for class {classId}"
+        | some weight => pure weight
+      require lineNo (weight > 0) s!"WRR weight must be > 0 for class {classId}"
+      match queue state classId with
+      | packet :: rest =>
+          let count := state.sent.getD classId 0
+          if count < weight then
+            pure
+              ({ state with
+                  sent := state.sent.insert classId (count + 1)
+                  queues := state.queues.insert classId rest
+                  waiting := state.waiting - 1 },
+                packet)
+          else
+            scheduleLoop lineNo fuel (advance state)
+      | [] => scheduleLoop lineNo fuel (advance state)
+
+def schedule (lineNo : Nat) (state : State) : Except String (State × Packet) := do
+  require lineNo (state.classCount > 0) "class_count must be > 0"
+  require lineNo (state.waiting > 0) "schedule on empty WRR"
+  -- Every class is inspected at most once to reset its round state and once more to select
+  -- from a nonempty class, matching the scalar executor's cyclic scan.
+  scheduleLoop lineNo (2 * state.classCount) state
+
+end Wrr
+
+/-!
+Days AGO's exact Weighted Fair Queueing (P16 L2), after Demers, Keshav and Shenker. Virtual time
+and finish tags are rationals normalized by the egress link's rate (bits rather than seconds), as
+in the executor's `WfqSchedulerState`: a packet's service is `size_bytes * 8 / weight`, and virtual
+time advances by `elapsed_ns * rate_bps / (10^9 * W)` over the active classes' weight sum `W`.
+A packet's class is `flow % class_count`.
+-/
+namespace Wfq
+
+/-- The scheduler state one transition reads and writes. -/
+structure State where
+  virtualTime : Rat
+  lastUpdatedNs : Nat
+  /-- Each class's last finish tag. -/
+  finishTimes : List Rat
+  /-- Each class's queued plus in-service packets. -/
+  activePackets : List Nat
+  deriving DecidableEq, Repr
+
+def initial (classCount : Nat) : State :=
+  { virtualTime := 0
+    lastUpdatedNs := 0
+    finishTimes := List.replicate classCount 0
+    activePackets := List.replicate classCount 0 }
+
+def activeWeightSum (weights activePackets : List Nat) : Nat :=
+  (weights.zip activePackets).foldl
+    (fun sum (weight, active) => if active = 0 then sum else sum + weight) 0
+
+/-- Virtual time at `timeNs`, advanced over the active weight sum (which must be positive). -/
+def advance (rateBps : Nat) (weights : List Nat) (state : State) (timeNs : Nat) : Rat :=
+  let weightSum := activeWeightSum weights state.activePackets
+  state.virtualTime +
+    (((timeNs - state.lastUpdatedNs) * rateBps : Nat) : Rat) / ((1_000_000_000 * weightSum : Nat) : Rat)
+
+/--
+Admit a packet of `classId` at `timeNs`: an idle scheduler resets virtual time and every class's
+finish tag to zero; otherwise virtual time advances. The packet starts at the later of virtual time
+and its class's last finish tag. Returns the state after, the virtual start and the finish tag.
+-/
+def enqueue (lineNo rateBps : Nat) (weights : List Nat) (state : State)
+    (classId sizeBytes timeNs : Nat) : Except String (State × Rat × Rat) := do
+  require lineNo (state.lastUpdatedNs ≤ timeNs) "WFQ time went backwards"
+  let weight := weights.getD classId 0
+  require lineNo (weight > 0) s!"WFQ weight of class {classId} must be positive"
+  let idle := state.activePackets.all (· = 0)
+  let virtualTime := if idle then 0 else advance rateBps weights state timeNs
+  let finishTimes := if idle then List.replicate weights.length 0 else state.finishTimes
+  let previous := finishTimes.getD classId 0
+  let start := if virtualTime < previous then previous else virtualTime
+  let finish := start + ((sizeBytes * 8 : Nat) : Rat) / (weight : Rat)
+  pure
+    ({ virtualTime
+       lastUpdatedNs := timeNs
+       finishTimes := finishTimes.set classId finish
+       activePackets :=
+         state.activePackets.set classId (state.activePackets.getD classId 0 + 1) },
+      start, finish)
+
+/--
+Complete the service of a packet of `classId` at `timeNs`: virtual time advances over the active
+set that still holds the packet, then the class loses it; a scheduler left idle resets its virtual
+time and that class's finish tag to zero.
+-/
+def complete (lineNo rateBps : Nat) (weights : List Nat) (state : State)
+    (classId timeNs : Nat) : Except String State := do
+  require lineNo (state.lastUpdatedNs ≤ timeNs) "WFQ time went backwards"
+  let active := state.activePackets.getD classId 0
+  require lineNo (active > 0) s!"WFQ class {classId} completes a packet it does not hold"
+  let virtualTime := advance rateBps weights state timeNs
+  let activePackets := state.activePackets.set classId (active - 1)
+  if activePackets.all (· = 0) then
+    pure
+      { virtualTime := 0
+        lastUpdatedNs := timeNs
+        finishTimes := state.finishTimes.set classId 0
+        activePackets }
+  else
+    pure { state with virtualTime, lastUpdatedNs := timeNs, activePackets }
+
+/-- A waiting packet: its finish tag and its enqueue ordinal at the queue. -/
+structure Waiting where
+  payload : Nat
+  finish : Rat
+  order : Nat
+  deriving Repr
+
+/-- The served packet: the least finish tag, the earliest enqueue among equal tags. -/
+def least : List Waiting → Option Waiting
+  | [] => none
+  | first :: rest =>
+      some <| rest.foldl
+        (fun best packet =>
+          if packet.finish < best.finish ||
+              (packet.finish = best.finish && packet.order < best.order) then
+            packet
+          else
+            best)
+        first
+
+end Wfq
+
+end LeanGuard.P10c.Semantics

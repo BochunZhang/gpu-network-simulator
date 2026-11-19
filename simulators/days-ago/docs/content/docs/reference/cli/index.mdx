@@ -1,0 +1,16 @@
+---
+title: CLI
+description: The days CLI, the legacy CLI, the LeanGuard tools, and the retained measurement binaries.
+---
+
+User-facing entry points:
+
+- [`days`](/docs/reference/cli/days) (package `days`): compile one scenario and run it on the Scalar, CPU, Metal, or CUDA engine of Days AGO.
+- [`days-legacy`](/docs/reference/cli/days-legacy) (package `days-legacy`): run one scenario on the frozen Legacy Days simulator.
+- [`leanguard-run`](/docs/reference/cli/leanguard-run): generate or discover legacy traces and invoke the Lean checkers.
+- [`leanguard-testgen`](/docs/reference/cli/leanguard-testgen): generate, replay, and minimize checker corpora.
+
+The root package also has two measurement binaries. They are validation tools, not a stable general-purpose CLI:
+
+- `device-sizing-report [FIXTURE]`: lowers one fixture and prints the default Metal and CUDA device plan, plane by plane, using host arithmetic only. It allocates no device memory and does not run the simulation.
+- `sustained-benchmark`: the timing harness for the sustained device fixtures. It builds only with `--features metal` or `--features cuda`.

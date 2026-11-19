@@ -1,0 +1,73 @@
+---
+title: Examples
+description: Runnable Days AGO fixtures, from the TCP smoke test to the 262,144-flow frontier.
+---
+
+**Scope: Days AGO.** Run commands from the repository root. Examples for the frozen legacy simulator are on the [Legacy Days](/docs/legacy) page.
+
+## TCP smoke fixture
+
+`configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml` is a k=4 fat tree with 16 CUBIC flows, small enough for a quick check of every engine:
+
+```bash
+cargo run --release --bin days -- --engine scalar \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
+
+cargo run --release --bin days -- --engine cpu --workers 2 \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
+```
+
+## TCP corpus
+
+`configs/benchmarks/tcp/` also holds k=16 and k=32 fat trees with one Reno or CUBIC flow per host (1,024 and 8,192 flows). `configs/benchmarks/tcp/tcp-corpus-manifest.md` lists each fixture's shape. The [byte-identity campaign](/docs/testing#tcp-corpus-byte-identity) runs all five fixtures on every available backend.
+
+## E5 wide TCP
+
+E5 is a family of k=32 fat trees with 8,192 hosts and one byte-terminated 1 MiB TCP flow per host:
+
+- `configs/benchmarks/evaluation/e5_wide_k32_q200.toml` (Reno, 200-packet queues)
+- `configs/benchmarks/evaluation/e5_wide_k32_q200_cubic.toml` (CUBIC, 200-packet queues)
+- `configs/benchmarks/evaluation/e5_wide_k32_q256.toml` (Reno, 256-packet queues)
+
+Run the Reno fixture on the CPU engine:
+
+```bash
+cargo run --release --bin days -- --engine cpu --workers 4 \
+  configs/benchmarks/evaluation/e5_wide_k32_q200.toml
+```
+
+## E6 constant-rate traffic
+
+E6 is a family of k=32 fat trees with 8,192 constant-rate `PacketDistribution` flows at increasing offered load: `configs/benchmarks/evaluation/e6_cbr_k32_load_01.toml`, `_10`, `_30`, and `_60`.
+
+```bash
+cargo run --release --bin days -- --engine cpu --workers 4 \
+  configs/benchmarks/evaluation/e6_cbr_k32_load_01.toml
+```
+
+## Frontier fixture
+
+`configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml` defines 32 flow sets of 8,192 closed-loop Reno flows, 262,144 flows in total. A Scalar run:
+
+```bash
+cargo run --release --bin days -- --engine scalar \
+  configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml
+```
+
+On a device, the default channel-stream cap of 2,048 events can exceed device memory for this fixture; `--channel-events-per-stream 256` lowers the starting cap. Capacity is refuse-or-run, so the cap changes memory use and retries, never the result.
+
+## Capacity warm start
+
+A device run can save the capacities it converged on and pass them to a later run of the same fixture as first-attempt sizing:
+
+```bash
+cargo run --release --features metal --bin days -- --engine metal \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --dump-capacity-warm-start /tmp/days-capacity-warm-start.txt
+
+cargo run --release --features metal --bin days -- --engine metal \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --capacity-warm-start /tmp/days-capacity-warm-start.txt
+```
+
+The snapshot changes initial arena sizing only. Both runs report the same `result_bytes` and `result_fnv1a64`. Use `--features cuda` and `--engine cuda` on an NVIDIA host.

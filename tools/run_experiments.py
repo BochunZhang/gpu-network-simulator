@@ -36,6 +36,11 @@ CONTROLLER_COMMIT_ENV = 'GPU_NET_SIM_CONTROLLER_COMMIT'
 TERMINAL = {'succeeded', 'failed', 'abandoned'}
 NSYS_REPORT_SUFFIX = '.nsys-rep'
 NSYS_REPORT_ARCHIVE_LIMIT = 8 * 1024**3
+# Full FT48 files are explicitly named. At 24 B/warp the GeDES run writes 51.4 GiB
+# before its launch index, graph and preview. Keep the independent general-file cap.
+WARP_TRACE_FILES = {'warp/lifetimes.bin', 'warp/index.sqlite', 'warp/preview.perfetto.json',
+                    'warp/summary.json', 'warp/graph.dot', 'warp/pending.iket.json'}
+WARP_TRACE_ARCHIVE_LIMIT = 128 * 1024**3
 RESULT_SUFFIXES = {'.json', '.csv', '.txt', NSYS_REPORT_SUFFIX}
 FILE_LIMIT = 2 * 1024**2
 ARCHIVE_LIMIT = 16 * 1024**2
@@ -964,19 +969,27 @@ def run_candidates(results, row):
     return [path]
 
 
+def is_warp_capture(record):
+    task = record.get('task', {})
+    return (isinstance(task, dict) and task.get('params') == {'warp_trace': True}
+            and record.get('kind') in {'days_ago_fat_tree48', 'gedes_fat_tree48'})
+
+
 def prepare_archive(output, record):
     record['archive_name'] = archive_name(record)
     tarpath = archive_path(output.parent.parent, record)
     tarpath.parent.mkdir(parents=True, exist_ok=True)
     tmp_tar = tarpath.with_suffix('.tmp')
     metadata = output / '.archive-metadata.json'
-    selected, omitted, total, trace_total = [], [], 0, 0
+    warp_files = WARP_TRACE_FILES if is_warp_capture(record) else set()
+    selected, omitted, total, trace_total, warp_total = [], [], 0, 0, 0
     candidates = []
     for path in output.rglob('*'):
         relative = path.relative_to(output)
         if (any(part.startswith('.') for part in relative.parts)
                 or relative.as_posix() in {'result.json', 'run.json'}
-                or path.suffix not in RESULT_SUFFIXES or path.is_symlink() or not path.is_file()
+                or (path.suffix not in RESULT_SUFFIXES and relative.as_posix() not in warp_files)
+                or path.is_symlink() or not path.is_file()
                 or any(parent.is_symlink() for parent in path.parents if parent.is_relative_to(output))):
             continue
         candidates.append(path)
@@ -986,7 +999,12 @@ def prepare_archive(output, record):
                                      path.relative_to(output).as_posix()))
     for path in candidates:
         size = path.stat().st_size
-        if path.suffix == NSYS_REPORT_SUFFIX:
+        if path.relative_to(output).as_posix() in warp_files:
+            warp_total += size
+            if warp_total > WARP_TRACE_ARCHIVE_LIMIT:
+                raise OSError('warp trace exceeds package capacity; original data retained on CPFS')
+            selected.append(path)
+        elif path.suffix == NSYS_REPORT_SUFFIX:
             if trace_total + size <= NSYS_REPORT_ARCHIVE_LIMIT:
                 trace_total += size
                 selected.append(path)
@@ -1002,7 +1020,7 @@ def prepare_archive(output, record):
         record['archive_omitted'] = omitted
     write_json(metadata, record)
     try:
-        with tarfile.open(tmp_tar, 'w:gz') as archive:
+        with tarfile.open(tmp_tar, 'w:gz', compresslevel=1 if warp_total else 9) as archive:
             archive.add(metadata, arcname='result.json')
             for path in selected:
                 archive.add(path, arcname=path.relative_to(output).as_posix())

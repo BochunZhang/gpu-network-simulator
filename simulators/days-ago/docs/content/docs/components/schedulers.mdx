@@ -1,0 +1,52 @@
+---
+title: Schedulers
+description: Days AGO queue ownership, service disciplines, admission, and backend limits.
+---
+
+**Scope: Days AGO.** The legacy scheduler actors, including VirtualClock and the floating-point RED policy, are described in [Legacy schedulers](/docs/legacy/components/schedulers).
+
+Schedulers combine queue admission, packet selection, and non-preemptive link service. Lowering gives each switch-egress LP one queue and one closed `SchedulerKind` state value.
+
+## Service sequence
+
+The executor represents service as three transitions:
+
+1. `RemoteArrival` applies admission and inserts the packet.
+2. `TxReady` selects one eligible packet and commits it to `in_service`.
+3. `TxComplete` releases the server, updates discipline state, forwards the transmitted packet as a remote arrival, and schedules another local selection when work remains.
+
+The event key gives arrivals phase 0, completions phase 1, and service selection phase 2 at equal nanosecond times. PFC eligibility is checked before selection, and service remains non-preemptive.
+
+## Disciplines
+
+| Config value | Executor state | Scalar/CPU | Metal/CUDA |
+| --- | --- | --- | --- |
+| `FIFO` | `Fifo` | yes | yes |
+| `SP` | `StaticPriority` | yes | yes |
+| `WFQ` | `WeightedFairQueue` | yes | yes |
+| `DRR` | `DeficitRoundRobin` | yes | yes |
+| `WRR` | `WeightedRoundRobin` | yes | yes |
+| `VirtualClock` | none | rejected at compilation | rejected at compilation |
+
+Classed schedulers use `flow_id % class_count`. SP orders larger configured priorities first. DRR stores byte quanta and deficits; each class quantum is `1500 * weight / smallest_weight` bytes. WRR stores per-class packet counts. WFQ stores virtual time and finish tags as reduced arbitrary-precision rationals on Scalar and CPU; Metal and CUDA use checked 320-bit rational components, and device validation requires each rational to fit.
+
+Lowering rejects zero class weights. VirtualClock fails before image construction:
+
+```text
+unsupported scheduler `VirtualClock`; Days executor supports FIFO, SP, WFQ, DRR, and WRR
+```
+
+## Admission and ECN
+
+| Policy | Scalar/CPU | Metal/CUDA |
+| --- | --- | --- |
+| TailDrop at the packet capacity | yes | yes |
+| ECN ramp (`switch.ecn`, `switch.ecn_by_rate`) | yes | yes |
+
+A TailDrop queue drops a packet that would exceed its packet capacity; capacity zero means unlimited. An ECN queue drops a packet that would exceed its byte capacity (`ecn_capacity_bytes`) and marks ECN-capable data on the Kmin/Kmax/Pmax ramp over its byte depth after admission, with a stateless hash draw between the thresholds. The step is the ramp with `kmin = kmax` and `pmax = 1`. Packets that are not ECN-capable data (ACKs, NACKs, CNPs, PFC frames) are never marked and never draw. The rule, its exact integer form and the draw are on [Switches & Queues](/docs/configuration/switches).
+
+The policy is immutable: no queue carries marking state, so checkpoints and device readback hold none. RED and RED_ECN were removed in P16; Days AGO refuses them, and `ECN_THRESHOLD`, at lowering.
+
+## PFC queue state
+
+Queues store their PFC monitors and pause-controller sets beside scheduler state. PFC runs on Scalar, CPU, Metal, and CUDA. See [PFC](/docs/components/l2) and [Switch configuration](/docs/configuration/switches).

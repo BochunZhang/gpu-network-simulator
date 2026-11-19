@@ -1,0 +1,78 @@
+---
+title: Semantic coverage & test generation
+description: Coverage-guided scenario generation using checker-derived semantic coverpoints.
+---
+
+For more information about the CLI:
+
+- [/docs/reference/cli/leanguard-testgen](/docs/reference/cli/leanguard-testgen)
+
+## Why test generation is needed
+
+LeanGuard makes a single execution *checkable*, but one accepted trace is
+not a test suite. To gain confidence across protocols and corner cases
+(gates, thresholds, rounding boundaries, interleavings), the goal is to
+build **many small adversarial executions** that can run routinely in CI.
+
+## Semantic coverage (spec-level)
+
+In this workflow, the simulator is the untrusted producer and the Lean
+checker is trusted. So coverage is defined at the **specification level**
+rather than as code coverage in the simulator implementation.
+
+### Coverpoints
+
+Coverpoints are semantically meaningful events during replay, for example:
+
+- **Event kinds**: observed `enqueue`, `schedule`, `depart`, `timer_tick`, …
+- **Guards / branches**: gate fired vs blocked; threshold crossed vs not;
+  min/max clamp hit
+- **Obligations**: pairing map used; accounting update executed;
+  time-monotonicity check executed
+- **Rounding / encoding**: boundary cases in integer encodings
+
+These coverpoints are emitted by the checker during replay, as
+deterministic observers of trusted semantics.
+
+## Coverage-guided loop
+
+The generator loop:
+
+1. Start from a seed corpus (handwritten scenarios + prior regressions).
+2. Mutate or calibrate a candidate scenario (TOML + seeds + bounded
+   duration).
+3. Run Days to emit trace certificates (`*_events.csv`).
+4. Run LeanGuard checkers to obtain `ACCEPT`/`REJECT` (the oracle),
+   coverpoints (the coverage sensor), and the first failing row on
+   rejection.
+5. Persist the outcome into the corpus.
+
+Campaigns currently support the **DCQCN, AQM, PFC, WFQ, DRR, and CUBIC**
+protocol families.
+
+## Corpus management
+
+The fuzz/campaign corpus **persists both accepted and rejected cases**;
+accepted cases are additionally marked `new` (coverage-expanding) or
+`redundant` (`src/utils/testgen.rs`). Nothing is silently discarded — a
+redundant accepted case is recorded as such rather than dropped, and
+rejected cases are kept with their first failing row for minimization.
+
+Practical corpus strategies:
+
+- **Tiers**: micro-harness tests (isolated components) vs full integration
+  scenarios.
+- **Deduplication**: one representative per semantic signature
+  (coverpoint bitset, canonical kind sequence).
+- **Minimization**: shrink failing scenarios while preserving the same
+  first failure (delta debugging), via the `minimize` subcommand.
+
+**Set-cover reduction** — selecting a minimal subset of accepted tests that
+covers all reached coverpoints — is a method described in the paper; the
+current CLI does not expose a set-cover subcommand, so it is applied
+offline when needed.
+
+Quantitative campaign results (coverpoint counts, goal-directed calibration
+hit rates, reduction factors) belong to the paper's evaluation; this tree
+does not pin those result artifacts, so this page states the mechanisms
+and leaves the numbers to the paper.

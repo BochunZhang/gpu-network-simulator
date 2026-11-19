@@ -1,0 +1,66 @@
+---
+title: leanguard-run
+description: Generate or discover legacy trace CSVs and invoke LeanGuard checkers.
+---
+
+**Scope: Legacy Days traces and the Lean checkers.** `leanguard-run` optionally launches the separately built `days-legacy` binary,
+discovers nonempty certificate CSVs, invokes matching Lean executables, and
+prints one `RunSummaryV1` JSON document.
+
+## Build and run
+
+A bare `lake build` builds only the default targets (`DaysExecutor` and `dcqcn_check`), so name
+the checkers the runner may select:
+
+```bash
+cd lean && lake build dcqcn_check pfc_check cubic_check tcp_check drr_check wfq_check \
+  aqm_check aqm_dcqcn_check && cd ..
+cargo build -p days-legacy --features dcqcn,l2_pfc,lean --bin days-legacy
+cargo run --bin leanguard-run -- \
+  --config configs/dcqcn_simple.toml \
+  --legacy-runner target/debug/days-legacy \
+  --checker-dir lean/.lake/build/bin
+```
+
+The scenario must leave `csv_logging` enabled. With `csv_logging=false`, the
+legacy run creates no CSVs or `traces.json`, so there are no certificates to
+discover.
+
+Check an existing log directory without rerunning the simulator:
+
+```bash
+cargo run --bin leanguard-run -- \
+  --config configs/dcqcn_simple.toml \
+  --mode check-only \
+  --checker-dir lean/.lake/build/bin
+```
+
+## Flags
+
+- `--config <path>`: required TOML path; `log_path` is read from it.
+- `--mode <simulate-and-check|check-only>`: default `simulate-and-check`.
+- `--checker-dir <path>`: default `lean/.lake/build/bin`.
+- `--legacy-runner <path>`: explicit legacy trace generator. If omitted, the
+  runner checks `DAYS_LEGACY_RUNNER`, then a `days-legacy` executable next to `leanguard-run`.
+- `--allow-nondeterministic`: permit `threading="multiple"`; otherwise that
+  simulation mode is refused.
+- `--coverage` and `--coverage-dir <path>`: request checker coverpoints and
+  include their union/per-checker sets in the JSON summary.
+
+## Discovery and checker selection
+
+The runner prefers `<log_path>/traces.json`, then scans for nonempty PFC, AQM,
+DCQCN, WFQ, DRR, CUBIC, and TCP event files. It selects `pfc_check`,
+`aqm_check`, `dcqcn_check`, `wfq_check`, `drr_check`, `cubic_check`, or
+`tcp_check`; when both AQM and DCQCN exist it also runs `aqm_dcqcn_check`.
+
+## Output and exit codes
+
+`RunSummaryV1` includes version/mode, config and log paths, determinism status,
+simulator status/error, trace-discovery mode/list, checker results, optional
+coverage, and final `accept`.
+
+- `0`: `accept=true`.
+- `1`: the simulation/checking workflow completed but did not accept.
+- `2`: input/refusal/discovery failure, such as invalid config, refused
+  multithreading, or no trace in check-only mode.
