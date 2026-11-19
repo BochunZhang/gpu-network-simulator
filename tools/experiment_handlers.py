@@ -456,10 +456,11 @@ def prepare(kind, params):
             and params == {"warp_trace": True} and params["warp_trace"] is True):
         return partial(_run_pinned, kind, warp_trace=True)
     if (kind == "gedes_fat_tree48" and isinstance(params, dict)
-            and set(params) == {"profile", "capture_seconds"}):
+            and set(params) in ({"profile", "capture_seconds"}, {"profile", "capture_seconds", "metric_set"})):
         seconds = params["capture_seconds"]
-        if params["profile"] is True and type(seconds) is int and seconds > 0:
-            return partial(_run_pinned, kind, profile=True, capture_seconds=seconds)
+        if (params["profile"] is True and type(seconds) is int and seconds > 0
+                and params.get("metric_set", "gb10x") in ("gb10x", "gb10x-ct")):
+            return partial(_run_pinned, kind, **params)
     if (kind in {"days_ago_fat_tree48", "gedes_fat_tree48"}
             and params == {"profile": True} and params["profile"] is True):
         return partial(_run_pinned, kind, profile=True)

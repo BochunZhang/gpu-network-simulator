@@ -7,7 +7,7 @@ import sqlite3
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import nsys_ft48
@@ -43,14 +43,17 @@ class NsysFT48Tests(unittest.TestCase):
             ("cudaGraphLaunch_v10000", "cuGraphLaunch_v10000", "cudaStreamSynchronize_v3020",
              "forward_frames", "days_horizon_sweep", "days_round",
              "days_round_finalize", "other_days_stage"), 1))
-        for i, metric in enumerate(nsys_ft48.METRICS, 1):
-            self.db.execute("INSERT INTO TARGET_INFO_GPU_METRICS VALUES (?, ?, ?)",
-                            (500, i, metric))
-            self.db.executemany("INSERT INTO GPU_METRICS VALUES (?, ?, ?, ?)",
-                                [(30, 500, i, 0), (110, 500, i, 80)])
+        for i, name in enumerate(("SMs Active", "SM Issue", "DRAM Read Bandwidth", "DRAM Write Bandwidth"), 1):
+            self._add_metric(i, name)
+
+    def _add_metric(self, metric_id, name):
+        self.db.execute("INSERT INTO TARGET_INFO_GPU_METRICS VALUES (?, ?, ?)", (500, metric_id, name))
+        self.db.executemany("INSERT INTO GPU_METRICS VALUES (?, ?, ?, ?)",
+                            [(30, 500, metric_id, 0), (110, 500, metric_id, 80)])
 
     def test_capture_switch_preserves_full_run_prefix(self):
         full = nsys_ft48.prefix("nsys", self.output)
+        self.assertIn("--gpu-metrics-set=gb10x", full)
         self.assertIn("--capture-range=none", full)
         self.assertNotIn("--capture-range-end=stop", full)
         window = nsys_ft48.prefix("nsys", self.output, capture_range=True)
@@ -58,6 +61,26 @@ class NsysFT48Tests(unittest.TestCase):
         self.assertEqual(window, full[:position] + [
             "--capture-range=cudaProfilerApi", "--capture-range-end=stop",
         ] + full[position + 1:])
+        triage = nsys_ft48.prefix("nsys", self.output, capture_range=True, metric_set="gb10x-ct")
+        self.assertEqual(triage, ["--gpu-metrics-set=gb10x-ct" if arg == "--gpu-metrics-set=gb10x"
+                                  else arg for arg in window])
+
+    def test_preflight_requires_the_requested_alias_on_the_selected_gpu(self):
+        nsys = self.output / f"NsightSystems-{nsys_ft48.VERSION}/bin/nsys"
+        nsys.parent.mkdir(parents=True)
+        nsys.touch(mode=0o755)
+        env = {"GPU_NET_SIM_REPO_ROOT": str(self.output), "CUDA_VISIBLE_DEVICES": "GPU-abc"}
+        sets = "    gb10x : General metrics\n"
+
+        def command(args, log, **kwargs):
+            log.write_text(nsys_ft48.VERSION if "--version" in args else sets)
+
+        helpers = Mock()
+        helpers.command.side_effect = command
+        with self.assertRaisesRegex(RuntimeError, "gb10x-ct"):
+            nsys_ft48.preflight(self.output, env, helpers, metric_set="gb10x-ct")
+        sets += "    gb10x-ct : Compute triage metrics\n"
+        self.assertEqual(nsys_ft48.preflight(self.output, env, helpers, metric_set="gb10x-ct"), nsys.resolve())
 
     def _add_window_replays(self):
         self.db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?, ?, 7, ?, ?, 0)", (
@@ -67,7 +90,7 @@ class NsysFT48Tests(unittest.TestCase):
             "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, 0, ?, 673, 71, 4, 2, 1, 1, 64, 1, 1)",
             [(24, 78, 150), (115, 175, 160)])
 
-    def _collect_window(self, window, *, lost=0):
+    def _collect_window(self, window, *, lost=0, **profile_options):
         self.db.commit()
         source = self.db
         output = self.output
@@ -89,7 +112,32 @@ class NsysFT48Tests(unittest.TestCase):
                 path.write_text(json.dumps(value))
 
         return nsys_ft48.collect("nsys", output, {}, Helpers, simulator="gedes",
-                                rounds=95851, capture_window=window)
+                                rounds=95851, capture_window=window, **profile_options)
+
+    def test_compute_triage_exports_distinct_percent_series_and_requires_sol(self):
+        self._add_window_replays()
+        self.db.execute("DELETE FROM TARGET_INFO_GPU_METRICS")
+        self.db.execute("DELETE FROM GPU_METRICS")
+        labels = ("SMs Active", "SM Issue Active", "SM Throughput", "DRAM Read Bandwidth",
+                  "DRAM Write Bandwidth", "SM ALU Pipe Throughput", "SM Warps Stalled on L1 Operation")
+        for i, name in enumerate(labels, 1):
+            self._add_metric(i, name + " [Throughput %]")
+        self._add_metric(8, "L2 Sector Hit Rate [Ratio %]")
+        self._add_metric(9, "SM ALU Pipe Throughput [Avg]")
+        window = {"first_round": 0, "end_round": 2, "wall_ns": 10_000_002_200, "requested_seconds": 10}
+        report = self._collect_window(window, metric_set="gb10x-ct")
+        self.assertEqual(report["metric_set"], "gb10x-ct")
+        for name in (*labels, "L2 Sector Hit Rate"):
+            self.assertEqual(report["gpu_metrics"][name]["sample_point_mean_pct"], 40)
+        with (self.output / "profile-metric-windows.csv").open(newline="") as stream:
+            recorded = {row["metric"] for row in csv.DictReader(stream)}
+        self.assertIn("SM Throughput [Throughput %]", recorded)
+        self.assertIn("SM Issue Active [Throughput %]", recorded)
+        self.assertNotIn("SM ALU Pipe Throughput [Avg]", recorded)
+
+        self.db.execute("DELETE FROM TARGET_INFO_GPU_METRICS WHERE metricName='SM Throughput [Throughput %]'")
+        with self.assertRaisesRegex(RuntimeError, "missing usable GPU series: SM Throughput"):
+            self._collect_window(window, metric_set="gb10x-ct")
 
     def test_capture_local_graph_replay_count_differs_from_full_run(self):
         self._add_window_replays()

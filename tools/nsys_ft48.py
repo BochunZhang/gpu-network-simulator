@@ -20,6 +20,19 @@ VERSION = "2026.6.1"
 FREQUENCY_HZ = 10_000
 METRIC_SET = "gb10x"
 METRICS = ("SMs Active", "SM Issue", "DRAM Read Bandwidth", "DRAM Write Bandwidth")
+CT_METRIC_SET = "gb10x-ct"
+REQUIRED_METRICS = {
+    METRIC_SET: METRICS,
+    CT_METRIC_SET: ("SMs Active", "SM Issue Active", "SM Throughput",
+                    "DRAM Read Bandwidth", "DRAM Write Bandwidth"),
+}
+CT_CONTEXT_METRICS = (
+    "SM Warps Active CS", "SM Warps Stalled on L1 Operation", "SM Warps Stalled on MIO Operation",
+    "SM ALU Pipe Throughput", "SM FMA Pipe Throughput", "SM FMA Light Pipe Throughput",
+    "SM FMA Heavy Pipe Throughput", "SM Uniform Pipe Throughput", "SM XU Pipe Throughput",
+    "SM FP64 Pipe Active", "SM Tensor Pipe Active", "L1 Throughput",
+    "L1 Sector Hit Rate", "L2 Sector Hit Rate",
+)
 PERIOD_NS = 1_000_000_000 // FREQUENCY_HZ
 WINDOW_ROUNDS = 128
 MAX_WINDOW_REPORT_BYTES = 64 * 1024**2
@@ -31,7 +44,9 @@ LAUNCH_NAMES = (
 SYNC_NAMES = ("cudaStreamSynchronize", "cuStreamSynchronize")
 
 
-def preflight(output, env, helpers):
+def preflight(output, env, helpers, *, metric_set=METRIC_SET):
+    if metric_set not in REQUIRED_METRICS:
+        raise ValueError(f"unsupported Nsight metric set: {metric_set}")
     shared_root = env.get("GPU_NET_SIM_REPO_ROOT")
     root = Path(shared_root).resolve() if shared_root else Path(sys.argv[0]).resolve().parent.parent
     nsys = root / f"NsightSystems-{VERSION}" / "bin" / "nsys"
@@ -48,17 +63,17 @@ def preflight(output, env, helpers):
     sets = output / "nsys-metric-sets.txt"
     helpers.command([nsys, "profile", "--gpu-metrics-devices=cuda-visible",
                      "--gpu-metrics-set=help"], sets, env=env)
-    if not re.search(rf"\b{METRIC_SET}\b(?!-)", sets.read_text()):
-        raise RuntimeError(f"selected GPU does not expose {METRIC_SET}; see {sets.name}")
+    if not re.search(rf"^\s*{re.escape(metric_set)}\s*:", sets.read_text(), re.MULTILINE):
+        raise RuntimeError(f"selected GPU does not expose {metric_set}; see {sets.name}")
     return nsys
 
 
-def prefix(nsys, output, *, capture_range=False):
+def prefix(nsys, output, *, capture_range=False, metric_set=METRIC_SET):
     capture = (["--capture-range=cudaProfilerApi", "--capture-range-end=stop"]
                if capture_range else ["--capture-range=none"])
     return [str(nsys), "profile", "--trace=cuda,nvtx", "--sample=none", "--cpuctxsw=none",
             *capture, "--cuda-graph-trace=node", "--gpu-metrics-devices=cuda-visible",
-            f"--gpu-metrics-set={METRIC_SET}", f"--gpu-metrics-frequency={FREQUENCY_HZ}",
+            f"--gpu-metrics-set={metric_set}", f"--gpu-metrics-frequency={FREQUENCY_HZ}",
             "-o", str(output / "profile")]
 
 
@@ -184,15 +199,16 @@ def _copy_summary(db, tables, start, end):
     ]
 
 
-def _bin_metrics(db, first, last, windows, output, tables):
+def _bin_metrics(db, first, last, windows, output, tables, metric_names):
     if not {"GPU_METRICS", "TARGET_INFO_GPU_METRICS"} <= tables:
         return {}
     names = db.execute("SELECT DISTINCT typeId, metricId, metricName FROM TARGET_INFO_GPU_METRICS")
     selected = defaultdict(list)
     for type_id, metric_id, name in names:
-        for metric in METRICS:
-            if name and name.startswith(metric):
-                selected[metric].append((type_id, metric_id, name))
+        metric = (name or "").partition(" [")[0]
+        unit = "Ratio %" if metric in ("L1 Sector Hit Rate", "L2 Sector Hit Rate") else "Throughput %"
+        if metric in metric_names and name in (metric, f"{metric} [{unit}]"):
+            selected[metric].append((type_id, metric_id, name))
     ends = [window[1] for window in windows]
     summary = {}
     fields = ["first_replay", "last_replay", "start_ns", "end_ns", "metric", "samples",
@@ -348,7 +364,10 @@ def _analyze(db, output, simulator, rounds, report, *, capture_window=None):
     windows = [(group[0].start, (batch_groups[n + 1][0].start if n + 1 < len(batch_groups)
                                 else group[-1].sync_end), n * WINDOW_ROUNDS,
                 n * WINDOW_ROUNDS + len(group) - 1) for n, group in enumerate(batch_groups)]
-    metrics = _bin_metrics(db, starts[0], replays[-1].sync_end, windows, output, tables)
+    metric_set = report.get("metric_set", METRIC_SET)
+    required_metrics = REQUIRED_METRICS[metric_set]
+    metric_names = required_metrics + (CT_CONTEXT_METRICS if metric_set == CT_METRIC_SET else ())
+    metrics = _bin_metrics(db, starts[0], replays[-1].sync_end, windows, output, tables, metric_names)
     diagnostics = []
     if "DIAGNOSTIC_EVENT" in tables:
         diagnostics = [text for text, in db.execute("SELECT DISTINCT text FROM DIAGNOSTIC_EVENT")
@@ -421,10 +440,11 @@ def _analyze(db, output, simulator, rounds, report, *, capture_window=None):
         if (invalid or encoded != counts["days_attempt_nodes"]
                 or encoded < rounds or not all(len(replay.attempts) == 64 for replay in replays)):
             errors.append("Days graph attempt nodes do not match the pinned attempt DAG and waves")
-    for metric in METRICS:
+    for metric in metric_names:
         samples = metrics.get(metric, {})
         if not samples.get("samples"):
-            errors.append(f"missing usable GPU series: {metric}")
+            issues = errors if metric in required_metrics else report["warnings"]
+            issues.append(f"missing usable GPU series: {metric}")
         elif samples["invalid_samples"] or samples["gaps_above_two_nominal_periods"]:
             report["warnings"].append(f"{metric} has invalid samples or gaps; consult metric coverage")
     if any(re.search(r"(?i)buffer overflow|dropped .* (?:records|events|samples)", text)
@@ -461,13 +481,14 @@ def _survey(nsys, native, output, env, helpers):
     return {"duration_seconds": duration, "lost_events": lost}
 
 
-def collect(nsys, output, env, helpers, *, simulator, rounds, capture_window=None):
+def collect(nsys, output, env, helpers, *, simulator, rounds, capture_window=None,
+            metric_set=METRIC_SET):
     if simulator not in {"days-ago", "gedes"} or not isinstance(rounds, int) or rounds <= 0:
         raise ValueError("expected simulator days-ago/gedes and positive simulation round count")
     native = output / "profile.nsys-rep"
     database = output / "profile.sqlite"
     report = {
-        "simulator": simulator, "nsys_version": VERSION, "metric_set": METRIC_SET,
+        "simulator": simulator, "nsys_version": VERSION, "metric_set": metric_set,
         "simulation_rounds_reported": rounds, "requested_sampling_hz": FREQUENCY_HZ,
         "passed": False, "warnings": [], "errors": [],
         "raw_files": {}, "profiling_scope": "One full simulator process with CUDA graph-node trace "

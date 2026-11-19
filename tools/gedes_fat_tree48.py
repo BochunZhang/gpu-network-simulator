@@ -217,7 +217,7 @@ def _paired_fct(baseline_csv, trace_csv):
             'max_absolute_difference_ns': max(deltas), 'all_equal': not any(deltas)}
 
 
-def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace=False):
+def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace=False, metric_set=None):
     audit = helpers._support_module(source, 'gedes_experiments')
     drain = helpers._support_module(source, 'gedes_drain')
     summary = {'scope': 'Single-GB200 GeDES public artifact FatTree48 TCP/DCTCP workload with seeded inputs',
@@ -233,6 +233,8 @@ def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace
             raise ValueError('a positive integer GeDES capture duration requires profiling')
         if warp_trace and profile:
             raise ValueError('GeDES warp and Nsight captures use separate runs')
+        if metric_set is not None and not profile:
+            raise ValueError('a GeDES Nsight metric set requires profiling')
         if helpers.GEDES[1] != audit.UPSTREAM_REVISION:
             raise ValueError('unexpected GeDES source pin')
         capability, env = helpers.selected_gpu(output)
@@ -250,7 +252,8 @@ def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace
                 'process_seconds_scope': 'Nsight Systems wrapper including simulator execution and trace generation',
             }
             profiler = helpers._support_module(source, 'nsys_ft48')
-            nsys = profiler.preflight(output, env, helpers)
+            metric_options = {'metric_set': metric_set} if metric_set is not None else {}
+            nsys = profiler.preflight(output, env, helpers, **metric_options)
         helpers.command(['nvidia-smi', '--id=' + gpu['uuid'], '--query-gpu=memory.free',
                          '--format=csv,noheader,nounits'], output / 'gpu-free-mib.txt', env=env)
         summary['gpu'] = {**gpu, 'free_mib_before_build': int((output / 'gpu-free-mib.txt').read_text())}
@@ -293,7 +296,7 @@ def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace
                 prefix_options = {'capture_range': True} if capture_seconds is not None else {}
                 profile_env = {**env, CAPTURE_ENV: '1'} if capture_seconds is not None else env
                 _run_case(binary, profile_output, profile_env, audit, drain, helpers, capture['run'],
-                          prefix=profiler.prefix(nsys, output, **prefix_options), journal_dir=output)
+                          prefix=profiler.prefix(nsys, output, **prefix_options, **metric_options), journal_dir=output)
                 differences = capture['work_differences'] = _work_differences(summary, capture['run'])
                 full_rounds = capture['run']['measurements']['rounds']
                 collect_options = {}
@@ -302,7 +305,7 @@ def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace
                     capture['capture_window'] = collect_options['capture_window'] = window
                 if not differences or capture_seconds is not None:
                     capture['trace'] = profiler.collect(nsys, output, env, helpers, simulator='gedes',
-                                                        rounds=full_rounds, **collect_options)
+                                                        rounds=full_rounds, **collect_options, **metric_options)
                 if differences:
                     raise RuntimeError(f'GeDES profiled work differs from baseline: {", ".join(differences)}')
                 capture['passed'] = True

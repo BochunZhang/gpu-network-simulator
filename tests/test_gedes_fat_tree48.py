@@ -173,6 +173,12 @@ namespace VDES {''', 1
         warp.collect.assert_called_once_with(self.output, self.output, 'gedes', 4)
 
     def test_short_profile_collects_trace_before_reporting_fct_mismatch(self):
+        self._check_short_profile({})
+
+    def test_short_profile_passes_compute_triage_set_to_preflight_capture_and_export(self):
+        self._check_short_profile({'metric_set': 'gb10x-ct'})
+
+    def _check_short_profile(self, metric_options):
         binary = self.output / 'GeDES'
         nsys = self.output / 'nsys'
         profiler = Mock()
@@ -203,13 +209,15 @@ namespace VDES {''', 1
         with patch.object(study, '_run_case', side_effect=run_case) as run_cases, \
                 patch.object(study, '_build_gedes', return_value=binary) as build:
             with self.assertRaisesRegex(RuntimeError, 'flows.csv_sha256'):
-                study.run(self.output, self.output, helpers, profile=True, capture_seconds=10)
+                study.run(self.output, self.output, helpers, profile=True, capture_seconds=10,
+                          **metric_options)
         self.assertEqual(run_cases.call_count, 2)
         self.assertIn('patch_main', build.call_args.kwargs)
-        profiler.prefix.assert_called_once_with(nsys, self.output, capture_range=True)
+        profiler.preflight.assert_called_once_with(self.output, {}, helpers, **metric_options)
+        profiler.prefix.assert_called_once_with(nsys, self.output, capture_range=True, **metric_options)
         window = {'first_round': 0, 'end_round': 2, 'wall_ns': 10_000_000_000, 'requested_seconds': 10}
         profiler.collect.assert_called_once_with(nsys, self.output, {}, helpers, simulator='gedes',
-                                                rounds=3, capture_window=window)
+                                                rounds=3, capture_window=window, **metric_options)
         summary = json.loads((self.output / 'summary.json').read_text())
         self.assertFalse(summary['passed'])
         self.assertFalse(summary['profile']['passed'])
