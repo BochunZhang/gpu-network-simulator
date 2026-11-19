@@ -8,6 +8,8 @@ import csv
 from dataclasses import dataclass, field
 import hashlib
 from heapq import merge
+import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,6 +22,7 @@ METRIC_SET = "gb10x"
 METRICS = ("SMs Active", "SM Issue", "DRAM Read Bandwidth", "DRAM Write Bandwidth")
 PERIOD_NS = 1_000_000_000 // FREQUENCY_HZ
 WINDOW_ROUNDS = 128
+MAX_WINDOW_REPORT_BYTES = 64 * 1024**2
 ACTIVITY_TABLE = "CUPTI_ACTIVITY_KIND_"
 LAUNCH_NAMES = (
     "cudaGraphLaunch", "cuGraphLaunch", "cudaLaunchKernel", "cuLaunchKernel",
@@ -49,9 +52,11 @@ def preflight(output, env, helpers):
     return nsys
 
 
-def prefix(nsys, output):
+def prefix(nsys, output, *, capture_range=False):
+    capture = (["--capture-range=cudaProfilerApi", "--capture-range-end=stop"]
+               if capture_range else ["--capture-range=none"])
     return [str(nsys), "profile", "--trace=cuda,nvtx", "--sample=none", "--cpuctxsw=none",
-            "--capture-range=none", "--cuda-graph-trace=node", "--gpu-metrics-devices=cuda-visible",
+            *capture, "--cuda-graph-trace=node", "--gpu-metrics-devices=cuda-visible",
             f"--gpu-metrics-set={METRIC_SET}", f"--gpu-metrics-frequency={FREQUENCY_HZ}",
             "-o", str(output / "profile")]
 
@@ -241,10 +246,13 @@ def _bin_metrics(db, first, last, windows, output, tables):
     return summary
 
 
-def _write_replays(replays, output, simulator):
+def _write_replays(replays, output, simulator, capture_window):
+    index_column = "round" if simulator == "gedes" else "graph_wave"
+    if capture_window is not None:
+        index_column = "capture_local_round"
     with (output / "profile-replays.csv").open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["round" if simulator == "gedes" else "graph_wave", "api_start_ns",
+        writer.writerow([index_column, "api_start_ns",
                          "api_end_ns", "sync_start_ns", "sync_end_ns", "next_launch_start_ns",
                          "first_graph_node_ns", "last_graph_node_ns", "kernel_nodes",
                          "memcpy_nodes", "memset_nodes", "days_attempt_kernel_nodes",
@@ -285,7 +293,7 @@ def _write_days_attempts(replays, output):
     return attempt_sizes, invalid_attempts
 
 
-def _analyze(db, output, simulator, rounds, report):
+def _analyze(db, output, simulator, rounds, report, *, capture_window=None):
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if ACTIVITY_TABLE + "KERNEL" not in tables:
         raise RuntimeError("CUDA node trace contains no kernel activity table")
@@ -334,7 +342,7 @@ def _analyze(db, output, simulator, rounds, report):
         if starts[0] <= start <= replays[-1].sync_end and end <= replays[-1].sync_end:
             device_activity.add(start, end)
 
-    _write_replays(replays, output, simulator)
+    _write_replays(replays, output, simulator, capture_window)
     batch_groups = [replays[i:i + WINDOW_ROUNDS] for i in range(0, len(replays), WINDOW_ROUNDS)]
     windows = [(group[0].start, (batch_groups[n + 1][0].start if n + 1 < len(batch_groups)
                                 else group[-1].sync_end), n * WINDOW_ROUNDS,
@@ -382,14 +390,24 @@ def _analyze(db, output, simulator, rounds, report):
         "trace_diagnostics": [text[:1000] for text in diagnostics[:20]],
     })
     errors = report["errors"]
+    expected_replays = rounds
+    if capture_window is not None:
+        expected_replays = capture_window["end_round"] - capture_window["first_round"]
+        report["capture_rounds_reported"] = expected_replays
+        report["capture_csv_scope"] = (
+            "CSV replay indices are zero-based within the capture. Add first_round from "
+            "capture_window to obtain a simulation round. Timestamps are relative to the "
+            "Nsight Systems report, and metric-window bounds are inclusive replay indices."
+        )
     if len(device_ids) != 1:
         errors.append("expected CUDA activity on one GPU")
     if not counts["kernel"] or any(not replay.counts["kernel"] for replay in replays):
         errors.append("some graph replays lack CUDA kernel nodes")
     if unmapped or report["replays_without_terminal_stream_sync"]:
         errors.append("graph activity could not be matched completely to synchronized replay windows")
-    if simulator == "gedes" and len(replays) != rounds:
-        errors.append("GeDES CUDA graph launch count does not match simulation rounds")
+    if simulator == "gedes" and len(replays) != expected_replays:
+        scope = "captured simulation rounds" if capture_window is not None else "simulation rounds"
+        errors.append(f"GeDES CUDA graph launch count does not match {scope}")
     if simulator == "days-ago":
         attempt_sizes, invalid = _write_days_attempts(replays, output)
         encoded = sum(attempt_sizes.values())
@@ -413,24 +431,81 @@ def _analyze(db, output, simulator, rounds, report):
         errors.append("report contains a capture overflow/drop diagnostic")
 
 
-def collect(nsys, output, env, helpers, *, simulator, rounds):
+def _capture_rounds(window, rounds):
+    keys = ("first_round", "end_round", "wall_ns", "requested_seconds")
+    if not isinstance(window, dict) or any(type(window.get(key)) is not int for key in keys):
+        raise ValueError("invalid GeDES capture window marker")
+    if not (0 <= window["first_round"] < window["end_round"] <= rounds
+            and window["wall_ns"] > 0 and window["requested_seconds"] > 0):
+        raise ValueError("GeDES capture window marker is outside the simulation run")
+    return window["end_round"] - window["first_round"]
+
+
+def _survey(nsys, native, output, env, helpers):
+    log = output / "nsys-survey.txt"
+    helpers.command([nsys, "survey", "--format=jsonl", native], log, env=env)
+    capture = {}
+    for line in log.read_text().splitlines():
+        # The helper also captures stderr. Non-JSON tool messages remain in the log.
+        if line.lstrip().startswith("{"):
+            row = json.loads(line)
+            if row.get("type") == "capture":
+                capture[row["name"]] = row.get("value")
+    duration = capture.get("Duration (s)")
+    lost = capture.get("Lost Events")
+    if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("Nsight Systems survey did not report a positive capture duration")
+    if type(lost) is not int or lost < 0:
+        raise RuntimeError("Nsight Systems survey did not report a valid lost event count")
+    return {"duration_seconds": duration, "lost_events": lost}
+
+
+def collect(nsys, output, env, helpers, *, simulator, rounds, capture_window=None):
     if simulator not in {"days-ago", "gedes"} or not isinstance(rounds, int) or rounds <= 0:
         raise ValueError("expected simulator days-ago/gedes and positive simulation round count")
     native = output / "profile.nsys-rep"
     database = output / "profile.sqlite"
     report = {
         "simulator": simulator, "nsys_version": VERSION, "metric_set": METRIC_SET,
-        "requested_sampling_hz": FREQUENCY_HZ, "passed": False, "warnings": [], "errors": [],
+        "simulation_rounds_reported": rounds, "requested_sampling_hz": FREQUENCY_HZ,
+        "passed": False, "warnings": [], "errors": [],
         "raw_files": {}, "profiling_scope": "One full simulator process with CUDA graph-node trace "
                                              "and device-system-wide performance sampling.",
     }
+    window_is_usable = capture_window is None
+    if capture_window is not None:
+        report["capture_window"] = capture_window
+        report["profiling_scope"] = (
+            "CUDA graph-node trace and device-system-wide performance sampling during the marker "
+            "window within the full GeDES simulation."
+        )
+        if simulator != "gedes":
+            report["errors"].append("only GeDES uses the profile capture window")
+        else:
+            try:
+                report["capture_rounds_reported"] = _capture_rounds(capture_window, rounds)
+                window_is_usable = True
+                if capture_window["wall_ns"] < capture_window["requested_seconds"] * 1_000_000_000:
+                    report["errors"].append("GeDES capture window ended before its requested wall duration")
+            except ValueError as exc:
+                report["errors"].append(str(exc))
     try:
         if not native.is_file() or not native.stat().st_size:
             raise RuntimeError(f"missing nonempty {native.name}")
+        if capture_window is not None:
+            if native.stat().st_size > MAX_WINDOW_REPORT_BYTES:
+                report["errors"].append("native report exceeds 64 MiB")
+            try:
+                report["capture_survey"] = _survey(nsys, native, output, env, helpers)
+                if report["capture_survey"]["lost_events"]:
+                    report["errors"].append("Nsight Systems survey reports lost events")
+            except Exception as exc:
+                report["errors"].append(f"Nsight Systems survey failed: {exc}")
         helpers.command([nsys, "export", "--type=sqlite", "-o", database, native],
                         output / "nsys-export.txt", env=env)
-        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as db:
-            _analyze(db, output, simulator, rounds, report)
+        if window_is_usable:
+            with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as db:
+                _analyze(db, output, simulator, rounds, report, capture_window=capture_window)
     except Exception as exc:
         report["errors"].append(str(exc))
     finally:

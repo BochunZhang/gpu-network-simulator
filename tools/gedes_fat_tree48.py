@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 import time
 
@@ -13,10 +14,73 @@ K = 48
 HOSTS = K ** 3 // 4
 CHANNEL_BLOCKS = 6 * HOSTS // 32
 TIMESLOT_NS = 1000
+CAPTURE_ENV = 'GEDES_FT48_CAPTURE'
 PARAMETERS = {'ft_k': K, 'packet_pool_size': 20_000_000,
               'average_flow_size': 10_000, 'flow_time_range': 10_000_000}
 ERROR_MARKERS = ('memory exhausted!', 'packet pool is not enough!', 'error malloc:', 'cudamalloc failed',
                  'cuda error:', 'gedes completion readback failed:', 'gedes terminal snapshot failed:')
+
+
+def _instrument_capture(source, seconds):
+    declaration = '    int audit_rounds = 0;'
+    first_graph = '#if ENABLE_HUGE_GRAPH\n        if (audit_detail)'
+    round_complete = '        ++audit_rounds;'
+    loop_complete = '    const auto audit_loop_end = AuditClock::now();'
+    if any(source.count(anchor) != 1 for anchor in (declaration, first_graph, round_complete, loop_complete)):
+        raise ValueError('unexpected audited GeDES main layout for capture')
+    source = source.replace(declaration, declaration + f'''
+    const bool capture_enabled = std::getenv("{CAPTURE_ENV}") != nullptr;
+    const auto capture_target = std::chrono::seconds({seconds});
+    bool capture_active = false;
+    AuditClock::time_point capture_start;
+    auto stop_capture = [&](AuditClock::duration elapsed) {{
+        capture_active = false;
+        const auto status = cudaProfilerStop();
+        if (status != cudaSuccess) {{
+            std::cerr << "Cuda error: cudaProfilerStop: " << cudaGetErrorString(status) << std::endl;
+        }}
+        std::cout << "record=gedes_capture first_round=0 end_round=" << audit_rounds
+                  << " rounds=" << audit_rounds
+                  << " wall_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()
+                  << " requested_seconds=" << capture_target.count() << std::endl;
+    }};
+''')
+    source = source.replace(first_graph, '''#if ENABLE_HUGE_GRAPH
+        if (capture_enabled && i == 0) {
+            const auto status = cudaProfilerStart();
+            if (status == cudaSuccess) {
+                capture_start = AuditClock::now();
+                capture_active = true;
+            } else {
+                std::cerr << "Cuda error: cudaProfilerStart: " << cudaGetErrorString(status) << std::endl;
+            }
+        }
+        if (audit_detail)''')
+    source = source.replace(round_complete, round_complete + '''
+        if (capture_active) {
+            const auto elapsed = AuditClock::now() - capture_start;
+            if (elapsed >= capture_target) stop_capture(elapsed);
+        }''')
+    source = source.replace(loop_complete, '''    if (capture_active) {
+        stop_capture(AuditClock::now() - capture_start);
+    }
+''' + loop_complete)
+    return '#include <cuda_profiler_api.h>\n#include <cstdlib>\n' + source
+
+
+def _read_capture_window(log, full_rounds, seconds):
+    with log.open(encoding='utf-8', errors='replace') as stream:
+        records = [line.strip() for line in stream if line.startswith('record=gedes_capture ')]
+    if len(records) != 1:
+        raise ValueError('expected exactly one GeDES capture window record')
+    match = re.fullmatch(r'record=gedes_capture first_round=(\d+) end_round=(\d+) rounds=(\d+) '
+                         r'wall_ns=(\d+) requested_seconds=(\d+)', records[0])
+    if not match:
+        raise ValueError('malformed GeDES capture window record')
+    first, end, count, wall_ns, requested = map(int, match.groups())
+    if not (first == 0 and 0 < end <= full_rounds and count == end - first and requested == seconds):
+        raise ValueError('invalid GeDES capture window boundaries')
+    return {'first_round': first, 'end_round': end, 'wall_ns': wall_ns, 'requested_seconds': requested}
 
 
 def _host_ip(node):
@@ -110,7 +174,7 @@ def _work_differences(baseline, profiled):
     return differences
 
 
-def run(source, output, helpers, profile=False):
+def run(source, output, helpers, profile=False, capture_seconds=None):
     audit = helpers._support_module(source, 'gedes_experiments')
     drain = helpers._support_module(source, 'gedes_drain')
     summary = {'scope': 'Single-GB200 GeDES public artifact FatTree48 TCP/DCTCP workload with seeded inputs',
@@ -122,9 +186,15 @@ def run(source, output, helpers, profile=False):
                'build': 'pending', 'passed': False, 'raw_files': {}}
     profile_output = output / 'profile'
     try:
+        if capture_seconds is not None and (not profile or type(capture_seconds) is not int or capture_seconds <= 0):
+            raise ValueError('a positive integer GeDES capture duration requires profiling')
         if helpers.GEDES[1] != audit.UPSTREAM_REVISION:
             raise ValueError('unexpected GeDES source pin')
         capability, env = helpers.selected_gpu(output)
+        build_options = {}
+        if capture_seconds is not None:
+            env = {key: value for key, value in env.items() if key != CAPTURE_ENV}
+            build_options['patch_main'] = lambda text: _instrument_capture(text, capture_seconds)
         gpu = json.loads((output / 'gpu.json').read_text())
         if 'GB200' not in gpu['name'].upper():
             raise ValueError(f"FatTree48 requires a GB200, selected {gpu['name']}")
@@ -143,19 +213,28 @@ def run(source, output, helpers, profile=False):
         summary['build'] = 'failed'
         with TemporaryDirectory(prefix='.gedes-fat-tree48-', dir=output) as temporary:
             build_start = time.monotonic()
-            binary = drain.build_audit(source, output, helpers, audit, Path(temporary), capability, env)
+            binary = drain.build_audit(source, output, helpers, audit, Path(temporary), capability, env,
+                                       **build_options)
             summary['build_setup_seconds'] = time.monotonic() - build_start
             summary['build'] = 'succeeded'
             _run_case(binary, output, env, audit, drain, helpers, summary)
             if profile:
                 profile_output.mkdir()
-                _run_case(binary, profile_output, env, audit, drain, helpers, capture['run'],
-                          prefix=profiler.prefix(nsys, output), journal_dir=output)
+                prefix_options = {'capture_range': True} if capture_seconds is not None else {}
+                profile_env = {**env, CAPTURE_ENV: '1'} if capture_seconds is not None else env
+                _run_case(binary, profile_output, profile_env, audit, drain, helpers, capture['run'],
+                          prefix=profiler.prefix(nsys, output, **prefix_options), journal_dir=output)
                 differences = capture['work_differences'] = _work_differences(summary, capture['run'])
+                full_rounds = capture['run']['measurements']['rounds']
+                collect_options = {}
+                if capture_seconds is not None:
+                    window = _read_capture_window(profile_output / 'simulation.txt', full_rounds, capture_seconds)
+                    capture['capture_window'] = collect_options['capture_window'] = window
+                if not differences or capture_seconds is not None:
+                    capture['trace'] = profiler.collect(nsys, output, env, helpers, simulator='gedes',
+                                                        rounds=full_rounds, **collect_options)
                 if differences:
                     raise RuntimeError(f'GeDES profiled work differs from baseline: {", ".join(differences)}')
-                capture['trace'] = profiler.collect(nsys, output, env, helpers, simulator='gedes',
-                                                    rounds=summary['measurements']['rounds'])
                 capture['passed'] = True
         summary['passed'] = True
     except Exception as error:

@@ -1,10 +1,13 @@
 """Exercise the Nsight Systems SQLite parser without a GPU."""
 
+import csv
+import json
 from pathlib import Path
 import sqlite3
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import nsys_ft48
@@ -45,6 +48,79 @@ class NsysFT48Tests(unittest.TestCase):
                             (500, i, metric))
             self.db.executemany("INSERT INTO GPU_METRICS VALUES (?, ?, ?, ?)",
                                 [(30, 500, i, 0), (110, 500, i, 80)])
+
+    def test_capture_switch_preserves_full_run_prefix(self):
+        full = nsys_ft48.prefix("nsys", self.output)
+        self.assertIn("--capture-range=none", full)
+        self.assertNotIn("--capture-range-end=stop", full)
+        window = nsys_ft48.prefix("nsys", self.output, capture_range=True)
+        position = full.index("--capture-range=none")
+        self.assertEqual(window, full[:position] + [
+            "--capture-range=cudaProfilerApi", "--capture-range-end=stop",
+        ] + full[position + 1:])
+
+    def _add_window_replays(self):
+        self.db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?, ?, 7, ?, ?, 0)", (
+            (10, 20, 150, 1), (30, 90, 152, 3), (100, 112, 160, 1), (113, 180, 161, 3),
+        ))
+        self.db.executemany(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, 0, ?, 673, 71, 4, 2, 1, 1, 64, 1, 1)",
+            [(24, 78, 150), (115, 175, 160)])
+
+    def _collect_window(self, window, *, lost=0):
+        self.db.commit()
+        source = self.db
+        output = self.output
+        (output / "profile.nsys-rep").write_bytes(b"native report stub")
+
+        class Helpers:
+            @staticmethod
+            def command(args, log, **_kwargs):
+                if args[1] == "survey":
+                    log.write_text("".join(json.dumps({
+                        "type": "capture", "name": name, "value": value,
+                    }) + "\n" for name, value in (("Duration (s)", 10.002), ("Lost Events", lost))))
+                else:
+                    with sqlite3.connect(output / "profile.sqlite") as target:
+                        source.backup(target)
+
+            @staticmethod
+            def write_json(path, value):
+                path.write_text(json.dumps(value))
+
+        return nsys_ft48.collect("nsys", output, {}, Helpers, simulator="gedes",
+                                rounds=95851, capture_window=window)
+
+    def test_capture_local_graph_replay_count_differs_from_full_run(self):
+        self._add_window_replays()
+        window = {"first_round": 0, "end_round": 2, "wall_ns": 10_000_002_200,
+                  "requested_seconds": 10}
+        report = self._collect_window(window)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["capture_window"], window)
+        self.assertEqual(report["capture_rounds_reported"], 2)
+        self.assertEqual(report["simulation_rounds_reported"], 95851)
+        self.assertEqual(report["host_graph_replays"], 2)
+        self.assertEqual(report["capture_survey"], {"duration_seconds": 10.002, "lost_events": 0})
+        with (self.output / "profile-replays.csv").open(newline="") as f:
+            replays = list(csv.DictReader(f))
+        self.assertEqual([row["capture_local_round"] for row in replays], ["0", "1"])
+
+    def test_failed_capture_still_exports_and_preserves_raw_evidence(self):
+        self._add_window_replays()
+        window = {"first_round": 0, "end_round": 3, "wall_ns": 9_999_999_999,
+                  "requested_seconds": 10}
+        with patch.object(nsys_ft48, "MAX_WINDOW_REPORT_BYTES", 8):
+            with self.assertRaisesRegex(RuntimeError, "native report exceeds 64 MiB"):
+                self._collect_window(window, lost=1)
+        report = json.loads((self.output / "profile-summary.json").read_text())
+        self.assertFalse(report["passed"])
+        self.assertEqual(set(report["raw_files"]), {"profile.nsys-rep", "profile.sqlite"})
+        self.assertEqual(report["capture_survey"]["lost_events"], 1)
+        self.assertIn("GeDES capture window ended before its requested wall duration", report["errors"])
+        self.assertIn("GeDES CUDA graph launch count does not match captured simulation rounds",
+                      report["errors"])
+        self.assertIn("Nsight Systems survey reports lost events", report["errors"])
 
     def test_nested_host_launch_and_synchronized_node_fallback(self):
         self.db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?, ?, 7, ?, ?, 0)", (

@@ -452,6 +452,11 @@ def days_cuda_smoke(source: Path, output: Path):
 def prepare(kind, params):
     handlers = {"gpu_inventory": inventory, "gedes_smoke": gedes_smoke,
                 "days_cuda_smoke": days_cuda_smoke}
+    if (kind == "gedes_fat_tree48" and isinstance(params, dict)
+            and set(params) == {"profile", "capture_seconds"}):
+        seconds = params["capture_seconds"]
+        if params["profile"] is True and type(seconds) is int and seconds > 0:
+            return partial(_run_pinned, kind, profile=True, capture_seconds=seconds)
     if (kind in {"days_ago_fat_tree48", "gedes_fat_tree48"}
             and params == {"profile": True} and params["profile"] is True):
         return partial(_run_pinned, kind, profile=True)

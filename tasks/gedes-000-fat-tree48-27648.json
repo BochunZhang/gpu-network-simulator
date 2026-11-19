@@ -17,17 +17,18 @@
       }
     },
     "01": {
-      "status": "2026-11-19T04:44:56Z",
-      "name": "GeDES FatTree48 full Nsight Systems profile",
+      "status": "2026-11-19T07:50:43Z",
+      "name": "GeDES FatTree48 10-second Nsight Systems profile",
       "kind": "gedes_fat_tree48",
       "params": {
-        "profile": true
+        "profile": true,
+        "capture_seconds": 10
       },
       "resources": {
         "gpus": 1
       },
       "enabled": true,
-      "description": "Profile the full pinned FT48 run through terminal drain on one GB200, with CUDA graph nodes, SMs Active, SM Issue and DRAM activity. Compare completion, bytes, FCT and queue drain with an unprofiled run of the same binary.",
+      "description": "Capture 10 wall-clock seconds from the start of the pinned FT48 simulation loop on one GB200, including CUDA graph nodes, SMs Active, SM Issue and DRAM activity. Require a native report no larger than 64 MiB. Continue to terminal drain and compare with an unprofiled run of the same binary. Export the trace even when paired FCT differs.",
       "execution": {
         "mode": "full"
       }
