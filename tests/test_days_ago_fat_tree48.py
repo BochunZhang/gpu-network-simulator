@@ -28,6 +28,8 @@ class DaysFatTree48Test(unittest.TestCase):
         self.smoke_hash = '0123456789abcdef'
         self.profile_hash = '0123456789abcdef'
         self.profile_transitions = 1000
+        self.retry_count = 0
+        self.capture_seconds = None
         self.wide_commands = {}
         self.wide_sourced = days.EXPECTED_PACKETS
         self.fail_build = False
@@ -83,11 +85,16 @@ class DaysFatTree48Test(unittest.TestCase):
             if log.name == 'smoke-cuda.txt':
                 digest = self.smoke_hash
             lines = []
+            expected_capture = self.capture_seconds if log.name == 'fat-tree48-cuda-nsys.txt' else None
+            self.assertEqual(env.get(days.CAPTURE_ENV), expected_capture)
+            if expected_capture:
+                lines.append('record=days_capture first_wave=0 end_wave=2 first_round=0 end_round=5 '
+                             f'wall_ns=10100000000 requested_seconds={expected_capture}')
             if engine == 'cuda':
                 device_ns = 9 if profiled else 7
                 transitions = self.profile_transitions if profiled else 1000
                 lines.append(f'record=days_device engine=cuda wall_ns=10 device_ns={device_ns} rounds=6 '
-                             f'transitions={transitions} continuation_relaunches=0 retry_count=1 '
+                             f'transitions={transitions} continuation_relaunches=0 retry_count={self.retry_count} '
                              'grown_stream_count=1 channel_capacity_distribution=2:1 '
                              'retry_trace=[CapacityRetry { old: 1, new: 2 }] '
                              'same_time_continuations=0 round_kernel=plain')
@@ -153,6 +160,56 @@ class DaysFatTree48Test(unittest.TestCase):
         self.assertTrue((self.output / 'fat-tree48-cuda.txt').is_file())
         self.assertTrue((self.output / 'fat-tree48-cuda-nsys.txt').is_file())
         profiler.collect.assert_not_called()
+
+    def test_compute_triage_collects_scoped_waves_before_paired_mismatch(self):
+        self.capture_seconds = '10'
+        self.worker_env[days.CAPTURE_ENV] = '999'
+        self.profile_hash = '0123456789abcdee'
+        profiler = Mock()
+        profiler.preflight.return_value = 'nsys'
+        profiler.prefix.return_value = ['nsys', 'profile']
+        profiler.collect.return_value = {'passed': True}
+        with patch.object(handlers, '_support_module', return_value=profiler):
+            with self.assertRaisesRegex(RuntimeError, 'profiled work differs from baseline'):
+                days.run(REPO, self.output, handlers, profile=True, capture_seconds=10, metric_set='gb10x-ct')
+        profile = self.summary()['wide']['profile']
+        self.assertEqual(profile['work_differences'], ['result_fnv1a64'])
+        self.assertEqual(profile['capture_attempt'], 0)
+        self.assertTrue(profile['trace']['passed'])
+        self.assertEqual(self.worker_env[days.CAPTURE_ENV], '999')
+        self.assertEqual(profile['capture_window'], {'first_wave': 0, 'end_wave': 2, 'first_round': 0,
+                                                    'end_round': 5, 'wall_ns': 10_100_000_000,
+                                                    'requested_seconds': 10})
+        self.assertEqual(profiler.preflight.call_args.kwargs, {'metric_set': 'gb10x-ct'})
+        profiler.prefix.assert_called_once_with('nsys', self.output, capture_range=True, metric_set='gb10x-ct')
+        self.assertEqual(profiler.collect.call_args.kwargs,
+                         {'simulator': 'days-ago', 'rounds': 6, 'capture_window': profile['capture_window'],
+                          'metric_set': 'gb10x-ct'})
+        self.assertNotIn(days.CAPTURE_ENV, profiler.collect.call_args.args[2])
+
+    def test_capture_of_retried_run_keeps_trace_without_accepting_final_counters(self):
+        self.capture_seconds = '10'
+        self.retry_count = 1
+        profiler = Mock()
+        profiler.prefix.return_value = ['nsys', 'profile']
+        profiler.collect.return_value = {'passed': True}
+        with patch.object(handlers, '_support_module', return_value=profiler):
+            with self.assertRaisesRegex(RuntimeError, 'retried attempt'):
+                days.run(REPO, self.output, handlers, profile=True, capture_seconds=10, metric_set='gb10x-ct')
+        self.assertEqual(self.summary()['state'], 'failed')
+        self.assertTrue(self.summary()['wide']['profile']['trace']['passed'])
+        profiler.collect.assert_called_once()
+
+    def test_capture_marker_must_be_unique_and_match_request(self):
+        log = self.output / 'fat-tree48-cuda-nsys.txt'
+        record = ('record=days_capture first_wave=0 end_wave=3 first_round=0 end_round=130 '
+                  'wall_ns=10000000001 requested_seconds=10\n')
+        log.write_text(record * 2)
+        with self.assertRaisesRegex(ValueError, 'exactly one'):
+            days._read_capture_window(log, 10)
+        log.write_text(record)
+        with self.assertRaisesRegex(ValueError, 'requested duration'):
+            days._read_capture_window(log, 8)
 
     def test_warp_profile_uses_maintained_build_and_compares_work(self):
         warp = Mock()

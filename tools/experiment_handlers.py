@@ -455,7 +455,7 @@ def prepare(kind, params):
     if (kind in {"days_ago_fat_tree48", "gedes_fat_tree48"}
             and params == {"warp_trace": True} and params["warp_trace"] is True):
         return partial(_run_pinned, kind, warp_trace=True)
-    if (kind == "gedes_fat_tree48" and isinstance(params, dict)
+    if (kind in {"gedes_fat_tree48", "days_ago_fat_tree48"} and isinstance(params, dict)
             and set(params) in ({"profile", "capture_seconds"}, {"profile", "capture_seconds", "metric_set"})):
         seconds = params["capture_seconds"]
         if (params["profile"] is True and type(seconds) is int and seconds > 0

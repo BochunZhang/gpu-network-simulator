@@ -90,7 +90,7 @@ class NsysFT48Tests(unittest.TestCase):
             "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, 0, ?, 673, 71, 4, 2, 1, 1, 64, 1, 1)",
             [(24, 78, 150), (115, 175, 160)])
 
-    def _collect_window(self, window, *, lost=0, **profile_options):
+    def _collect_window(self, window, *, lost=0, simulator="gedes", rounds=95851, **profile_options):
         self.db.commit()
         source = self.db
         output = self.output
@@ -111,8 +111,8 @@ class NsysFT48Tests(unittest.TestCase):
             def write_json(path, value):
                 path.write_text(json.dumps(value))
 
-        return nsys_ft48.collect("nsys", output, {}, Helpers, simulator="gedes",
-                                rounds=95851, capture_window=window, **profile_options)
+        return nsys_ft48.collect("nsys", output, {}, Helpers, simulator=simulator,
+                                rounds=rounds, capture_window=window, **profile_options)
 
     def test_compute_triage_exports_distinct_percent_series_and_requires_sol(self):
         self._add_window_replays()
@@ -198,13 +198,18 @@ class NsysFT48Tests(unittest.TestCase):
         self.assertEqual(self.report["gpu_metrics"]["SMs Active"]["sample_point_mean_pct"], 40)
         self.assertEqual(self.report["trace_diagnostics"], ["Using software trace"])
 
-    def test_days_attempts_are_separate_from_committed_rounds(self):
+    def _add_days_wave(self, start, correlation):
         self.db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?, ?, 7, ?, ?, 0)",
-                            [(10, 20, 150, 2), (22, 9000, 152, 3)])
+                            [(start, start + 10, correlation, 2),
+                             (start + 12, start + 8990, correlation + 1, 3)])
         nodes = (5, 8, 8, 8, 6, 8, 8, 8, 8, 8, 8, 7) * 64
         self.db.executemany(
-            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, 0, 150, ?, 71, ?, 2, 1, 1, 64, 1, 1)",
-            [(25 + i * 2, 26 + i * 2, i + 1, name_id) for i, name_id in enumerate(nodes)])
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, 0, ?, ?, 71, ?, 2, 1, 1, 64, 1, 1)",
+            [(start + 15 + i * 2, start + 16 + i * 2, correlation, i + 1, name_id)
+             for i, name_id in enumerate(nodes)])
+
+    def test_days_attempts_are_separate_from_committed_rounds(self):
+        self._add_days_wave(10, 150)
         nsys_ft48._analyze(self.db, self.output, "days-ago", 57, self.report)
         self.assertFalse(self.report["errors"])
         self.assertEqual(self.report["days_graph_encoded_attempts"], 64)
@@ -216,6 +221,39 @@ class NsysFT48Tests(unittest.TestCase):
         nsys_ft48._analyze(self.db, self.output, "days-ago", 57, self.report)
         self.assertIn("Days graph attempt nodes do not match the pinned attempt DAG and waves",
                       self.report["errors"])
+
+    def test_days_ct_window_counts_waves_and_committed_rounds_independently(self):
+        self._add_days_wave(10, 150)
+        self._add_days_wave(10_000, 160)
+        self.db.execute("UPDATE TARGET_INFO_GPU_METRICS SET metricName='SM Issue Active' WHERE metricId=2")
+        self._add_metric(5, "SM Throughput [Throughput %]")
+        self.db.execute("INSERT INTO GPU_METRICS VALUES (10100, 500, 5, 25)")
+        window = {"first_wave": 0, "end_wave": 2, "first_round": 0, "end_round": 103,
+                  "wall_ns": 10_020_000_000, "requested_seconds": 10}
+        report = self._collect_window(window, simulator="days-ago", rounds=1002, metric_set="gb10x-ct")
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["capture_waves_reported"], 2)
+        self.assertEqual(report["host_graph_replays"], 2)
+        self.assertEqual(report["days_graph_encoded_attempts"], 128)
+        self.assertEqual(report["capture_rounds_reported"], 103)
+        self.assertEqual(report["simulation_rounds_reported"], 1002)
+        with (self.output / "profile-replays.csv").open() as f:
+            self.assertEqual([row["graph_wave"] for row in csv.DictReader(f)], ["0", "1"])
+        with (self.output / "profile-metric-windows.csv").open() as f:
+            self.assertEqual([(r["first_replay"], r["last_replay"], r["mean_pct"]) for r in csv.DictReader(f)
+                              if r["metric"] == "SM Throughput [Throughput %]"], [("0", "0", "40.0"),
+                                                                                 ("1", "1", "25.0")])
+        for change, error in (
+            ({"end_wave": 1}, "launch count does not match captured graph waves"),
+            ({"end_round": 129}, "attempt nodes do not match"),
+            ({"wall_ns": 9_000_000_000}, "Days capture window ended before its requested wall duration"),
+        ):
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, error):
+                self._collect_window({**window, **change}, simulator="days-ago", rounds=1002,
+                                     metric_set="gb10x-ct")
+            failed = json.loads((self.output / "profile-summary.json").read_text())
+            self.assertFalse(failed["passed"])
+            self.assertTrue(failed["raw_files"]["profile.sqlite"]["bytes"])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 import hashlib
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 
 
@@ -9,6 +10,7 @@ WIDE_FIXTURE = Path(
     'configs/benchmarks/width_via_load_k48_h16/fattree_k48_h16_load_30_sustained.toml'
 )
 SIMULATOR_DIR = Path('simulators/days-ago')
+CAPTURE_ENV = 'DAYS_FT48_CAPTURE_SECONDS'
 SMOKE_FIXTURE_SHA256 = 'a715aa8e4492583c1727224f161b61324d653382d331d270fb1850863f2a5440'
 WIDE_FIXTURE_SHA256 = 'ca005a37bbab9192f85cac61ea2f3fe63c73db8aeba1d72df46096a92950ba7c'
 HOST_COUNT = 18_432
@@ -48,6 +50,22 @@ def _device_record(log):
             'channel_capacity_distribution': fields['channel_capacity_distribution']}
 
 
+def _read_capture_window(log, requested_seconds):
+    with log.open(encoding='utf-8', errors='replace') as stream:
+        records = [line.strip() for line in stream if line.startswith('record=days_capture ')]
+    if len(records) != 1:
+        raise ValueError('expected exactly one Days capture window record')
+    match = re.fullmatch(r'record=days_capture first_wave=(\d+) end_wave=(\d+) first_round=(\d+) '
+                         r'end_round=(\d+) wall_ns=(\d+) requested_seconds=(\d+)', records[0])
+    if not match:
+        raise ValueError('malformed Days capture window record')
+    keys = ('first_wave', 'end_wave', 'first_round', 'end_round', 'wall_ns', 'requested_seconds')
+    window = dict(zip(keys, map(int, match.groups())))
+    if window['requested_seconds'] != requested_seconds:
+        raise ValueError('Days capture window does not match the requested duration')
+    return window
+
+
 def _measure(binary, fixture, engine, log, directory, env, handlers, record, *, prefix=()):
     args = [*prefix, binary, fixture, '--engine', engine]
     if engine == 'cpu':
@@ -73,7 +91,7 @@ def _work_differences(baseline, profiled):
     return differences
 
 
-def run(source, output, handlers, profile=False, warp_trace=False):
+def run(source, output, handlers, profile=False, warp_trace=False, capture_seconds=None, metric_set=None):
     wide = {'fixture': WIDE_FIXTURE.as_posix(), 'k': 48, 'hosts_per_edge': 16, 'hosts': HOST_COUNT,
             'flows': FLOW_COUNT, 'inclusive_stop_ns': STOP_NS, 'seed': 17_048, 'packet_bytes': PACKET_BYTES,
             'packet_interval_ns': PACKET_INTERVAL_NS, 'link_rate_bps': 100_000_000_000, 'link_delay_ns': 1_000,
@@ -91,10 +109,15 @@ def run(source, output, handlers, profile=False, warp_trace=False):
                'stage': 'preflight'}
     build_log = output / 'build.log'
     try:
+        if capture_seconds is not None and (not profile or type(capture_seconds) is not int or capture_seconds <= 0):
+            raise ValueError('a positive integer Days capture duration requires profiling')
+        if metric_set is not None and not profile:
+            raise ValueError('a Days Nsight metric set requires profiling')
         capability, env = handlers.selected_gpu(output)
         if profile and warp_trace:
             raise ValueError('Nsight Systems and IKET require separate profiler runs')
         env = dict(env)
+        env.pop(CAPTURE_ENV, None)
         env.pop('FT48_WARP_OUTPUT', None)
         env.pop('FT48_WARP_LIBDIR', None)
         if capability != '10.0':
@@ -105,7 +128,8 @@ def run(source, output, handlers, profile=False, warp_trace=False):
         if profile:
             summary['stage'] = 'nsys-preflight'
             profiler = handlers._support_module(source, 'nsys_ft48')
-            nsys = profiler.preflight(output, env, handlers)
+            metric_options = {'metric_set': metric_set} if metric_set is not None else {}
+            nsys = profiler.preflight(output, env, handlers, **metric_options)
         with TemporaryDirectory(prefix='.days-fat-tree48-', dir=output) as temp:
             scratch = Path(temp)
             src = source / SIMULATOR_DIR
@@ -154,9 +178,17 @@ def run(source, output, handlers, profile=False, warp_trace=False):
                     'Nsight Systems wrapper including simulator execution and trace generation.'
                 )
                 capture_env = warp.capture_environment(source, output, env, 'days') if warp_trace else env
-                prefix = () if warp_trace else profiler.prefix(nsys, output)
-                _measure(binary, wide['fixture'], 'cuda', output / f'fat-tree48-cuda-{label}.txt', src,
-                         capture_env, handlers, profiled['run'], prefix=prefix)
+                prefix = ()
+                if profile:
+                    range_options = {}
+                    if capture_seconds is not None:
+                        capture_env = {**env, CAPTURE_ENV: str(capture_seconds)}
+                        range_options['capture_range'] = True
+                        profiled['capture_attempt'] = 0
+                    prefix = profiler.prefix(nsys, output, **range_options, **metric_options)
+                log = output / f'fat-tree48-cuda-{label}.txt'
+                _measure(binary, wide['fixture'], 'cuda', log, src, capture_env, handlers,
+                         profiled['run'], prefix=prefix)
                 differences = profiled['work_differences'] = _work_differences(record, profiled['run'])
                 rounds = profiled['run']['device']['rounds']
                 if warp_trace:
@@ -166,13 +198,20 @@ def run(source, output, handlers, profile=False, warp_trace=False):
                         raise RuntimeError('missing Days CUDA Graph dependency export')
                     profiled['graph_dependencies'] = 'warp/graph.dot'
                     profiled['trace'] = warp.collect(source, output, 'days', rounds)
+                if profile and (not differences or capture_seconds is not None):
+                    summary['stage'] = 'nsys-collect'
+                    collect_options = {}
+                    if capture_seconds is not None:
+                        window = _read_capture_window(log, capture_seconds)
+                        profiled['capture_window'] = collect_options['capture_window'] = window
+                    profiled['trace'] = profiler.collect(nsys, output, env, handlers, simulator='days-ago',
+                                                         rounds=rounds, **collect_options, **metric_options)
+                    if capture_seconds is not None and profiled['run']['device']['retry_count']:
+                        raise RuntimeError('Days capture covers a retried attempt; final run counters describe '
+                                           'a later attempt')
                 if differences:
                     summary['stage'] = f'fat-tree48-{label}'
                     raise RuntimeError(f'Days profiled work differs from baseline: {", ".join(differences)}')
-                if profile:
-                    summary['stage'] = 'nsys-collect'
-                    profiled['trace'] = profiler.collect(nsys, output, env, handlers, simulator='days-ago',
-                                                         rounds=rounds)
         summary.update(state='succeeded', stage='complete')
     except Exception as error:
         summary.update(state='failed', error=str(error))

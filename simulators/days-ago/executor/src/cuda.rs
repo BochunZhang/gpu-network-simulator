@@ -1,5 +1,6 @@
 //! Correctness-first production CUDA executor.
 //! Modified 2026-11-19 for GB200 and FT48 warp-lifetime capture.
+//! Modified 2026-11-20 for wave-bounded FT48 Nsight Systems capture.
 //!
 //! The backend keeps the safe-horizon round loop resident in explicit CUDA device buffers. One
 //! fixed thirteen-kernel attempt DAG is captured as a CUDA Graph and replayed in bounded waves.
@@ -1540,6 +1541,21 @@ impl CudaExecutor {
         // plan that fails or is refused below loads and unloads the module before its error
         // returns; nothing is allocated or launched for it.
         let held = direct.hold_round_module(round_kernel)?;
+        let mut profile_duration = match std::env::var_os("DAYS_FT48_CAPTURE_SECONDS") {
+            None => None,
+            Some(value) => {
+                let seconds = value
+                    .to_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|seconds| *seconds > 0)
+                    .ok_or_else(|| {
+                        CudaError::Validation(
+                            "DAYS_FT48_CAPTURE_SECONDS must be a positive integer".into(),
+                        )
+                    })?;
+                Some(Duration::from_secs(seconds))
+            }
+        };
         loop {
             let attempt = (|| {
                 let plan = CudaPlan::new_with_entity_capacity_floors(
@@ -1574,7 +1590,9 @@ impl CudaExecutor {
                 // before any buffer or graph, and no other run's module is in the context.
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
                 record_run_step("buffers_allocated");
-                let timing = direct.run(&buffers, attempt_config, &held.module)?;
+                // A capacity retry starts the simulation over. Capture only the first graph loop.
+                let timing =
+                    direct.run(&buffers, attempt_config, &held.module, profile_duration.take())?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
                 let mut run =
@@ -5912,6 +5930,7 @@ impl DirectCuda {
         buffers: &CudaBuffers,
         config: CudaConfig,
         module: &RoundModule,
+        profile_duration: Option<Duration>,
     ) -> Result<CudaTiming, CudaError> {
         let round_kernel = module.build;
         let functions = module.attempt_functions();
@@ -5979,7 +5998,8 @@ impl DirectCuda {
 
         #[cfg(ft48_warp)]
         let trace_enabled = warp_capture::enabled();
-        for _ in 0..maximum_replays {
+        let mut profile = NsightCapture::start(profile_duration)?;
+        for wave in 0..maximum_replays {
             #[cfg(ft48_warp)]
             let capture = trace_enabled.then(warp_capture::begin_graph);
             let start = self
@@ -6021,6 +6041,11 @@ impl DirectCuda {
 
             let done = control[CONTROL_DONE] != 0;
             let error = control[CONTROL_ERROR] != 0;
+            profile.wave_complete(
+                graph_replays,
+                control[CONTROL_ROUNDS],
+                done || error || wave + 1 == maximum_replays,
+            )?;
             if !done && !error && control[CONTROL_CONTINUATION] != 0 {
                 mid_round_wave_boundary_syncs = mid_round_wave_boundary_syncs.saturating_add(1);
             }
@@ -6191,6 +6216,52 @@ fn launch_uniform(
         arguments.launch(config)?;
     }
     Ok(())
+}
+
+/// The optional range spans whole synchronized waves; stopping it never ends the simulation.
+struct NsightCapture {
+    window: Option<(Instant, Duration)>,
+}
+
+impl NsightCapture {
+    fn start(duration: Option<Duration>) -> Result<Self, CudaError> {
+        let window = if let Some(target) = duration {
+            unsafe { sys::cuProfilerStart() }
+                .result()
+                .map_err(|error| driver_error("start Nsight capture", error))?;
+            Some((Instant::now(), target))
+        } else {
+            None
+        };
+        Ok(Self { window })
+    }
+
+    fn wave_complete(&mut self, waves: u64, rounds: u64, last: bool) -> Result<(), CudaError> {
+        if let Some((started, target)) = self.window {
+            let wall = started.elapsed();
+            if wall >= target || last {
+                self.window = None;
+                unsafe { sys::cuProfilerStop() }
+                    .result()
+                    .map_err(|error| driver_error("stop Nsight capture", error))?;
+                println!(
+                    "record=days_capture first_wave=0 end_wave={waves} first_round=0 end_round={rounds} wall_ns={} requested_seconds={}",
+                    duration_ns(wall),
+                    target.as_secs()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NsightCapture {
+    fn drop(&mut self) {
+        // Keep an interrupted graph launch or control readback from leaving profiling enabled.
+        if self.window.is_some() {
+            let _ = unsafe { sys::cuProfilerStop() };
+        }
+    }
 }
 
 struct CudaTiming {

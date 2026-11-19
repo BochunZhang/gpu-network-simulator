@@ -265,7 +265,7 @@ def _bin_metrics(db, first, last, windows, output, tables, metric_names):
 
 def _write_replays(replays, output, simulator, capture_window):
     index_column = "round" if simulator == "gedes" else "graph_wave"
-    if capture_window is not None:
+    if capture_window is not None and simulator == "gedes":
         index_column = "capture_local_round"
     with (output / "profile-replays.csv").open("w", newline="") as f:
         writer = csv.writer(f)
@@ -360,10 +360,12 @@ def _analyze(db, output, simulator, rounds, report, *, capture_window=None):
             device_activity.add(start, end)
 
     _write_replays(replays, output, simulator, capture_window)
-    batch_groups = [replays[i:i + WINDOW_ROUNDS] for i in range(0, len(replays), WINDOW_ROUNDS)]
+    days_window = simulator == "days-ago" and capture_window is not None
+    group_size = 1 if days_window else WINDOW_ROUNDS
+    batch_groups = [replays[i:i + group_size] for i in range(0, len(replays), group_size)]
     windows = [(group[0].start, (batch_groups[n + 1][0].start if n + 1 < len(batch_groups)
-                                else group[-1].sync_end), n * WINDOW_ROUNDS,
-                n * WINDOW_ROUNDS + len(group) - 1) for n, group in enumerate(batch_groups)]
+                                else group[-1].sync_end), n * group_size,
+                n * group_size + len(group) - 1) for n, group in enumerate(batch_groups)]
     metric_set = report.get("metric_set", METRIC_SET)
     required_metrics = REQUIRED_METRICS[metric_set]
     metric_names = required_metrics + (CT_CONTEXT_METRICS if metric_set == CT_METRIC_SET else ())
@@ -410,22 +412,33 @@ def _analyze(db, output, simulator, rounds, report, *, capture_window=None):
         "trace_diagnostics": [text[:1000] for text in diagnostics[:20]],
     })
     errors = report["errors"]
-    expected_replays = rounds
+    committed_rounds = rounds
     if capture_window is not None:
-        expected_replays = capture_window["end_round"] - capture_window["first_round"]
-        report["capture_rounds_reported"] = expected_replays
-        report["capture_csv_scope"] = (
-            "CSV replay indices are zero-based within the capture. Add first_round from "
-            "capture_window to obtain a simulation round. Timestamps are relative to the "
-            "Nsight Systems report, and metric-window bounds are inclusive replay indices."
-        )
+        committed_rounds = capture_window["end_round"] - capture_window["first_round"]
+        report["capture_rounds_reported"] = committed_rounds
+        if days_window:
+            wave_count = capture_window["end_wave"] - capture_window["first_wave"]
+            report["capture_waves_reported"] = wave_count
+            report["capture_csv_scope"] = (
+                "CSV replay indices identify graph waves starting at wave 0. Each metric window "
+                "covers one wave. Encoded attempts include continuations and no-ops. The marker "
+                "records cumulative committed rounds at the capture boundaries."
+            )
+            if len(replays) != wave_count:
+                errors.append("Days CUDA graph launch count does not match captured graph waves")
+        else:
+            report["capture_csv_scope"] = (
+                "CSV replay indices are zero-based within the capture. Add first_round from "
+                "capture_window to obtain a simulation round. Timestamps are relative to the "
+                "Nsight Systems report, and metric-window bounds are inclusive replay indices."
+            )
     if len(device_ids) != 1:
         errors.append("expected CUDA activity on one GPU")
     if not counts["kernel"] or any(not replay.counts["kernel"] for replay in replays):
         errors.append("some graph replays lack CUDA kernel nodes")
     if unmapped or report["replays_without_terminal_stream_sync"]:
         errors.append("graph activity could not be matched completely to synchronized replay windows")
-    if simulator == "gedes" and len(replays) != expected_replays:
+    if simulator == "gedes" and len(replays) != committed_rounds:
         scope = "captured simulation rounds" if capture_window is not None else "simulation rounds"
         errors.append(f"GeDES CUDA graph launch count does not match {scope}")
     if simulator == "days-ago":
@@ -438,7 +451,7 @@ def _analyze(db, output, simulator, rounds, report, *, capture_window=None):
                                   "The simulator reports the separate committed-round count.",
         })
         if (invalid or encoded != counts["days_attempt_nodes"]
-                or encoded < rounds or not all(len(replay.attempts) == 64 for replay in replays)):
+                or encoded < committed_rounds or not all(len(replay.attempts) == 64 for replay in replays)):
             errors.append("Days graph attempt nodes do not match the pinned attempt DAG and waves")
     for metric in metric_names:
         samples = metrics.get(metric, {})
@@ -452,14 +465,23 @@ def _analyze(db, output, simulator, rounds, report, *, capture_window=None):
         errors.append("report contains a capture overflow/drop diagnostic")
 
 
-def _capture_rounds(window, rounds):
+def _capture_rounds(window, rounds, simulator):
+    name = "GeDES" if simulator == "gedes" else "Days"
     keys = ("first_round", "end_round", "wall_ns", "requested_seconds")
+    if simulator == "days-ago":
+        keys += ("first_wave", "end_wave")
     if not isinstance(window, dict) or any(type(window.get(key)) is not int for key in keys):
-        raise ValueError("invalid GeDES capture window marker")
-    if not (0 <= window["first_round"] < window["end_round"] <= rounds
+        raise ValueError(f"invalid {name} capture window marker")
+    if not (0 <= window["first_round"] <= window["end_round"] <= rounds
             and window["wall_ns"] > 0 and window["requested_seconds"] > 0):
+        raise ValueError(f"{name} capture window marker is outside the simulation run")
+    count = window["end_round"] - window["first_round"]
+    if simulator == "gedes" and not count:
         raise ValueError("GeDES capture window marker is outside the simulation run")
-    return window["end_round"] - window["first_round"]
+    if simulator == "days-ago" and not (
+            window["first_round"] == window["first_wave"] == 0 and window["end_wave"] > 0):
+        raise ValueError("Days capture must start at graph wave and committed round zero and include a wave")
+    return count
 
 
 def _survey(nsys, native, output, env, helpers):
@@ -497,20 +519,18 @@ def collect(nsys, output, env, helpers, *, simulator, rounds, capture_window=Non
     window_is_usable = capture_window is None
     if capture_window is not None:
         report["capture_window"] = capture_window
+        name = "GeDES" if simulator == "gedes" else "Days"
         report["profiling_scope"] = (
             "CUDA graph-node trace and device-system-wide performance sampling during the marker "
-            "window within the full GeDES simulation."
+            f"window within the full {name} simulation."
         )
-        if simulator != "gedes":
-            report["errors"].append("only GeDES uses the profile capture window")
-        else:
-            try:
-                report["capture_rounds_reported"] = _capture_rounds(capture_window, rounds)
-                window_is_usable = True
-                if capture_window["wall_ns"] < capture_window["requested_seconds"] * 1_000_000_000:
-                    report["errors"].append("GeDES capture window ended before its requested wall duration")
-            except ValueError as exc:
-                report["errors"].append(str(exc))
+        try:
+            report["capture_rounds_reported"] = _capture_rounds(capture_window, rounds, simulator)
+            window_is_usable = True
+            if capture_window["wall_ns"] < capture_window["requested_seconds"] * 1_000_000_000:
+                report["errors"].append(f"{name} capture window ended before its requested wall duration")
+        except ValueError as exc:
+            report["errors"].append(str(exc))
     try:
         if not native.is_file() or not native.stat().st_size:
             raise RuntimeError(f"missing nonempty {native.name}")
