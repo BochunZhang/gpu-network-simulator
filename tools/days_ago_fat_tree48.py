@@ -1,4 +1,4 @@
-"""Time the pinned Days AGO k48/h16 30% fixture on one SM100 GPU."""
+"""Time and optionally trace the pinned Days AGO k48/h16 30% fixture on one SM100 GPU."""
 
 import hashlib
 from pathlib import Path
@@ -17,10 +17,12 @@ STOP_NS = 1_024_000
 PACKET_INTERVAL_NS = 21
 PACKET_BYTES = 256
 EXPECTED_PACKETS = FLOW_COUNT * (STOP_NS // PACKET_INTERVAL_NS + 1)
-RESULT_COUNTERS = ('lowering_ns', 'run_ns', 'result_bytes', 'pending_events', 'resident_packets',
-                   'sourced_packets', 'departed_packets', 'received_packets', 'dropped_packets')
-DEVICE_COUNTERS = ('wall_ns', 'device_ns', 'rounds', 'transitions', 'continuation_relaunches',
-                   'retry_count', 'grown_stream_count', 'same_time_continuations')
+RESULT_WORK_COUNTERS = ('result_bytes', 'pending_events', 'resident_packets', 'sourced_packets',
+                        'departed_packets', 'received_packets', 'dropped_packets')
+DEVICE_WORK_COUNTERS = ('rounds', 'transitions', 'continuation_relaunches', 'retry_count',
+                        'grown_stream_count', 'same_time_continuations')
+RESULT_COUNTERS = ('lowering_ns', 'run_ns', *RESULT_WORK_COUNTERS)
+DEVICE_COUNTERS = ('wall_ns', 'device_ns', *DEVICE_WORK_COUNTERS)
 
 
 def _sha256(path):
@@ -46,8 +48,8 @@ def _device_record(log):
             'channel_capacity_distribution': fields['channel_capacity_distribution']}
 
 
-def _measure(binary, fixture, engine, log, directory, env, handlers, record):
-    args = [binary, fixture, '--engine', engine]
+def _measure(binary, fixture, engine, log, directory, env, handlers, record, *, prefix=()):
+    args = [*prefix, binary, fixture, '--engine', engine]
     if engine == 'cpu':
         args.extend(['--workers', '2', '--repetitions', '1'])
     if engine == 'cuda':
@@ -62,7 +64,16 @@ def _measure(binary, fixture, engine, log, directory, env, handlers, record):
         record['device'] = _device_record(log)
 
 
-def run(source, output, handlers):
+def _work_differences(baseline, profiled):
+    differences = [key for key in (*RESULT_WORK_COUNTERS, 'result_fnv1a64')
+                   if baseline[key] != profiled[key]]
+    differences.extend(f'device.{key}'
+                       for key in (*DEVICE_WORK_COUNTERS, 'round_kernel', 'channel_capacity_distribution')
+                       if baseline['device'][key] != profiled['device'][key])
+    return differences
+
+
+def run(source, output, handlers, profile=False):
     wide = {'fixture': WIDE_FIXTURE.as_posix(), 'k': 48, 'hosts_per_edge': 16, 'hosts': HOST_COUNT,
             'flows': FLOW_COUNT, 'inclusive_stop_ns': STOP_NS, 'seed': 17_048, 'packet_bytes': PACKET_BYTES,
             'packet_interval_ns': PACKET_INTERVAL_NS, 'link_rate_bps': 100_000_000_000, 'link_delay_ns': 1_000,
@@ -86,6 +97,10 @@ def run(source, output, handlers):
         handlers.command([env.get('NVCC', 'nvcc'), '--version'], output / 'nvcc.txt', env=env)
         summary['stage'] = 'rust-toolchain'
         env = handlers.days_rust_environment(source, output, env)
+        if profile:
+            summary['stage'] = 'nsys-preflight'
+            profiler = handlers._support_module(source, 'nsys_ft48')
+            nsys = profiler.preflight(output, env, handlers)
         with TemporaryDirectory(prefix='.days-fat-tree48-', dir=output) as temp:
             scratch = Path(temp)
             summary['stage'] = 'checkout'
@@ -126,6 +141,20 @@ def run(source, output, handlers):
             if sourced != EXPECTED_PACKETS or received + dropped > sourced:
                 raise RuntimeError(f'Days fixed-window packet gate failed: expected {EXPECTED_PACKETS} sourced, '
                                    f'observed {sourced} sourced, {received} received and {dropped} dropped')
+            if profile:
+                summary['stage'] = 'fat-tree48-nsys'
+                profiled = wide['profile'] = {'run': {}}
+                summary['timing_scope']['profiled_process_seconds'] = (
+                    'Nsight Systems wrapper including simulator execution and trace generation.'
+                )
+                _measure(binary, wide['fixture'], 'cuda', output / 'fat-tree48-cuda-nsys.txt', src, env,
+                         handlers, profiled['run'], prefix=profiler.prefix(nsys, output))
+                differences = profiled['work_differences'] = _work_differences(record, profiled['run'])
+                if differences:
+                    raise RuntimeError(f'Days profiled work differs from baseline: {", ".join(differences)}')
+                summary['stage'] = 'nsys-collect'
+                profiled['trace'] = profiler.collect(nsys, output, env, handlers, simulator='days-ago',
+                                                     rounds=record['device']['rounds'])
         summary.update(state='succeeded', stage='complete')
     except Exception as error:
         summary.update(state='failed', error=str(error))

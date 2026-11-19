@@ -42,8 +42,8 @@ def _support_module(source, name):
     return _SUPPORT_MODULES[key]
 
 
-def _run_pinned(kind, source, output):
-    _support_module(source, kind).run(source, output, sys.modules[__name__])
+def _run_pinned(kind, source, output, **options):
+    _support_module(source, kind).run(source, output, sys.modules[__name__], **options)
 
 
 def write_json(path, result):
@@ -452,6 +452,9 @@ def days_cuda_smoke(source: Path, output: Path):
 def prepare(kind, params):
     handlers = {"gpu_inventory": inventory, "gedes_smoke": gedes_smoke,
                 "days_cuda_smoke": days_cuda_smoke}
+    if (kind in {"days_ago_fat_tree48", "gedes_fat_tree48"}
+            and params == {"profile": True} and params["profile"] is True):
+        return partial(_run_pinned, kind, profile=True)
     if params == {} and kind in {"gpu_transfer", "gedes_drain", "gedes_fat_tree48",
                                  "days_ago_fat_tree48", "nsx_single_gpu", "nsx_four_gpu",
                                  "training_roce_checks", "gedes_timeline", "training_roce_profile",

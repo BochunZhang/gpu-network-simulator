@@ -5,7 +5,7 @@ import shutil
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tools'))
@@ -27,6 +27,9 @@ class DaysFatTree48Test(unittest.TestCase):
         self.fail_install = False
         self.rust_commands = {}
         self.smoke_hash = '0123456789abcdef'
+        self.profile_hash = '0123456789abcdef'
+        self.profile_transitions = 1000
+        self.wide_commands = {}
         self.wide_sourced = days.EXPECTED_PACKETS
         self.fail_build = False
         self.fixture_bytes = b'mock fixture'
@@ -78,12 +81,20 @@ class DaysFatTree48Test(unittest.TestCase):
             binary.write_bytes(b'same binary across engines')
         elif '--engine' in args:
             engine = args[args.index('--engine') + 1]
-            sourced = self.wide_sourced if log.name.startswith('fat-tree48') else 100
-            digest = self.smoke_hash if log.name == 'smoke-cuda.txt' else '0123456789abcdef'
+            wide = log.name.startswith('fat-tree48')
+            profiled = log.name == 'fat-tree48-cuda-nsys.txt'
+            if wide:
+                self.wide_commands[log.name] = args
+            sourced = self.wide_sourced if wide else 100
+            digest = self.profile_hash if profiled else '0123456789abcdef'
+            if log.name == 'smoke-cuda.txt':
+                digest = self.smoke_hash
             lines = []
             if engine == 'cuda':
-                lines.append('record=days_device engine=cuda wall_ns=8 device_ns=7 rounds=6 '
-                             'transitions=1000 continuation_relaunches=0 retry_count=1 '
+                device_ns = 9 if profiled else 7
+                transitions = self.profile_transitions if profiled else 1000
+                lines.append(f'record=days_device engine=cuda wall_ns=10 device_ns={device_ns} rounds=6 '
+                             f'transitions={transitions} continuation_relaunches=0 retry_count=1 '
                              'grown_stream_count=1 channel_capacity_distribution=2:1 '
                              'retry_trace=[CapacityRetry { old: 1, new: 2 }] '
                              'same_time_continuations=0 round_kernel=plain')
@@ -105,8 +116,59 @@ class DaysFatTree48Test(unittest.TestCase):
         self.assertEqual(result['wide']['run']['device']['transitions'], 1000)
         self.assertEqual(result['wide']['run']['process_seconds'], 0.25)
         self.assertEqual(result['wide']['run']['run_ns'], 10)
+        self.assertNotIn('profile', result['wide'])
         self.assertEqual(self.install_calls, 0)
         self.assertEqual(self.rust_commands['cargo', 'build'], (self.worker_bin, None))
+
+    def test_profiling_reuses_baseline_binary_and_accepts_different_timing(self):
+        profiler = Mock()
+        profiler.preflight.return_value = Path('/mock/nsys')
+        profile_prefix = [profiler.preflight.return_value, 'profile']
+        profiler.prefix.return_value = profile_prefix
+        profiler.collect.return_value = {'kernel_count': 72}
+        with patch.object(handlers, '_support_module', return_value=profiler) as support:
+            days.run(REPO, self.output, handlers, profile=True)
+        support.assert_called_once_with(REPO, 'nsys_ft48')
+        result = self.summary()
+        self.assertEqual(result['state'], 'succeeded')
+        profile = result['wide']['profile']
+        self.assertEqual(profile['run']['device']['device_ns'], 9)
+        self.assertEqual(result['wide']['run']['device']['device_ns'], 7)
+        self.assertEqual(profile['work_differences'], [])
+        self.assertEqual(profile['trace']['kernel_count'], 72)
+        self.assertEqual(self.wide_commands['fat-tree48-cuda-nsys.txt'],
+                         [*profile_prefix, *self.wide_commands['fat-tree48-cuda.txt']])
+        profiler.collect.assert_called_once_with(profiler.preflight.return_value, self.output,
+                                                 self.worker_env, handlers, simulator='days-ago', rounds=6)
+
+    def test_profile_work_mismatch_keeps_both_runs_and_fails(self):
+        profiler = Mock()
+        profiler.prefix.return_value = ['nsys', 'profile']
+        self.profile_hash = '0123456789abcdee'
+        self.profile_transitions = 999
+        with patch.object(handlers, '_support_module', return_value=profiler):
+            with self.assertRaisesRegex(RuntimeError, 'profiled work differs from baseline'):
+                days.run(REPO, self.output, handlers, profile=True)
+        result = self.summary()
+        self.assertEqual((result['state'], result['stage']), ('failed', 'fat-tree48-nsys'))
+        self.assertEqual(result['wide']['profile']['work_differences'],
+                         ['result_fnv1a64', 'device.transitions'])
+        self.assertEqual(result['wide']['run']['device']['transitions'], 1000)
+        self.assertEqual(result['wide']['profile']['run']['device']['transitions'], 999)
+        self.assertTrue((self.output / 'fat-tree48-cuda.txt').is_file())
+        self.assertTrue((self.output / 'fat-tree48-cuda-nsys.txt').is_file())
+        profiler.collect.assert_not_called()
+
+    def test_profile_preflight_failure_stops_before_the_build(self):
+        profiler = Mock()
+        profiler.preflight.side_effect = RuntimeError('nsys unavailable')
+        with patch.object(handlers, '_support_module', return_value=profiler):
+            with self.assertRaisesRegex(RuntimeError, 'nsys unavailable'):
+                days.run(REPO, self.output, handlers, profile=True)
+        result = self.summary()
+        self.assertEqual((result['state'], result['stage']), ('failed', 'nsys-preflight'))
+        self.assertNotIn(('cargo', 'build'), self.rust_commands)
+        self.assertNotIn('run', result['wide'])
 
     def test_existing_cargo_bin_is_used_without_install(self):
         (self.worker_bin / 'cargo').unlink()

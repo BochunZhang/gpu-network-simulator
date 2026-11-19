@@ -15,6 +15,22 @@
       "execution": {
         "mode": "full"
       }
+    },
+    "01": {
+      "status": "2026-11-19T04:44:56Z",
+      "name": "GeDES FatTree48 full Nsight Systems profile",
+      "kind": "gedes_fat_tree48",
+      "params": {
+        "profile": true
+      },
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "Profile the full pinned FT48 run through terminal drain on one GB200, with CUDA graph nodes, SMs Active, SM Issue and DRAM activity. Compare completion, bytes, FCT and queue drain with an unprofiled run of the same binary.",
+      "execution": {
+        "mode": "full"
+      }
     }
   }
 }
