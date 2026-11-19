@@ -1,0 +1,22 @@
+{
+  "archive_name": "gedes-000-fat-tree48-27648-01.v3-261119-143124.tar.gz",
+  "archive_sha256": "be2e344e7f0bf71fadcf010b08b0732a4e2eba1456db8a1ce1a0b987e514f78e",
+  "archive_size": 11574374,
+  "archived_at": "2026-11-19T17:20:01+00:00",
+  "claim": "b341e638bf334c15a9f82e76a7737cbe",
+  "command": "bash tools/runner.sh --task gedes-000-fat-tree48-27648-01 --once",
+  "command_source": "recorded",
+  "id": "gedes-000-fat-tree48-27648-01",
+  "name": "GeDES FatTree48 10-second Nsight Systems compute triage",
+  "parent_id": "gedes-000-fat-tree48-27648",
+  "schema_version": 1,
+  "slug": "fat-tree48-27648",
+  "source_commit": "008a7fd68bb34f42b0aeed1712f95f8ce73d3af2",
+  "state": "failed",
+  "subtask_id": "01",
+  "subtask_status": "2026-11-19T14:31:24Z",
+  "task_sha256": "5e154d3b9cac477814c0368013f0922f2e0e7f15ee52edb0a821cb71d7d8d4b7",
+  "task_status": "2026-11-18T13:29:35Z",
+  "version": 1795098684,
+  "version_label": "v3-261119-143124"
+}

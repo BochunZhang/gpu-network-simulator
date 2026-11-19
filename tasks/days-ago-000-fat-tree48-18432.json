@@ -17,17 +17,19 @@
       }
     },
     "01": {
-      "status": "2026-11-19T04:44:56Z",
-      "name": "Days AGO FatTree48 full Nsight Systems profile",
+      "status": "2026-11-20T01:25:12+08:00",
+      "name": "Days AGO FatTree48 10-second Nsight Systems compute triage",
       "kind": "days_ago_fat_tree48",
       "params": {
-        "profile": true
+        "profile": true,
+        "capture_seconds": 10,
+        "metric_set": "gb10x-ct"
       },
       "resources": {
         "gpus": 1
       },
       "enabled": true,
-      "description": "Profile the full pinned FT48 run through 1.024 ms on one GB200, with CUDA graph nodes, SMs Active, SM Issue and DRAM activity. Compare the complete-state fingerprint and work counters with an unprofiled run of the same binary.",
+      "description": "Capture the first 10 wall-clock seconds of the single-GB200 k48/h16 30% CUDA graph loop at 10 kHz with gb10x-ct. Stop collection at the first synchronized wave boundary at or after 10 s. Report Compute SOL, SM Issue Active and DRAM read/write bandwidth with graph nodes, encoded attempts and committed rounds. Require a native report at most 64 MiB. Continue through 1.024 ms of virtual time and compare the final fingerprint and work counters with an unprofiled run of the same binary.",
       "execution": {
         "mode": "full"
       }
@@ -49,7 +51,7 @@
       }
     },
     "03": {
-      "status": "2026-11-19T17:11:40Z",
+      "status": "ignore",
       "name": "Days AGO FatTree48 10-second Nsight Systems compute triage",
       "kind": "days_ago_fat_tree48",
       "params": {
