@@ -13,7 +13,7 @@ SHORT_NAME_PATTERN = r'[a-z0-9]+(?:-[a-z0-9]+)*'
 CATEGORY_PATTERN = r'[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*'
 PARENT_PATTERN = rf'(?P<category>{CATEGORY_PATTERN})-(?P<index>[0-9]{{3}})-(?P<slug>{SHORT_NAME_PATTERN})'
 CHILD_PATTERN = rf'{PARENT_PATTERN}-[0-9]{{2}}'
-STATUS_PATTERN = r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+STATUS_PATTERN = r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\+08:00|Z)'
 VERSION_LABEL_PATTERN = r'v[1-9][0-9]*-[0-9]{6}-[0-9]{6}'
 CHILD_FIELDS = {'status', 'name', 'kind', 'params', 'execution', 'resources', 'enabled', 'description'}
 
@@ -23,8 +23,8 @@ def release_version(status):
     if status == 'ignore':
         return None
     if not isinstance(status, str) or not re.fullmatch(STATUS_PATTERN, status):
-        raise ValueError('status must be UTC YYYY-MM-DDTHH:MM:SSZ or ignore')
-    value = datetime.strptime(status, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+        raise ValueError('status must be YYYY-MM-DDTHH:MM:SS+08:00, a legacy UTC timestamp ending in Z, or ignore')
+    value = datetime.strptime(status, '%Y-%m-%dT%H:%M:%S%z')
     seconds = int(value.timestamp())
     if seconds < 1:
         raise ValueError('release timestamp must be after the Unix epoch')
@@ -44,7 +44,7 @@ def execution_digest(task):
 def publication_label(ordinal, status):
     version = release_version(status)
     if type(ordinal) is not int or ordinal < 1 or version is None:
-        raise ValueError('publication label requires a positive ordinal and a UTC timestamp')
+        raise ValueError('publication label requires a positive ordinal and a publication timestamp')
     published = datetime.fromtimestamp(version, timezone.utc)
     return f'v{ordinal}-{published:%y%m%d-%H%M%S}'
 
@@ -118,10 +118,11 @@ def expand(manifest, path):
             task['legacy_base'] = {'id': legacy['id'], 'slug': legacy['slug']}
             if index == '00':
                 task.update(legacy_id=legacy['id'], legacy_slug=legacy['slug'])
-                if child['status'] == legacy['published_at'] or version is None:
+                legacy_publication = release_version(legacy['published_at'])
+                if version is None or version == legacy_publication:
                     task.update(id=legacy['id'], slug=legacy['slug'], version=legacy['version'],
                                 command=f"bash tools/runner.sh --task {legacy['id']} --once")
-                elif version < release_version(legacy['published_at']):
+                elif version < legacy_publication:
                     raise ValueError(f'child predates its legacy release: {path} {index}')
         if parent_version is None or version is None:
             task['enabled'] = False
@@ -153,9 +154,13 @@ def validate_transition(previous, current):
             if {**old, 'status': 'ignore'} != new:
                 raise ValueError(f'retirement must preserve the child definition: {parent}-{index}')
             continue
-        if new['status'] < old['status']:
+        old_version = release_version(old['status'])
+        new_version = release_version(new['status'])
+        if new_version < old_version:
             raise ValueError(f'child publication timestamp moved backwards: {parent}-{index}')
-        if new['status'] == old['status']:
+        if new_version == old_version:
+            if new['status'] != old['status']:
+                raise ValueError(f'preserve the original child publication timestamp: {parent}-{index}')
             def payload(child, parent_name):
                 return {**{k: v for k, v in child.items() if k not in {'enabled', 'description'}},
                         'name': child.get('name', parent_name)}

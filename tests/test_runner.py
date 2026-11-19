@@ -123,11 +123,12 @@ class RunnerTest(unittest.TestCase):
         first_run = self.store.read()[child0, batch]
         package = runner.archive_path(self.results, first_run)
         checksum = runner.sha256_file(package)
-        manifest['subtasks']['01'] = {**first, 'params': {'topos': ['D']}}
+        local_initial = '2026-11-18T08:00:00+08:00'
+        manifest['subtasks']['01'] = {**first, 'status': local_initial, 'params': {'topos': ['D']}}
         self.publish_catalog(manifest)
         once(parent)
         self.assertEqual(len(self.store.read()), 2)
-        first['status'] = '2026-11-18T00:00:01Z'
+        first['status'] = '2026-11-18T08:00:01+08:00'
         self.publish_catalog(manifest)
         once(child1)
         self.assertEqual(len(self.store.read()), 2)
@@ -135,6 +136,8 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(set(self.store.read()), {(child0, batch), (child1, batch), (child0, batch + 1)})
         self.assertEqual(runner.sha256_file(package), checksum)
         self.assertEqual(self.store.read()[child0, batch]['claim'], first_run['claim'])
+        self.assertEqual(self.store.read()[child0, batch + 1]['subtask_status'], first['status'])
+        self.assertEqual(self.store.read()[child1, batch]['subtask_status'], local_initial)
         self.assertEqual(package.name, f'{child0}.v1-261118-000000.tar.gz')
         self.assertTrue((self.results / child0 / 'v2-261118-000001' / 'result.json').is_file())
         self.assertTrue((self.status_dir / child1 / 'v1-261118-000000.json').is_file())

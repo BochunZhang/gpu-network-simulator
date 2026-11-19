@@ -88,7 +88,9 @@ class CatalogTest(unittest.TestCase):
                          catalog.expand(changed, self.path)[0][1])
 
     def test_invalid_manifest_and_timestamp(self):
-        for status in ('2026-11-18T10:00:00', '2026-02-30T00:00:00Z', None, 1, 'ignored'):
+        for status in ('2026-11-18T10:00:00', '2026-02-30T00:00:00Z',
+                       '2026-11-18T10:00:00+08:01', '2026-11-18T10:00:00+0800',
+                       None, 1, 'ignored'):
             with self.subTest(status=status), self.assertRaises(ValueError):
                 catalog.release_version(status)
         with self.assertRaises(ValueError):
@@ -96,3 +98,28 @@ class CatalogTest(unittest.TestCase):
         self.manifest['subtasks']['0'] = self.manifest['subtasks'].pop('00')
         with self.assertRaises(ValueError):
             catalog.expand(self.manifest, self.path)
+
+    def test_publication_order_across_midnight_and_offsets(self):
+        utc = '2026-11-18T20:00:00Z'
+        same_instant = '2026-11-19T04:00:00+08:00'
+        earlier = '2026-11-19T03:59:59+08:00'
+        later = '2026-11-19T04:00:01+08:00'
+        self.manifest['status'] = self.manifest['subtasks']['00']['status'] = utc
+        updated = copy.deepcopy(self.manifest)
+        child = updated['subtasks']['00']
+        child['status'] = earlier
+        with self.assertRaisesRegex(ValueError, 'backwards'):
+            catalog.validate_transition(self.manifest, updated)
+        child['status'] = same_instant
+        with self.assertRaisesRegex(ValueError, 'preserve the original'):
+            catalog.validate_transition(self.manifest, updated)
+        child['status'] = later
+        catalog.validate_transition(self.manifest, updated)
+
+        updated['status'] = same_instant
+        [(task, _)] = catalog.expand(updated, self.path)
+        self.assertEqual(task['version'], catalog.release_version(utc) + 1)
+        self.assertEqual(catalog.publication_label(2, later), 'v2-261118-200001')
+        child['status'] = earlier
+        with self.assertRaisesRegex(ValueError, 'predates its parent'):
+            catalog.expand(updated, self.path)
