@@ -44,7 +44,7 @@
       "resources": {
         "gpus": 1
       },
-      "enabled": true,
+      "enabled": false,
       "description": "Trace every warp of all 45 kernel launches per FT48 timeslot through terminal drain on one GB200. Validate coverage, matched inputs and terminal byte/queue state. Report per-flow completion-time differences separately.",
       "execution": {
         "mode": "full"

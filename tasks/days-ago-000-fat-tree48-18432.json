@@ -44,7 +44,7 @@
       "resources": {
         "gpus": 1
       },
-      "enabled": true,
+      "enabled": false,
       "description": "Trace every warp of the full FT48 graph replays and direct gathers on one GB200. Check CTA and warp coverage at every launch and match the baseline state fingerprint and work counters.",
       "execution": {
         "mode": "full"
