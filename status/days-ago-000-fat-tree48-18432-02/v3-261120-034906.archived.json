@@ -1,0 +1,22 @@
+{
+  "archive_name": "days-ago-000-fat-tree48-18432-02.v3-261120-034906.tar.gz",
+  "archive_sha256": "6ccd254a958027c0b0533faa1fac4ce68e624355ede458940f916b6a8cec7718",
+  "archive_size": 16808394,
+  "archived_at": "2026-11-20T04:53:09+00:00",
+  "claim": "3703aea7425d4ff3adaedd9cbcaa623d",
+  "command": "bash tools/runner.sh --task days-ago-000-fat-tree48-18432-02 --once",
+  "command_source": "recorded",
+  "id": "days-ago-000-fat-tree48-18432-02",
+  "name": "Days AGO FatTree48 full warp lifetime trace",
+  "parent_id": "days-ago-000-fat-tree48-18432",
+  "schema_version": 1,
+  "slug": "fat-tree48-18432",
+  "source_commit": "42035c3a854038072aed22743464f7cb1a1012d6",
+  "state": "failed",
+  "subtask_id": "02",
+  "subtask_status": "2026-11-20T11:49:06+08:00",
+  "task_sha256": "da1b53297e485c97bb50f1cb1e6f07bc73a5c76198ab44b72379ab91ce353e61",
+  "task_status": "2026-11-18T13:29:35Z",
+  "version": 1795146546,
+  "version_label": "v3-261120-034906"
+}
