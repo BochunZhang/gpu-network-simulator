@@ -1,0 +1,22 @@
+{
+  "archive_name": "days-ago-000-fat-tree48-18432-02.v2-261120-015414.tar.gz",
+  "archive_sha256": "7141d972f92bd47b6da4d3f6dea35134b370a320ecee8b0a5ba91a700e9b86c8",
+  "archive_size": 5031,
+  "archived_at": "2026-11-20T03:39:17+00:00",
+  "claim": "110fa0e528ee49dabbe3f235e43b4b90",
+  "command": "bash tools/runner.sh --task days-ago-000-fat-tree48-18432-02 --once",
+  "command_source": "recorded",
+  "id": "days-ago-000-fat-tree48-18432-02",
+  "name": "Days AGO IKET graph initialization timing probe",
+  "parent_id": "days-ago-000-fat-tree48-18432",
+  "schema_version": 1,
+  "slug": "fat-tree48-18432",
+  "source_commit": "6753ac65adf6316a4c1c331ac60ba088b822087a",
+  "state": "succeeded",
+  "subtask_id": "02",
+  "subtask_status": "2026-11-20T09:54:14+08:00",
+  "task_sha256": "7e1a07f710836c72e93b21b28ba5f65ecfcccfd3f8f453dd1ff29ec670bf8070",
+  "task_status": "2026-11-18T13:29:35Z",
+  "version": 1795139654,
+  "version_label": "v2-261120-015414"
+}
