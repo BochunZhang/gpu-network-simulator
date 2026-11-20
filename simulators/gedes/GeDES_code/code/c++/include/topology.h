@@ -118,7 +118,7 @@ namespace VDES
     uint32_t m_distribution_seed;
 
     cudaGraph_t m_graph;
-    cudaGraphExec_t m_graph_exec;
+    cudaGraphExec_t m_graph_exec = nullptr;
     cudaStream_t m_graph_stream;
 
     // traffic flows
@@ -160,7 +160,9 @@ namespace VDES
     void BuildHugeGraph();
 #endif
 
-    void BuildGraphOnlyGPU();
+    void BuildGraphOnlyGPU(bool defer_instantiation = false);
+    void InstantiateGraph();
+    void DestroyGraphExecutable();
 
     // test interface
     void Run(int time);

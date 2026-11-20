@@ -35,7 +35,7 @@
       }
     },
     "02": {
-      "status": "2026-11-19T14:18:41Z",
+      "status": "2026-11-20T11:49:06+08:00",
       "name": "GeDES FatTree48 full warp lifetime trace",
       "kind": "gedes_fat_tree48",
       "params": {

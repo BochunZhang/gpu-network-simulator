@@ -52,11 +52,12 @@ struct Session {
         if (status) throw std::runtime_error(std::string(name) + " returned " + std::to_string(status));
     }
 #define IKET(method, ...) check(symbol<decltype(&IketProfilingSession##method)>("IketProfilingSession" #method)(__VA_ARGS__), #method)
-    void begin(const char* kind, uint64_t id) {
+    bool begin(const char* kind, uint64_t id) {
         init();
         if (in_launch) throw std::runtime_error("overlapping begin hooks");
         if (handle && phase != kind) flush();
-        if (!handle) {
+        const bool starts_window = !handle;
+        if (starts_window) {
             phase = kind;
             first = id;
             count = 0;
@@ -70,17 +71,18 @@ struct Session {
         }
         if (id != first + count) throw std::runtime_error("nonconsecutive replay in a window");
         in_launch = true;
+        return starts_window;
     }
-    void end(const char* kind, uint64_t id) {
+    bool end(const char* kind, uint64_t id) {
         if (!in_launch || phase != kind || first + count != id)
             throw std::runtime_error("end does not match active replay");
         in_launch = false;
         ++count;
-        if (count == batch || phase == "direct") flush();
+        return (count == batch || phase == "direct") && flush();
     }
-    void flush() {
+    bool flush() {
         if (in_launch) throw std::runtime_error("flush during a replay");
-        if (!handle) return;
+        if (!handle) return false;
         IKET(Stop, handle);
         auto raw = output / "pending.iket.json";
         IKET(SaveTrace, handle, raw.c_str());
@@ -103,13 +105,14 @@ struct Session {
         if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status))
             throw std::runtime_error("warp decoder failed; pending.iket.json retained");
         fs::remove(raw);
+        return true;
     }
 };
 Session session;
-template<class F> void hook(F f) {
+template<class F> bool hook(F f) {
     const char* output = std::getenv("FT48_WARP_OUTPUT");
-    if (!output || !*output) return;
-    try { f(); }
+    if (!output || !*output) return false;
+    try { return f(); }
     catch (const std::exception& e) {
         std::fprintf(stderr, "FT48 warp capture: %s\n", e.what());
         std::fflush(stderr);
@@ -117,8 +120,8 @@ template<class F> void hook(F f) {
     }
 }
 }
-extern "C" void ft48_warp_begin(uint64_t id) { hook([&] { session.begin("graph", id); }); }
-extern "C" void ft48_warp_end(uint64_t id) { hook([&] { session.end("graph", id); }); }
-extern "C" void ft48_warp_begin_direct(uint64_t id) { hook([&] { session.begin("direct", id); }); }
-extern "C" void ft48_warp_end_direct(uint64_t id) { hook([&] { session.end("direct", id); }); }
-extern "C" void ft48_warp_finish() { hook([] { session.flush(); }); }
+extern "C" bool ft48_warp_begin(uint64_t id) { return hook([&] { return session.begin("graph", id); }); }
+extern "C" bool ft48_warp_end(uint64_t id) { return hook([&] { return session.end("graph", id); }); }
+extern "C" void ft48_warp_begin_direct(uint64_t id) { hook([&] { return session.begin("direct", id); }); }
+extern "C" void ft48_warp_end_direct(uint64_t id) { hook([&] { return session.end("direct", id); }); }
+extern "C" void ft48_warp_finish() { hook([] { return session.flush(); }); }

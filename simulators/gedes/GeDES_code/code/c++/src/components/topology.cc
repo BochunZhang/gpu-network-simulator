@@ -1129,7 +1129,24 @@ namespace VDES
       throw std::runtime_error(std::string("GeDES RunGraph: ") + cudaGetErrorString(status));
   }
 
-  void Topology::BuildGraphOnlyGPU()
+  void Topology::InstantiateGraph()
+  {
+    const auto status = cudaGraphInstantiate(&m_graph_exec, m_graph, 0);
+    if (status != cudaSuccess)
+      throw std::runtime_error(std::string("GeDES graph instantiation: ") + cudaGetErrorString(status));
+  }
+
+  void Topology::DestroyGraphExecutable()
+  {
+    if (!m_graph_exec)
+      return;
+    const auto status = cudaGraphExecDestroy(m_graph_exec);
+    if (status != cudaSuccess)
+      throw std::runtime_error(std::string("GeDES graph executable destruction: ") + cudaGetErrorString(status));
+    m_graph_exec = nullptr;
+  }
+
+  void Topology::BuildGraphOnlyGPU(bool defer_instantiation)
   {
     cudaGraph_t main_graph;
     cudaGraphCreate(&main_graph, 0);
@@ -1284,7 +1301,8 @@ namespace VDES
                                p2p_nodes.size(), timer_graph);
 
     m_graph = main_graph;
-    cudaGraphInstantiate(&m_graph_exec, m_graph, 0);
+    if (!defer_instantiation)
+      InstantiateGraph();
 #ifdef FT48_WARP_TRACE
     if (const char *dot = std::getenv("GEDES_FT48_GRAPH_DOT")) {
       const auto status = cudaGraphDebugDotPrint(m_graph, dot, 0);

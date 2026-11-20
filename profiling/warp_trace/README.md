@@ -28,7 +28,7 @@ Lifetime intervals include stalls and waits. Overlap describes co-residency over
 
 ## Capture and checks
 
-FT48 uses NVIDIA IKET's in-process lifetime-only session, enabled after graph instantiation. The host starts it before a replay and closes the window after stream synchronization. Days uses one session per 64-attempt replay and separate sessions for its three graph-external gathers. GeDES batches sequential synchronized replays. Source placement and requirements are in the simulator-specific runners and `tools/warp_ft48.py`.
+FT48 uses NVIDIA IKET's in-process lifetime-only sessions. The host builds the graph definition, starts IKET, and instantiates a new graph executable for that capture window. The final replay in the window synchronizes before IKET stops. Days uses one session per 64-attempt replay and separate sessions for its three graph-external gathers. GeDES batches sequential synchronized replays. The simulator-specific runners and `tools/warp_ft48.py` set up the capture.
 
 The decoder streams the location table and a kernel at a time, writes each launch's observed warp intervals, and commits a window only after checking every node's name, grid and block and every expected CTA/warp pair. A mismatched, overlapping, missing or duplicate interval identity fails the capture. Missing baseline or correctness gates are reported separately by the simulator-specific runner. Capture overhead, memory usage and total application time belong to the instrumented run.
 

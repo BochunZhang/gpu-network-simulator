@@ -12,8 +12,8 @@
 #ifdef FT48_WARP_TRACE
 #include <cstdint>
 #include <cstdlib>
-extern "C" void ft48_warp_begin(std::uint64_t replay);
-extern "C" void ft48_warp_end(std::uint64_t replay);
+extern "C" bool ft48_warp_begin(std::uint64_t replay);
+extern "C" bool ft48_warp_end(std::uint64_t replay);
 extern "C" void ft48_warp_finish();
 #endif
 
@@ -150,8 +150,14 @@ int main(int argc, char *argv[])
     topology.SetLookAheadTimeslot(look_ahead_timeslot);
     topology.SetTransmissionPlanParams(expected_packet_num, deviate, 41U);
     topology.BuildTopology();
+#ifdef FT48_WARP_TRACE
+    const char *trace_output = std::getenv("FT48_WARP_OUTPUT");
+    const bool trace_replays = trace_output && *trace_output;
+#else
+    constexpr bool trace_replays = false;
+#endif
 #if ENABLE_GPU_MEM_POOL
-    topology.BuildGraphOnlyGPU();
+    topology.BuildGraphOnlyGPU(trace_replays);
 #elif ENABLE_HUGE_GRAPH
     topology.BuildHugeGraph();
 #endif
@@ -173,13 +179,11 @@ int main(int argc, char *argv[])
         return result;
     };
     std::cout << "Simulation Start" << std::endl;
-#ifdef FT48_WARP_TRACE
-    const bool trace_replays = std::getenv("FT48_WARP_OUTPUT") != nullptr;
-#endif
     const auto audit_loop_start = AuditClock::now();
     for (int i = 0; i < audit_max_rounds && (!audit_early_stop || i < 1) && !audit_finished(); ++i) {
 #ifdef FT48_WARP_TRACE
-        if (trace_replays) ft48_warp_begin(i);
+        // A fresh executable belongs to the IKET session that records its replays.
+        if (trace_replays && ft48_warp_begin(i)) topology.InstantiateGraph();
 #endif
 #if ENABLE_HUGE_GRAPH
         if (audit_detail) {
@@ -191,7 +195,7 @@ int main(int argc, char *argv[])
         }
 #endif
 #ifdef FT48_WARP_TRACE
-        if (trace_replays) ft48_warp_end(i);
+        if (trace_replays && ft48_warp_end(i)) topology.DestroyGraphExecutable();
 #endif
         ++audit_rounds;
         if (i % 20000 == 0) {
@@ -199,7 +203,10 @@ int main(int argc, char *argv[])
         }
     }
 #ifdef FT48_WARP_TRACE
-    if (trace_replays) ft48_warp_finish();
+    if (trace_replays) {
+        ft48_warp_finish();
+        topology.DestroyGraphExecutable();
+    }
 #endif
     const auto audit_loop_end = AuditClock::now();
     const auto audit_sync_start = AuditClock::now();
