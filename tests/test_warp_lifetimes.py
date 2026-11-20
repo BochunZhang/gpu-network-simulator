@@ -68,6 +68,53 @@ class WarpLifetimeTest(unittest.TestCase):
                 keys = [r[0] for r in db.execute("select graph_key from launches order by node")]
             self.assertEqual(keys, ["graph_exec_2:0", "graph_exec_3:0"] * 22 + ["graph_exec_2:0"])
 
+    @unittest.skipUnless(importlib.util.find_spec("ijson"), "install the capture dependency to test streaming")
+    def test_empty_invalid_graph_key_copies_preserve_complete_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            window = form_window()
+            launches = window["graphLaunches"].pop("graph_exec_4:3")
+            window["graphLaunches"] = {
+                "graph_exec_2:4294967295": [dict(launch, warpLifetimes=[]) for launch in launches],
+                "graph_exec_2:0": launches,
+            }
+            (directory / "pending.iket.json").write_text(json.dumps(window))
+            trace.ingest(directory, "gedes", "graph", 0, 1)
+            summary = trace.verify(directory, "gedes", 1)
+            self.assertEqual(summary["kernel_launches"], 45)
+            self.assertEqual(summary["warp_lifetimes"], 23983)
+            with sqlite3.connect(directory / "index.sqlite") as db:
+                self.assertEqual(db.execute("select distinct graph_key from launches").fetchall(), [("graph_exec_2:0",)])
+
+    @unittest.skipUnless(importlib.util.find_spec("ijson"), "install the capture dependency to test streaming")
+    def test_invalid_graph_key_does_not_hide_capture_errors(self):
+        window = form_window()
+        launches = window["graphLaunches"]["graph_exec_4:3"]
+        empty = [dict(launch, warpLifetimes=[]) for launch in launches]
+        invalid_key = "graph_exec_4:4294967295"
+        cases = {
+            "unmatched grid": (invalid_key, [dict(empty[0], gridId=-1), *empty[1:]], "empty IKET graph group"),
+            "different executable": ("graph_exec_5:4294967295", empty, "empty IKET graph group"),
+            "mismatched metadata": (invalid_key, [dict(empty[0], enabledCluster={"x": 2, "y": 1, "z": 1}),
+                                                  *empty[1:]], "empty IKET graph group"),
+            "duplicate placeholder": (invalid_key, [*empty, empty[0]], "empty IKET graph group"),
+            "incomplete placeholder group": (invalid_key, empty[:-1], "empty IKET graph group"),
+            "mixed populated and empty rows": (invalid_key, [launches[0], *empty[1:]], "empty IKET graph group"),
+            "partial lifetimes": (invalid_key, [dict(launches[0], warpLifetimes=launches[0]["warpLifetimes"][:1])],
+                                  "expected 4 warp lifetimes, got 1"),
+            "empty regular launch": ("graph_exec_4:0", empty, "expected 4 warp lifetimes, got 0"),
+        }
+        for name, (key, rows, error) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                invalid = dict(window, graphLaunches={**window["graphLaunches"], key: rows})
+                (directory / "pending.iket.json").write_text(json.dumps(invalid))
+                with self.assertRaisesRegex(ValueError, error):
+                    trace.ingest(directory, "gedes", "graph", 0, 1)
+                self.assertEqual((directory / "lifetimes.bin").stat().st_size, 0)
+                with sqlite3.connect(directory / "index.sqlite") as db:
+                    self.assertEqual(db.execute("select count(*) from launches").fetchone(), (0,))
+
     def test_duplicate_warp_rejected(self):
         row = dict(locIdx=0, startTs=2, endTs=3)
         launch = dict(kernelName="x", gridDimX=1, gridDimY=1, gridDimZ=1,

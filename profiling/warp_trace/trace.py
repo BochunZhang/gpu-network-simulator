@@ -32,6 +32,7 @@ GEDES = {
 }
 GATHER = "days_compact_gather"
 GRAPH_KEY = re.compile(r"graph_exec_\d+:\d+\Z")
+UNKNOWN_GRAPH_SUFFIX = ":4294967295"  # IKET prints its failed CUDA ID lookup (-1) as uint32.
 SCHEMA = """
 create table if not exists chunks(
  id integer primary key, phase text, first_replay integer, replay_count integer,
@@ -178,6 +179,8 @@ def ingest(directory, simulator, phase, first, count):
             "bad capture window")
     locations = stream_locations(raw)
     groups = defaultdict(list)
+    graph_metadata = defaultdict(list)
+    empty_graph_keys = set()
     with sqlite3.connect(directory / "index.sqlite") as db, (directory / "lifetimes.bin").open("ab") as out:
         db.executescript(SCHEMA)
         offset = out.tell()
@@ -190,6 +193,12 @@ def ingest(directory, simulator, phase, first, count):
             sm_totals = defaultdict(lambda: [0, 0])
             for key, launch in stream_launches(raw):
                 require(phase == "graph" or not key, "unexpected graph launch in direct capture")
+                if key:
+                    graph_metadata[key].append({field: value for field, value in launch.items()
+                                                if field != "warpLifetimes"})
+                    if key.endswith(UNKNOWN_GRAPH_SUFFIX) and launch["warpLifetimes"] == []:
+                        empty_graph_keys.add(key)
+                        continue
                 name = launch["kernelName"]
                 if name not in kernels:
                     short = canonical_name(name, simulator, phase)
@@ -202,6 +211,14 @@ def ingest(directory, simulator, phase, first, count):
                 sdk_node = next((str(launch[k]) for k in ("graphNodeId", "nodeId") if k in launch), None)
                 groups[key].append((short, source_index, str(launch["contextId"]), str(launch["gridId"]),
                                     ident, *geometry, sdk_node, key))
+            # A failed IKET graph ID lookup can leave an empty copy of an entire
+            # graph group. Require a one-to-one match to validated launch metadata.
+            for key in sorted(empty_graph_keys):
+                prefix = key.removesuffix(UNKNOWN_GRAPH_SUFFIX) + ":"
+                matches = sum(other.startswith(prefix) and graph_metadata[other] == graph_metadata[key]
+                              for other in groups if other not in empty_graph_keys)
+                require(key not in groups and matches == 1,
+                        f"empty IKET graph group {key} has no unique populated copy")
             # The SDK may use one graph key per replay, combine multiple replays
             # under a graph-exec key, split nested graph keys, or place graph
             # nodes in the flat array. Keys are stored per launch.
