@@ -84,16 +84,19 @@ def prepare(source, output, scratch, env, helpers):
     return build
 
 
-def capture_environment(source, output, build_env, simulator):
+def capture_environment(source, output, build_env, simulator, graph_replays=None):
     trace_dir = output / 'warp'
     trace_dir.mkdir(exist_ok=True)
-    return {**build_env, 'FT48_WARP_OUTPUT': str(trace_dir.resolve()),
-            'FT48_WARP_SIMULATOR': simulator, 'FT48_WARP_BATCH': '1' if simulator == 'days' else '32'}
+    env = {**build_env, 'FT48_WARP_OUTPUT': str(trace_dir.resolve()),
+           'FT48_WARP_SIMULATOR': simulator, 'FT48_WARP_BATCH': '1' if simulator == 'days' else '32'}
+    if graph_replays is not None:
+        env['FT48_WARP_GRAPH_REPLAYS'] = str(graph_replays)
+    return env
 
 
-def collect(source, output, simulator, rounds):
+def collect(source, output, simulator, rounds, graph_replays=None):
     path = source / 'profiling/warp_trace/trace.py'
     spec = importlib.util.spec_from_file_location('ft48_warp_trace', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.verify(output / 'warp', simulator, rounds)
+    return module.verify(output / 'warp', simulator, rounds, graph_replays)

@@ -4,7 +4,7 @@ import shutil
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tools'))
@@ -212,19 +212,33 @@ class DaysFatTree48Test(unittest.TestCase):
             days._read_capture_window(log, 8)
 
     def test_warp_profile_uses_maintained_build_and_compares_work(self):
+        self._check_warp_profile(None)
+
+    def test_bounded_warp_profile_validates_prefix_and_full_work(self):
+        self._check_warp_profile(2)
+
+    def test_bounded_warp_profile_rejects_a_retried_workload(self):
+        self.retry_count = 1
+        with self.assertRaisesRegex(RuntimeError, 'warp prefix may cover a retried attempt'):
+            self._check_warp_profile(2)
+        self.assertEqual(self.summary()['state'], 'failed')
+        self.assertEqual(self.summary()['wide']['profile']['trace']['warp_instances'], 123)
+
+    def _check_warp_profile(self, graph_replays):
         warp = Mock()
         warp.prepare.side_effect = lambda source, output, scratch, env, handlers: dict(env)
-        warp.capture_environment.side_effect = lambda source, output, env, kind: {
+        warp.capture_environment.side_effect = lambda source, output, env, kind, replays: {
             **env, 'FT48_WARP_OUTPUT': str(output / 'warp')
         }
         warp.collect.return_value = {'warp_instances': 123}
         with patch.object(handlers, '_support_module', return_value=warp) as support:
-            days.run(REPO, self.output, handlers, warp_trace=True)
+            days.run(REPO, self.output, handlers, warp_trace=True, warp_graph_replays=graph_replays)
         support.assert_called_once_with(REPO, 'warp_ft48')
         profiled = self.summary()['wide']['profile']
         self.assertEqual(profiled['trace']['warp_instances'], 123)
         self.assertEqual(profiled['work_differences'], [])
-        warp.collect.assert_called_once_with(REPO, self.output, 'days', 6)
+        warp.capture_environment.assert_called_once_with(REPO, self.output, ANY, 'days', graph_replays)
+        warp.collect.assert_called_once_with(REPO, self.output, 'days', 6, graph_replays)
 
     def test_profile_preflight_failure_stops_before_the_build(self):
         profiler = Mock()

@@ -11,6 +11,14 @@ import experiment_handlers as handlers
 
 
 class TaskDispatchTest(unittest.TestCase):
+    def test_bounded_warp_tasks_accept_only_positive_uint64_replay_limits(self):
+        for kind, count in (('gedes_fat_tree48', 64), ('days_ago_fat_tree48', 2)):
+            params = {'warp_trace': True, 'warp_graph_replays': count}
+            self.assertEqual(handlers.prepare(kind, params).keywords, params)
+            for invalid in (0, -1, True, None, '2', 2**64):
+                with self.subTest(kind=kind, invalid=invalid), self.assertRaises(ValueError):
+                    handlers.prepare(kind, {**params, 'warp_graph_replays': invalid})
+
     def test_external_handlers_use_pinned_file_and_helpers(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

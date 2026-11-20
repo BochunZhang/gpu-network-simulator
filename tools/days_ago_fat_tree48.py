@@ -91,7 +91,8 @@ def _work_differences(baseline, profiled):
     return differences
 
 
-def run(source, output, handlers, profile=False, warp_trace=False, capture_seconds=None, metric_set=None):
+def run(source, output, handlers, profile=False, warp_trace=False, capture_seconds=None, metric_set=None,
+        warp_graph_replays=None):
     wide = {'fixture': WIDE_FIXTURE.as_posix(), 'k': 48, 'hosts_per_edge': 16, 'hosts': HOST_COUNT,
             'flows': FLOW_COUNT, 'inclusive_stop_ns': STOP_NS, 'seed': 17_048, 'packet_bytes': PACKET_BYTES,
             'packet_interval_ns': PACKET_INTERVAL_NS, 'link_rate_bps': 100_000_000_000, 'link_delay_ns': 1_000,
@@ -177,7 +178,8 @@ def run(source, output, handlers, profile=False, warp_trace=False, capture_secon
                     'IKET lifetime-only capture including trace collection.' if warp_trace else
                     'Nsight Systems wrapper including simulator execution and trace generation.'
                 )
-                capture_env = warp.capture_environment(source, output, env, 'days') if warp_trace else env
+                capture_env = (warp.capture_environment(source, output, env, 'days', warp_graph_replays)
+                               if warp_trace else env)
                 prefix = ()
                 if profile:
                     range_options = {}
@@ -197,7 +199,10 @@ def run(source, output, handlers, profile=False, warp_trace=False, capture_secon
                     if not dot.is_file() or dot.stat().st_size == 0:
                         raise RuntimeError('missing Days CUDA Graph dependency export')
                     profiled['graph_dependencies'] = 'warp/graph.dot'
-                    profiled['trace'] = warp.collect(source, output, 'days', rounds)
+                    profiled['trace'] = warp.collect(source, output, 'days', rounds, warp_graph_replays)
+                    if warp_graph_replays is not None and profiled['run']['device']['retry_count']:
+                        raise RuntimeError('Days warp prefix may cover a retried attempt; final run counters '
+                                           'describe a later attempt')
                 if profile and (not differences or capture_seconds is not None):
                     summary['stage'] = 'nsys-collect'
                     collect_options = {}

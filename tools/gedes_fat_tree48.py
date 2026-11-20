@@ -217,7 +217,8 @@ def _paired_fct(baseline_csv, trace_csv):
             'max_absolute_difference_ns': max(deltas), 'all_equal': not any(deltas)}
 
 
-def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace=False, metric_set=None):
+def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace=False, metric_set=None,
+        warp_graph_replays=None):
     audit = helpers._support_module(source, 'gedes_experiments')
     drain = helpers._support_module(source, 'gedes_drain')
     summary = {'scope': 'Single-GB200 GeDES public artifact FatTree48 TCP/DCTCP workload with seeded inputs',
@@ -274,13 +275,13 @@ def run(source, output, helpers, profile=False, capture_seconds=None, warp_trace
                 profile_output.mkdir()
                 run = {}
                 capture = summary['warp_profile'] = {'run': run, 'passed': False}
-                capture_env = warp.capture_environment(source, output, env, 'gedes')
+                capture_env = warp.capture_environment(source, output, env, 'gedes', warp_graph_replays)
                 dot = output / 'warp' / 'graph.dot'
                 dot.parent.mkdir(exist_ok=True)
                 capture_env['GEDES_FT48_GRAPH_DOT'] = str(dot)
                 _run_case(binary, profile_output, capture_env, audit, drain, helpers, run, journal_dir=output)
                 rounds = run['measurements']['rounds']
-                capture['trace'] = warp.collect(source, output, 'gedes', rounds)
+                capture['trace'] = warp.collect(source, output, 'gedes', rounds, warp_graph_replays)
                 if not dot.is_file() or not dot.stat().st_size:
                     raise ValueError('GeDES graph dependency DOT is missing or empty')
                 capture['graph_dot'] = {'path': 'warp/graph.dot', **_file_record(dot)}

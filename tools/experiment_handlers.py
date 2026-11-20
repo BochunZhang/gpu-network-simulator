@@ -20,6 +20,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+import task_catalog
+
 GEDES = ("https://github.com/mobinets/GeDES.git", "1376c638a0ae66116430f953da137d0c536675ad")
 DAYS = ("https://github.com/iQua/days.git", "048d48743119257fd8d4b2e5f0fb2228153fd955")
 DAYS_FIXTURE = "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml"
@@ -456,8 +458,8 @@ def prepare(kind, params):
             and params["warp_init_probe"] is True):
         return partial(_run_pinned, "iket_probe")
     if (kind in {"days_ago_fat_tree48", "gedes_fat_tree48"}
-            and params == {"warp_trace": True} and params["warp_trace"] is True):
-        return partial(_run_pinned, kind, warp_trace=True)
+            and task_catalog.is_ft48_warp_capture_params(params)):
+        return partial(_run_pinned, kind, **params)
     if (kind in {"gedes_fat_tree48", "days_ago_fat_tree48"} and isinstance(params, dict)
             and set(params) in ({"profile", "capture_seconds"}, {"profile", "capture_seconds", "metric_set"})):
         seconds = params["capture_seconds"]

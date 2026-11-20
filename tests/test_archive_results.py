@@ -119,12 +119,18 @@ class ArchiveResultsTest(unittest.TestCase):
         self.assertEqual(receipt['state'], 'failed')
 
     def test_full_warp_capture_round_trip_with_bulk_members(self):
+        self._check_warp_capture_round_trip({'warp_trace': True})
+
+    def test_bounded_warp_capture_round_trip_with_bulk_members(self):
+        self._check_warp_capture_round_trip({'warp_trace': True, 'warp_graph_replays': 64})
+
+    def _check_warp_capture_round_trip(self, params):
         row = {
             'id': 'gedes-000-fat-tree48-27648-02', 'parent_id': 'gedes-000-fat-tree48-27648',
             'subtask_id': '02', 'task_status': '2026-11-18T13:29:35Z',
             'subtask_status': '2026-11-19T04:44:56Z', 'version': 1795063496,
             'version_label': 'v1-261119-044456', 'slug': 'fat-tree48-27648',
-            'kind': 'gedes_fat_tree48', 'task': {'params': {'warp_trace': True}},
+            'kind': 'gedes_fat_tree48', 'task': {'params': params},
             'source_commit': 'a'*40, 'task_sha256': 'b'*64, 'worker': 'node-a',
             'host_id': 'host', 'claim': 'test', 'state': 'succeeded',
         }

@@ -49,6 +49,23 @@
       "execution": {
         "mode": "full"
       }
+    },
+    "03": {
+      "status": "2026-11-20T12:02:11+08:00",
+      "name": "GeDES FatTree48 first 64 timeslots IKET trace",
+      "kind": "gedes_fat_tree48",
+      "params": {
+        "warp_trace": true,
+        "warp_graph_replays": 64
+      },
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "On one GB200, record every CTA and warp of all 45 graph nodes in each of the first 64 timeslots, in two IKET sessions. Finish all 27,648 flows and verify matched inputs and terminal byte and queue state against the untraced run. Report per-flow completion-time and terminal-round differences separately.",
+      "execution": {
+        "mode": "full"
+      }
     }
   }
 }

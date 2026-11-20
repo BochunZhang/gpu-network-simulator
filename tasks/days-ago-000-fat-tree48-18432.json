@@ -67,6 +67,23 @@
       "execution": {
         "mode": "full"
       }
+    },
+    "04": {
+      "status": "2026-11-20T12:02:11+08:00",
+      "name": "Days AGO FatTree48 first two Graph replays IKET trace",
+      "kind": "days_ago_fat_tree48",
+      "params": {
+        "warp_trace": true,
+        "warp_graph_replays": 2
+      },
+      "resources": {
+        "gpus": 1
+      },
+      "enabled": true,
+      "description": "On one GB200, record every CTA and warp of the first two CUDA Graph replays and the three direct gathers. Complete the native k48/h16 30% workload with 5,530 flows through 1.024 ms of virtual time. Require no capacity retry and an exact fingerprint and work-counter match against the untraced run.",
+      "execution": {
+        "mode": "full"
+      }
     }
   }
 }

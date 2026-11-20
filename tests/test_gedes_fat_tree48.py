@@ -137,6 +137,12 @@ namespace VDES {''', 1
             study._read_capture_window(log, 3, 10)
 
     def test_warp_profile_reports_paired_timing_separately_from_validated_work(self):
+        self._check_warp_profile(None)
+
+    def test_bounded_warp_profile_checks_all_terminal_work(self):
+        self._check_warp_profile(64)
+
+    def _check_warp_profile(self, graph_replays):
         helpers = Mock(GEDES=(None, audit.UPSTREAM_REVISION))
         warp = Mock()
         warp.prepare.return_value = {'FT48_WARP_LIBDIR': '/lib/test'}
@@ -164,13 +170,15 @@ namespace VDES {''', 1
 
         with patch.object(study, '_build_gedes', return_value=self.output / 'GeDES'), \
                 patch.object(study, '_run_case', side_effect=run_case):
-            study.run(self.output, self.output, helpers, warp_trace=True)
+            study.run(self.output, self.output, helpers, warp_trace=True, warp_graph_replays=graph_replays)
         summary = json.loads((self.output / 'summary.json').read_text())
         self.assertTrue(summary['passed'])
         self.assertTrue(summary['warp_profile']['passed'])
         self.assertFalse(summary['warp_profile']['round_counts_equal'])
         self.assertEqual(summary['warp_profile']['paired_fct']['max_absolute_difference_ns'], 3)
-        warp.collect.assert_called_once_with(self.output, self.output, 'gedes', 4)
+        warp.capture_environment.assert_called_once_with(
+            self.output, self.output, {'FT48_WARP_LIBDIR': '/lib/test'}, 'gedes', graph_replays)
+        warp.collect.assert_called_once_with(self.output, self.output, 'gedes', 4, graph_replays)
 
     def test_short_profile_collects_trace_before_reporting_fct_mismatch(self):
         self._check_short_profile({})

@@ -231,10 +231,13 @@ def ingest(directory, simulator, phase, first, count):
             raise
 
 
-def verify(directory, simulator, rounds):
+def verify(directory, simulator, rounds, graph_replays=None):
     directory = Path(directory)
     require(simulator in ("days", "gedes") and rounds > 0, "invalid tracking workload")
-    replays = (rounds + 63) // 64 if simulator == "days" else rounds
+    require(graph_replays is None or (type(graph_replays) is int and graph_replays > 0),
+            "graph replay limit must be a positive integer")
+    simulation_replays = (rounds + 63) // 64 if simulator == "days" else rounds
+    replays = simulation_replays if graph_replays is None else min(simulation_replays, graph_replays)
     require((directory / "index.sqlite").is_file(), "missing warp trace index")
     with sqlite3.connect(directory / "index.sqlite") as db:
         sizes = {"graph": 0, "direct": 0}
@@ -255,7 +258,7 @@ def verify(directory, simulator, rounds):
         nodes, per_replay = (768, 2269184) if simulator == "days" else (45, 23983)
         require(count == replays * nodes + sizes["direct"] and
                 warps == replays * per_replay + (9960 if simulator == "days" else 0),
-                "full-run FT48 warp or launch coverage failed")
+                "FT48 warp or launch coverage failed")
         require(expected_bytes == warps * RECORD.size == (directory / "lifetimes.bin").stat().st_size,
                 "unexpected warp data length")
         per_sm = [dict(sm=sm, warp_lifetimes=n, summed_warp_ns=ns)
@@ -263,9 +266,12 @@ def verify(directory, simulator, rounds):
                                               "from sm_totals group by sm order by sm")]
         require(sum(row["warp_lifetimes"] for row in per_sm) == warps, "SM counts disagree with warp records")
     summary = dict(per_sm=per_sm, backend="iket-lifetime-only", format_version=1, record_bytes=RECORD.size,
-                   simulator=simulator, simulation_rounds=rounds, replays=replays, direct_launches=sizes["direct"],
+                   simulator=simulator, simulation_rounds=rounds, replays=sizes["graph"],
+                   direct_launches=sizes["direct"],
                    capture_windows=chunks, kernel_launches=count, warp_lifetimes=warps,
                    binary_bytes=expected_bytes, coverage_passed=True, clock_domain="per IKET capture window")
+    if graph_replays is not None:
+        summary.update(requested_graph_replays=graph_replays, simulation_graph_replays=simulation_replays)
     (directory / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     export(directory, "graph", 0, directory / "preview.perfetto.json", max_nodes=45, max_ctas=2)
     return summary

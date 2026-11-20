@@ -5674,7 +5674,7 @@ impl RoundModule {
 
 #[cfg(ft48_warp)]
 mod warp_capture {
-    use super::{CudaError, CudaStream, driver_error};
+    use super::{CudaError, CudaStream, GraphWave, driver_error};
     use cudarc::driver::{DriverError, result, sys};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5694,6 +5694,20 @@ mod warp_capture {
         std::env::var_os("FT48_WARP_OUTPUT").is_some_and(|value| !value.is_empty())
     }
 
+    pub(super) fn graph_replay_limit() -> Result<Option<u64>, CudaError> {
+        let Some(value) = std::env::var_os("FT48_WARP_GRAPH_REPLAYS") else {
+            return Ok(None);
+        };
+        value
+            .to_str()
+            .and_then(|text| text.parse::<u64>().ok())
+            .filter(|replays| *replays > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                CudaError::Validation("FT48_WARP_GRAPH_REPLAYS must be a positive integer".into())
+            })
+    }
+
     pub(super) fn begin_direct() -> u64 {
         let ordinal = NEXT_DIRECT.fetch_add(1, Ordering::Relaxed);
         unsafe { ft48_warp_begin_direct(ordinal) };
@@ -5711,10 +5725,15 @@ mod warp_capture {
     pub(super) struct Graph {
         stream: Arc<CudaStream>,
         handle: sys::CUgraph,
+        replay_limit: Option<u64>,
+        tail: Option<Executable>,
     }
 
     impl Graph {
-        pub(super) fn end_capture(stream: &Arc<CudaStream>) -> Result<Self, CudaError> {
+        pub(super) fn end_capture(
+            stream: &Arc<CudaStream>,
+            replay_limit: Option<u64>,
+        ) -> Result<Self, CudaError> {
             let handle = stream
                 .context()
                 .bind_to_thread()
@@ -5728,6 +5747,8 @@ mod warp_capture {
             Ok(Self {
                 stream: stream.clone(),
                 handle,
+                replay_limit,
+                tail: None,
             })
         }
 
@@ -5742,13 +5763,33 @@ mod warp_capture {
                 .map_err(|error| driver_error("CUDA Graph DOT export", error))
         }
 
-        pub(super) fn begin_wave(&self) -> Result<Replay<'_>, CudaError> {
+        pub(super) fn begin_wave(&mut self) -> Result<GraphWave<'_>, CudaError> {
+            if self
+                .replay_limit
+                .is_some_and(|limit| NEXT_GRAPH.load(Ordering::Relaxed) >= limit)
+            {
+                if self.tail.is_none() {
+                    // Close the captured prefix before any untraced replay can launch.
+                    finish();
+                    self.tail = Some(self.instantiate()?);
+                }
+                return Ok(GraphWave::Tail(
+                    self.tail.as_ref().expect("tail graph executable instantiated"),
+                ));
+            }
             let ordinal = NEXT_GRAPH.fetch_add(1, Ordering::Relaxed);
             // Each Days wave has its own IKET session. Instantiate after its Start so
             // IKET sees the executable before the first launch in that session.
             unsafe { ft48_warp_begin(ordinal) };
+            Ok(GraphWave::Traced(Replay {
+                executable: self.instantiate()?,
+                ordinal,
+            }))
+        }
+
+        fn instantiate(&self) -> Result<Executable, CudaError> {
             self.stream.context().bind_to_thread().map_err(|error| {
-                driver_error("warp-traced CUDA Graph context binding", error)
+                driver_error("CUDA Graph context binding", error)
             })?;
             let handle = unsafe {
                 result::graph::instantiate(
@@ -5756,20 +5797,20 @@ mod warp_capture {
                     sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
                 )
             }
-            .map_err(|error| driver_error("warp-traced CUDA Graph instantiate", error))?;
-            let replay = Replay {
-                stream: &self.stream,
+            .map_err(|error| driver_error("CUDA Graph instantiate", error))?;
+            let executable = Executable {
+                stream: Arc::clone(&self.stream),
                 handle,
-                ordinal,
             };
-            unsafe { result::graph::upload(replay.handle, replay.stream.cu_stream()) }
-                .map_err(|error| driver_error("warp-traced CUDA Graph upload", error))?;
-            Ok(replay)
+            unsafe { result::graph::upload(executable.handle, self.stream.cu_stream()) }
+                .map_err(|error| driver_error("CUDA Graph upload", error))?;
+            Ok(executable)
         }
     }
 
     impl Drop for Graph {
         fn drop(&mut self) {
+            drop(self.tail.take());
             let context = self.stream.context();
             context.record_err(context.bind_to_thread().and_then(|()| unsafe {
                 result::graph::destroy(self.handle)
@@ -5777,24 +5818,30 @@ mod warp_capture {
         }
     }
 
-    pub(super) struct Replay<'a> {
-        stream: &'a CudaStream,
-        handle: sys::CUgraphExec,
+    pub(super) struct Replay {
+        pub(super) executable: Executable,
         ordinal: u64,
     }
 
-    impl Replay<'_> {
-        pub(super) fn launch(&self) -> Result<(), DriverError> {
-            self.stream.context().bind_to_thread()?;
-            unsafe { result::graph::launch(self.handle, self.stream.cu_stream()) }
-        }
-
+    impl Replay {
         pub(super) fn finish(self) {
             unsafe { ft48_warp_end(self.ordinal) };
         }
     }
 
-    impl Drop for Replay<'_> {
+    pub(super) struct Executable {
+        stream: Arc<CudaStream>,
+        handle: sys::CUgraphExec,
+    }
+
+    impl Executable {
+        pub(super) fn launch(&self) -> Result<(), DriverError> {
+            self.stream.context().bind_to_thread()?;
+            unsafe { result::graph::launch(self.handle, self.stream.cu_stream()) }
+        }
+    }
+
+    impl Drop for Executable {
         fn drop(&mut self) {
             let context = self.stream.context();
             context.record_err(context.bind_to_thread().and_then(|()| unsafe {
@@ -5813,15 +5860,17 @@ enum AttemptGraph {
 enum GraphWave<'a> {
     Reusable(&'a CudaGraph),
     #[cfg(ft48_warp)]
-    Traced(warp_capture::Replay<'a>),
+    Traced(warp_capture::Replay),
+    #[cfg(ft48_warp)]
+    Tail(&'a warp_capture::Executable),
 }
 
 impl AttemptGraph {
-    fn begin_wave(&self) -> Result<GraphWave<'_>, CudaError> {
+    fn begin_wave(&mut self) -> Result<GraphWave<'_>, CudaError> {
         match self {
             Self::Reusable(graph) => Ok(GraphWave::Reusable(graph)),
             #[cfg(ft48_warp)]
-            Self::Traced(graph) => Ok(GraphWave::Traced(graph.begin_wave()?)),
+            Self::Traced(graph) => graph.begin_wave(),
         }
     }
 }
@@ -5831,7 +5880,9 @@ impl GraphWave<'_> {
         match self {
             Self::Reusable(graph) => graph.launch(),
             #[cfg(ft48_warp)]
-            Self::Traced(replay) => replay.launch(),
+            Self::Traced(replay) => replay.executable.launch(),
+            #[cfg(ft48_warp)]
+            Self::Tail(executable) => executable.launch(),
         }
     }
 
@@ -6100,7 +6151,7 @@ impl DirectCuda {
 
         let wall_started = Instant::now();
         let capture_started = Instant::now();
-        let graph = self.capture_graph(
+        let mut graph = self.capture_graph(
             buffers,
             &functions,
             round_kernel,
@@ -6200,6 +6251,10 @@ impl DirectCuda {
         configs: &[LaunchConfig; KERNEL_NAMES.len()],
         attempts: usize,
     ) -> Result<AttemptGraph, CudaError> {
+        #[cfg(ft48_warp)]
+        let warp_options = warp_capture::enabled()
+            .then(warp_capture::graph_replay_limit)
+            .transpose()?;
         self.stream
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|error| driver_error("CUDA Graph capture begin", error))?;
@@ -6224,8 +6279,8 @@ impl DirectCuda {
             Ok(())
         })();
         #[cfg(ft48_warp)]
-        if warp_capture::enabled() {
-            let ended = warp_capture::Graph::end_capture(&self.stream);
+        if let Some(replay_limit) = warp_options {
+            let ended = warp_capture::Graph::end_capture(&self.stream, replay_limit);
             captured?;
             let graph = ended?;
             graph.export_dot()?;

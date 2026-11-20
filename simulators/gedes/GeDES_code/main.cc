@@ -10,8 +10,10 @@
 #include <iomanip>
 #include <exception>
 #ifdef FT48_WARP_TRACE
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 extern "C" bool ft48_warp_begin(std::uint64_t replay);
 extern "C" bool ft48_warp_end(std::uint64_t replay);
 extern "C" void ft48_warp_finish();
@@ -137,6 +139,23 @@ int main(int argc, char *argv[])
         }
     }
 
+#ifdef FT48_WARP_TRACE
+    const char *trace_output = std::getenv("FT48_WARP_OUTPUT");
+    const bool trace_replays = trace_output && *trace_output;
+    std::uint64_t trace_replay_limit = 0;
+    if (trace_replays) {
+        if (const char *limit = std::getenv("FT48_WARP_GRAPH_REPLAYS")) {
+            const char *end = limit + std::strlen(limit);
+            const auto parsed = std::from_chars(limit, end, trace_replay_limit);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || trace_replay_limit == 0) {
+                std::cerr << "FT48_WARP_GRAPH_REPLAYS must be a positive integer" << std::endl;
+                return 1;
+            }
+        }
+    }
+#else
+    constexpr bool trace_replays = false;
+#endif
     std::cout << "Building Network" << std::endl;
     using AuditClock = std::chrono::steady_clock;
     const auto audit_init_start = AuditClock::now();
@@ -150,12 +169,6 @@ int main(int argc, char *argv[])
     topology.SetLookAheadTimeslot(look_ahead_timeslot);
     topology.SetTransmissionPlanParams(expected_packet_num, deviate, 41U);
     topology.BuildTopology();
-#ifdef FT48_WARP_TRACE
-    const char *trace_output = std::getenv("FT48_WARP_OUTPUT");
-    const bool trace_replays = trace_output && *trace_output;
-#else
-    constexpr bool trace_replays = false;
-#endif
 #if ENABLE_GPU_MEM_POOL
     topology.BuildGraphOnlyGPU(trace_replays);
 #elif ENABLE_HUGE_GRAPH
@@ -179,11 +192,21 @@ int main(int argc, char *argv[])
         return result;
     };
     std::cout << "Simulation Start" << std::endl;
+#ifdef FT48_WARP_TRACE
+    bool capture_graph_replays = trace_replays;
+#endif
     const auto audit_loop_start = AuditClock::now();
     for (int i = 0; i < audit_max_rounds && (!audit_early_stop || i < 1) && !audit_finished(); ++i) {
 #ifdef FT48_WARP_TRACE
+        if (capture_graph_replays && trace_replay_limit != 0 &&
+            static_cast<std::uint64_t>(i) == trace_replay_limit) {
+            ft48_warp_finish();
+            topology.DestroyGraphExecutable();
+            topology.InstantiateGraph();
+            capture_graph_replays = false;
+        }
         // A fresh executable belongs to the IKET session that records its replays.
-        if (trace_replays && ft48_warp_begin(i)) topology.InstantiateGraph();
+        if (capture_graph_replays && ft48_warp_begin(i)) topology.InstantiateGraph();
 #endif
 #if ENABLE_HUGE_GRAPH
         if (audit_detail) {
@@ -195,7 +218,7 @@ int main(int argc, char *argv[])
         }
 #endif
 #ifdef FT48_WARP_TRACE
-        if (trace_replays && ft48_warp_end(i)) topology.DestroyGraphExecutable();
+        if (capture_graph_replays && ft48_warp_end(i)) topology.DestroyGraphExecutable();
 #endif
         ++audit_rounds;
         if (i % 20000 == 0) {
@@ -204,7 +227,7 @@ int main(int argc, char *argv[])
     }
 #ifdef FT48_WARP_TRACE
     if (trace_replays) {
-        ft48_warp_finish();
+        if (capture_graph_replays) ft48_warp_finish();
         topology.DestroyGraphExecutable();
     }
 #endif

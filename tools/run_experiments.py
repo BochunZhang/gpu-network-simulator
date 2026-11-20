@@ -971,7 +971,7 @@ def run_candidates(results, row):
 
 def is_warp_capture(record):
     task = record.get('task', {})
-    return (isinstance(task, dict) and task.get('params') == {'warp_trace': True}
+    return (isinstance(task, dict) and task_catalog.is_ft48_warp_capture_params(task.get('params'))
             and record.get('kind') in {'days_ago_fat_tree48', 'gedes_fat_tree48'})
 
 

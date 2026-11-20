@@ -18,6 +18,14 @@ VERSION_LABEL_PATTERN = r'v[1-9][0-9]*-[0-9]{6}-[0-9]{6}'
 CHILD_FIELDS = {'status', 'name', 'kind', 'params', 'execution', 'resources', 'enabled', 'description'}
 
 
+def is_ft48_warp_capture_params(params):
+    if (not isinstance(params, dict) or params.get('warp_trace') is not True
+            or not params.keys() <= {'warp_trace', 'warp_graph_replays'}):
+        return False
+    replays = params.get('warp_graph_replays', 1)
+    return type(replays) is int and 0 < replays < 2**64
+
+
 def release_version(status):
     """Return Unix seconds, reserving None for retired catalog entries."""
     if status == 'ignore':
