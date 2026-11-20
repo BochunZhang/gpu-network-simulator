@@ -40,7 +40,7 @@ def _wheel(scratch, project, version, tag, machine, pin=None):
     return target, {'name': target.name, 'sha256': digest, 'url': row['url']}
 
 
-def prepare(source, output, scratch, env, helpers):
+def prepare_library(scratch, env):
     machine = platform.machine()
     if sys.platform != 'linux' or machine not in IKET_DIGESTS:
         raise RuntimeError(f'IKET capture requires supported Linux hardware, got {sys.platform}/{machine}')
@@ -55,18 +55,23 @@ def prepare(source, output, scratch, env, helpers):
             target = root / name
             target.parent.mkdir(exist_ok=True, parents=True)
             target.write_bytes(archive.read(IKET_ROOT + name))
-    abi = f'cp{sys.version_info.major}{sys.version_info.minor}'
-    ijson, python_record = _wheel(root, 'ijson', IJSON_VERSION, f'-{abi}-{abi}-', machine)
-    with ZipFile(ijson) as archive:
-        archive.extractall(root / 'python')
-    tools = source / 'profiling/warp_trace'
     paths = [str(root), str(root / 'profiler')]
     if env.get('LD_LIBRARY_PATH'):
         paths.append(env['LD_LIBRARY_PATH'])
-    build = {k: v for k, v in env.items() if not k.startswith('FT48_WARP_')}
-    build.update(FT48_WARP_LIBDIR=str(root), FT48_IKET_LIBRARY=str(root / 'profiler/libiket_injection.so'),
+    return root, native_record, {**env, 'FT48_IKET_LIBRARY': str(root / 'profiler/libiket_injection.so'),
+                                 'LD_LIBRARY_PATH': os.pathsep.join(paths)}
+
+
+def prepare(source, output, scratch, env, helpers):
+    root, native_record, build = prepare_library(
+        scratch, {k: v for k, v in env.items() if not k.startswith('FT48_WARP_')})
+    abi = f'cp{sys.version_info.major}{sys.version_info.minor}'
+    ijson, python_record = _wheel(root, 'ijson', IJSON_VERSION, f'-{abi}-{abi}-', platform.machine())
+    with ZipFile(ijson) as archive:
+        archive.extractall(root / 'python')
+    tools = source / 'profiling/warp_trace'
+    build.update(FT48_WARP_LIBDIR=str(root),
                  FT48_WARP_DECODER=str(tools / 'trace.py'), FT48_WARP_PYTHON=sys.executable,
-                 LD_LIBRARY_PATH=os.pathsep.join(paths),
                  PYTHONPATH=os.pathsep.join(filter(None, [str(root / 'python'), env.get('PYTHONPATH')])))
     helpers.write_json(output / 'warp-dependencies.json',
                        {'iket': native_record, 'ijson': python_record, 'python': sys.version})

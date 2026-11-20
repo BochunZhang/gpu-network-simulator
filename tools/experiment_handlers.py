@@ -452,6 +452,9 @@ def days_cuda_smoke(source: Path, output: Path):
 def prepare(kind, params):
     handlers = {"gpu_inventory": inventory, "gedes_smoke": gedes_smoke,
                 "days_cuda_smoke": days_cuda_smoke}
+    if (kind == "days_ago_fat_tree48" and params == {"warp_init_probe": True}
+            and params["warp_init_probe"] is True):
+        return partial(_run_pinned, "iket_probe")
     if (kind in {"days_ago_fat_tree48", "gedes_fat_tree48"}
             and params == {"warp_trace": True} and params["warp_trace"] is True):
         return partial(_run_pinned, kind, warp_trace=True)

@@ -35,17 +35,17 @@
       }
     },
     "02": {
-      "status": "2026-11-19T14:18:41Z",
-      "name": "Days AGO FatTree48 full warp lifetime trace",
+      "status": "2026-11-20T09:54:14+08:00",
+      "name": "Days AGO IKET graph initialization timing probe",
       "kind": "days_ago_fat_tree48",
       "params": {
-        "warp_trace": true
+        "warp_init_probe": true
       },
       "resources": {
         "gpus": 1
       },
       "enabled": true,
-      "description": "Trace every warp of the full FT48 graph replays and direct gathers on one GB200. Check CTA and warp coverage at every launch and match the baseline state fingerprint and work counters.",
+      "description": "On one GB200 use the pinned IKET 4.9.0.dev1 wheel and one binary with a single 32-thread CTA. In separate processes compare direct launch, a flat CUDA Graph instantiated before IKET startup, and the same graph instantiated after IKET startup. Require verified kernel output and one valid warp lifetime for the direct and early-start cases. The late-start case must either meet the same gate or reproduce the prior GraphManager abort before exporting a trace. Retain all case logs, available raw traces, and the CUDA and driver versions.",
       "execution": {
         "mode": "full"
       }
